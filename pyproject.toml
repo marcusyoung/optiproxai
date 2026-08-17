@@ -1,0 +1,48 @@
+[project]
+name = "optiproxai"
+version = "0.1.0"
+description = "A local OpenAI-compatible proxy that routes LLM requests by complexity, capability, and cost/quality profile"
+readme = "README.md"
+authors = [
+    { name = "Marcus Young", email = "marcus@graspit.co.uk" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "click>=8.3.1",
+    "fastapi>=0.135.1",
+    "httpx>=0.28.1",
+    "numpy>=2.4.3",
+    "openai>=2.29.0",
+    "platformdirs>=4.9.4",
+    "pydantic>=2.12.5",
+    "pyyaml>=6.0.3",
+    "scikit-learn>=1.8.0",
+    "sentence-transformers>=5.6.0",
+    "tiktoken>=0.12.0",
+    "uvicorn>=0.42.0",
+]
+
+[project.scripts]
+optiproxai = "optiproxai.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.10.8,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pyright>=1.1.408",
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.3.0",
+    "ruff>=0.15.7",
+]
+
+[tool.uv.build-backend]
+module-name = "optiproxai"
+
+[tool.pytest.ini_options]
+addopts = "-m 'not heavy'"
+markers = [
+    "heavy: tests that take over 1 second or require heavy imports",
+]

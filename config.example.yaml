@@ -1,0 +1,296 @@
+# OptiProxAI Smart Router – Configuration Example
+# ------------------------------------------
+# Copy this file to config.yaml and fill in your values.
+# Env vars are supported: use ${VAR_NAME} syntax.
+#
+# Usage:
+#   cp config.example.yaml config.yaml
+#   # edit config.yaml with your providers / models
+#
+# When running via Docker Compose, pass secrets via .env or
+# YAML ${...} substitution. config.yaml is gitignored.
+
+host: "0.0.0.0"
+port: 18420
+
+default_provider: openrouter   # override to your preferred provider
+default_profile: auto
+
+# ---------------------------------------------------------------------------
+# Scoring Configuration
+# ---------------------------------------------------------------------------
+# disable_axis_overrides: when true, the tier is determined purely by the
+# weighted composite score against thresholds. No axis promotions (agenticTask,
+# complexity_score, reasoning_score). Default: false.
+#
+# ambiguous_bands: per-boundary ambiguity handling. A score within `band` of a
+# tier boundary is ambiguous between the two adjacent tiers; `prefer` names
+# which one wins (LOWER or UPPER). Keys are boundary names:
+#   SIMPLE_MEDIUM, MEDIUM_COMPLEX, COMPLEX_REASONING
+# When unset or empty, behaviour is plain threshold mapping.
+#
+# disable_axis_overrides: true
+# ambiguous_bands:
+#   SIMPLE_MEDIUM:     {band: 0.02, prefer: UPPER}
+#   MEDIUM_COMPLEX:    {band: 0.02, prefer: UPPER}
+#   COMPLEX_REASONING: {band: 0.02, prefer: LOWER}
+
+# ---------------------------------------------------------------------------
+# Routing Configuration
+# ---------------------------------------------------------------------------
+# Session-sticky routing preserves prefix cache locality by pinning a
+# conversation to the same primary provider. When a tier's primary_selection
+# is "session_sticky", OptiProxAI reads the session key from this HTTP header
+# and uses hash(session_key) % len(candidates) for deterministic selection.
+# When the header is absent, falls back to round-robin (no regression).
+#
+# This is separate from smart_proxy.context_compaction.session.header_name.
+
+routing:
+    session_header: X-Session-Id
+
+# ---------------------------------------------------------------------------
+# LLM Classifier (optional — escalation when rule confidence < 0.7)
+# ---------------------------------------------------------------------------
+# Uncomment and configure to enable LLM-based tier classification.
+# When running inside Docker, use host.docker.internal to reach host services.
+#
+# llm_classifier:
+#     model: "gpt-4o-mini"
+#     provider: "openrouter"  # optional; defaults to default_provider
+
+# ---------------------------------------------------------------------------
+# Smart-proxy options
+# ---------------------------------------------------------------------------
+# `tools_capability_detection` controls when request tool schemas require a
+# tools-capable model:
+#   - declared (default): any `tools` or legacy `functions` field requires tools
+#   - active (opt-in): decorative schemas are ignored unless tool use is forced
+#     or recent history after the latest user turn contains active tool state
+#     (`assistant.tool_calls`, legacy `function_call`, role=tool/function).
+# Use active for OpenCode-style clients that attach full schemas to ordinary
+# conversation turns; tool-required requests still fail closed.
+#
+# `decorative_tool_schema_handling` controls the upstream payload for schemas
+# that active detection has already classified as non-required/decorative:
+#   - preserve (default): forward `tools`, legacy `functions`, `tool_choice`,
+#     and legacy `function_call` exactly as the client sent them
+#   - strip (opt-in): remove only those top-level fields from the upstream copy
+#     when schemas are declared but not required. Never strips forced tool use,
+#     active tool history, or message-level `tool_calls` / tool responses.
+# Use strip only when a selected provider/model rejects decorative schema fields.
+#
+# smart_proxy:
+#   tools_capability_detection: declared       # declared | active
+#   decorative_tool_schema_handling: preserve  # preserve | strip
+#
+# Context compaction is optional — all features disabled by default.
+# Uncomment and adjust to enable inline and/or background context compaction.
+#
+# smart_proxy:
+#   context_compaction:
+#     enabled: true
+#     sync_compaction:
+#       enabled: true
+#       threshold_percent: 80.0    # compact when prompt ≥ 80% of context window
+#       protect_first_n: 1
+#       protect_last_n: 2
+#       summary_profile: ""        # routing profile for summary model; empty = use default_profile
+#       summary_ratio: 0.25        # summary max_tokens = middle_tokens * ratio
+#       min_summary_tokens: 128    # floor for dynamic summary token budget
+#       max_summary_tokens: 1024   # ceiling for dynamic summary token budget
+#     background_precompaction:
+#       enabled: true
+#       trigger_percent: 70.0
+#       max_concurrency: 2
+#       summary_ttl_seconds: 3600
+#     session:
+#       # Explicit session header. If omitted by the client, OptiProxAI does not derive
+#       # a session ID; inline compaction may run, but cache/background reuse is unavailable.
+#       header_name: X-Optiproxai-Session-Id
+#     context_window_tokens: 128000
+
+# ---------------------------------------------------------------------------
+# Runtime embeddings for the distilled feature classifier
+# ---------------------------------------------------------------------------
+# mode:
+#   - api: call an OpenAI-compatible embedding provider at route time
+#   - local: compute embeddings in-process with local_model; install deps separately
+#   - disabled: skip learned semantic classification and use conservative defaults
+# timeout_seconds bounds request-time embedding work before safe fallback.
+# Keep model/local_model compatible with the model identity stored in trained
+# models/feature_classifier.pkl.
+embedding:
+    mode: api  # api | local | disabled
+    provider: openrouter
+    model: "openai/text-embedding-3-small"
+    timeout_seconds: 5.0
+    # Optional direct API endpoint/key override instead of provider resolution:
+    # base_url: "http://127.0.0.1:8317/v1"
+    # api_key: "${EMBEDDING_API_KEY}"
+    # local_model: "sentence-transformers/all-MiniLM-L6-v2"  # required for mode: local
+
+# ---------------------------------------------------------------------------
+# Model Rules (prefix-based metadata)
+# ---------------------------------------------------------------------------
+# Declare model metadata using prefix matching.
+# Supported capabilities: vision, tools, json_mode
+#
+# model_rules is the primary metadata key. Legacy model_capabilities is accepted
+# only when model_rules is unset and is normalized into model_rules.
+#
+# When a request requires a capability (e.g., image_url in messages, tools field,
+# or response_format.type = json_object), only models matching these prefixes
+# will be considered. If no configured candidate declares all required
+# capabilities, routing fails closed instead of selecting an incapable model.
+#
+model_rules:
+    - prefix: "gpt-4"
+      capabilities: [vision, tools, json_mode]
+    - prefix: "gpt-4o"
+      capabilities: [vision, tools, json_mode]
+    - prefix: "claude-"
+      capabilities: [vision, tools, json_mode]
+    - prefix: "anthropic/claude"
+      capabilities: [vision, tools, json_mode]
+    - prefix: "google/gemini"
+      capabilities: [vision, tools, json_mode]
+
+# ---------------------------------------------------------------------------
+# Providers
+# ---------------------------------------------------------------------------
+providers:
+    openrouter:
+        name: openrouter
+        base_url: "https://openrouter.ai/api/v1"
+        api_key: "${OPENROUTER_API_KEY}"
+
+    # Example: local OpenAI-compatible proxy (e.g. cli-proxy, LiteLLM, etc.)
+    # When OptiProxAI runs in Docker, use host.docker.internal instead of 127.0.0.1.
+    #
+    # local_proxy:
+    #     name: local_proxy
+    #     base_url: "http://host.docker.internal:8317/v1"
+    #     api_key: "${LOCAL_PROXY_API_KEY}"
+
+# ---------------------------------------------------------------------------
+# Routing Profiles
+# ---------------------------------------------------------------------------
+# Each profile has four tiers: SIMPLE / MEDIUM / COMPLEX / REASONING.
+# primary: model to use first (string/object) or ordered list for round-robin
+# primary_selection: round_robin (default) or session_sticky
+#   When session_sticky, the same session key always selects the same
+#   primary candidate, preserving prefix cache locality across requests
+#   in the same conversation. Requires routing.session_header to be set.
+# fallback: list of models tried on upstream error (5xx / timeout)
+#   - fallback: null is allowed and treated as []
+# provider: optional override; resolution order is model-entry provider,
+# then tier-level provider, then default_provider.
+# Model IDs are sent literally to the selected provider; OptiProxAI does not parse
+# provider/model strings as provider selectors.
+# Object entries may include max_input_tokens so long requests skip known
+# too-small models while string entries keep backward-compatible unknown limits.
+#
+# Tier selection is automatic based on prompt complexity scoring.
+# To route all requests to one profile, set default_profile above.
+
+profiles:
+    # ── auto: balanced cost / quality ──────────────────────────────────────
+    auto:
+        tiers:
+            SIMPLE:
+                primary: "gpt-4o-mini"
+                fallback:
+                    - "claude-haiku-4-5-20251001"
+            MEDIUM:
+                primary:
+                    - model: "gpt-4o-mini"
+                      max_input_tokens: 128000
+                    - model: "gpt-4o"
+                      max_input_tokens: 128000
+                fallback:
+                    - model: "claude-sonnet-4-5-20250929"
+                      max_input_tokens: 200000
+            COMPLEX:
+                primary: "gpt-4o"
+                fallback:
+                    - "claude-opus-4-20250514"
+            REASONING:
+                primary: "gpt-4o"
+                fallback:
+                    - "claude-opus-4-20250514"
+
+    # ── eco: cheapest viable models ─────────────────────────────────────────
+    eco:
+        tiers:
+            SIMPLE:
+                primary: "gpt-4o-mini"
+                fallback:
+                    - "claude-haiku-4-5-20251001"
+            MEDIUM:
+                primary: "gpt-4o-mini"
+                fallback:
+                    - "claude-haiku-4-5-20251001"
+            COMPLEX:
+                primary: "gpt-4o"
+                fallback:
+                    - "claude-sonnet-4-5-20250929"
+            REASONING:
+                primary: "gpt-4o"
+                fallback:
+                    - "claude-sonnet-4-5-20250929"
+
+    # ── premium: best quality models ─────────────────────────────────────────
+    premium:
+        tiers:
+            SIMPLE:
+                primary: "gpt-4o"
+                fallback:
+                    - "claude-sonnet-4-5-20250929"
+            MEDIUM:
+                primary: "gpt-4o"
+                fallback:
+                    - "claude-sonnet-4-5-20250929"
+            COMPLEX:
+                primary: "gpt-4o"
+                fallback:
+                    - model: "anthropic/claude-opus-4"
+                      provider: openrouter
+            REASONING:
+                primary: "gpt-4o"
+                fallback:
+                    - model: "anthropic/claude-opus-4"
+                      provider: openrouter
+
+    # ── agentic: optimized for tool use / function calling ──────────────────
+    agentic:
+        tiers:
+            SIMPLE:
+                primary: "gpt-4o-mini"
+                fallback:
+                    - "claude-haiku-4-5-20251001"
+            MEDIUM:
+                primary: "gpt-4o"
+                fallback:
+                    - "claude-sonnet-4-5-20250929"
+            COMPLEX:
+                primary: "gpt-4o"
+                fallback:
+                    - "claude-sonnet-4-5-20250929"
+            REASONING:
+                primary: "gpt-4o"
+                fallback:
+                    - model: "anthropic/claude-opus-4"
+                      provider: openrouter
+
+    # ── compress: cheap/fast model for summarisation tasks ──────────────────
+    compress:
+        tiers:
+            SIMPLE:
+                primary: "gpt-4o-mini"
+            MEDIUM:
+                primary: "gpt-4o-mini"
+            COMPLEX:
+                primary: "gpt-4o-mini"
+            REASONING:
+                primary: "gpt-4o-mini"

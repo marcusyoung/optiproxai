@@ -1,0 +1,31 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venv/
+__pycache__/
+*.pyc
+
+# Local configuration — never commit personal settings
+config.yaml
+.env.local
+data/
+models/
+
+# review-gauntlet output
+.review-gauntlet/
+!.review-gauntlet/checkpoints/
+
+# MetaMCP runtime artifacts
+.metamcp/
+
+# Machine-local config — never commit
+.mcp.json
+opencode.json
+.opencodereview/

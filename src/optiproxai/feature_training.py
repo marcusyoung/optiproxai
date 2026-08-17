@@ -1,0 +1,349 @@
+"""Train a multi-output distilled feature classifier for OptiProxAI routing."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import pickle
+import sys
+import time
+from pathlib import Path
+from typing import Any, cast
+
+import numpy as np
+from openai import OpenAI
+from sklearn.metrics import classification_report
+from sklearn.multioutput import MultiOutputClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+
+from optiproxai.config import load_config
+from optiproxai.scorer import SEMANTIC_DIMENSIONS, LocalEmbeddingBackend
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_MODEL_OPENROUTER = "openai/text-embedding-3-small"
+EMBEDDING_DIM = 1024
+BATCH_SIZE = 100
+EMBEDDING_TEXT_LIMIT = 4000
+VALID_DIMENSION_LABELS = {"low", "medium", "high"}
+DEFAULT_WEIGHTS: dict[str, float] = {
+    "tokenCount": 0.15,
+    "codePresence": 1.3,
+    "reasoningMarkers": 1.0,
+    "technicalTerms": 1.0,
+    "creativeMarkers": 1.0,
+    "simpleIndicators": 1.0,
+    "multiStepPatterns": 1.2,
+    "questionComplexity": 1.0,
+    "imperativeVerbs": 0.9,
+    "constraintCount": 1.0,
+    "outputFormat": 1.0,
+    "referenceComplexity": 1.3,
+    "negationComplexity": 0.9,
+    "domainSpecificity": 1.0,
+    "agenticTask": 0.9,
+}
+DEFAULT_THRESHOLDS: dict[str, float] = {"SIMPLE": 0.2, "MEDIUM": 0.58, "COMPLEX": 0.72}
+
+
+def get_embeddings(
+    client: OpenAI | LocalEmbeddingBackend,
+    texts: list[str],
+    model: str = EMBEDDING_MODEL,
+) -> np.ndarray[Any, np.dtype[np.float32]]:
+    if isinstance(client, LocalEmbeddingBackend):
+        print(f"  Embedding {len(texts)} items locally with model={model}...")
+        rows = [client.embed(text) for text in texts]
+        return np.vstack(rows).astype(np.float32)
+
+    all_embeddings: list[list[float]] = []
+    for i in range(0, len(texts), BATCH_SIZE):
+        batch = texts[i : i + BATCH_SIZE]
+        print(
+            f"  Embedding batch {i // BATCH_SIZE + 1}/{(len(texts) - 1) // BATCH_SIZE + 1} ({len(batch)} items)..."
+        )
+        resp = client.embeddings.create(input=batch, model=model)
+        for item in resp.data:
+            all_embeddings.append(item.embedding)
+        if i + BATCH_SIZE < len(texts):
+            time.sleep(0.2)
+    return np.array(all_embeddings, dtype=np.float32)
+
+
+def load_or_compute_embeddings(
+    client: OpenAI | LocalEmbeddingBackend,
+    texts: list[str],
+    cache_path: Path,
+    model: str = EMBEDDING_MODEL,
+) -> np.ndarray[Any, np.dtype[np.float32]]:
+    content_hash = hashlib.sha256(
+        json.dumps({"model": model, "texts": texts}, sort_keys=True).encode()
+    ).hexdigest()[:12]
+    cache_file = cache_path / f"embeddings_{content_hash}.npy"
+
+    if cache_file.exists():
+        print(f"  Loading cached embeddings from {cache_file}")
+        return cast(np.ndarray[Any, np.dtype[np.float32]], np.load(cache_file))
+
+    print(f"  Computing embeddings for {len(texts)} texts...")
+    embeddings = get_embeddings(client, texts, model=model)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    np.save(cache_file, embeddings)
+    print(f"  Cached to {cache_file}")
+    return embeddings
+
+
+def build_embedding_client() -> tuple[OpenAI | LocalEmbeddingBackend, str]:
+    loaded = None
+    cfg = None
+    try:
+        loaded = load_config()
+        cfg = loaded.embedding
+    except Exception:
+        pass
+
+    if loaded and cfg:
+        if cfg.effective_mode == "disabled":
+            raise RuntimeError(
+                "Embedding is disabled in config; set embedding.mode=api/local or remove "
+                "embedding config to use environment variables."
+            )
+        if cfg.effective_mode == "local":
+            print(f"  Using local embedding model={cfg.local_model}")
+            return LocalEmbeddingBackend(cfg.local_model), cfg.local_model
+        resolved = loaded.embedding_resolved()
+        if resolved is not None:
+            base_url, api_key = resolved
+            print(f"  Using config embedding: {base_url} model={cfg.model}")
+            return OpenAI(
+                api_key=api_key or "dummy",
+                base_url=base_url,
+            ), cfg.model
+
+    api_key = os.environ.get("OPENAI_API_KEY") or os.environ.get("OPENROUTER_API_KEY")
+    base_url = None
+    if not os.environ.get("OPENAI_API_KEY") and os.environ.get("OPENROUTER_API_KEY"):
+        base_url = "https://openrouter.ai/api/v1"
+        print("  Using OpenRouter for embeddings")
+    if not api_key:
+        raise RuntimeError(
+            "Set embedding config in config.yaml, or OPENAI_API_KEY / OPENROUTER_API_KEY"
+        )
+
+    embedding_model = EMBEDDING_MODEL_OPENROUTER if base_url else EMBEDDING_MODEL
+    return OpenAI(api_key=api_key, base_url=base_url), embedding_model
+
+
+def build_feature_classifier_bundle(
+    *,
+    classifier: Any,
+    label_encoders: dict[str, LabelEncoder],
+    semantic_dimensions: list[str],
+    embedding_model: str,
+    embedding_dim: int,
+    training_size: int,
+    class_distribution: dict[str, dict[str, int]],
+) -> dict[str, Any]:
+    """Build the persisted classifier bundle metadata."""
+    return {
+        "classifier": classifier,
+        "label_encoders": label_encoders,
+        "semantic_dimensions": semantic_dimensions,
+        "embedding_model": embedding_model,
+        "embedding_dim": embedding_dim,
+        "training_size": training_size,
+        "class_distribution": class_distribution,
+        "weights": DEFAULT_WEIGHTS,
+        "tier_thresholds": DEFAULT_THRESHOLDS,
+        "feature_schema_version": "v1",
+    }
+
+
+def load_feature_examples(data_path: Path) -> tuple[list[str], dict[str, list[str]]]:
+    with open(data_path, encoding="utf-8") as f:
+        dataset = json.load(f)
+
+    prompts = [str(item["prompt"]).strip()[:EMBEDDING_TEXT_LIMIT] for item in dataset]
+    if not prompts:
+        raise ValueError("Feature training dataset is empty")
+    if any(not prompt for prompt in prompts):
+        raise ValueError("Feature training dataset contains empty prompts")
+
+    labels_by_dimension: dict[str, list[str]] = {dim: [] for dim in SEMANTIC_DIMENSIONS}
+    for item in dataset:
+        for dim in SEMANTIC_DIMENSIONS:
+            label = str(item.get(dim, "")).strip().lower()
+            if label not in VALID_DIMENSION_LABELS:
+                raise ValueError(f"Invalid label for {dim}: {label}")
+            labels_by_dimension[dim].append(label)
+
+    return prompts, labels_by_dimension
+
+
+def train_feature_classifier(
+    *,
+    data_path: Path,
+    output_dir: Path,
+    cache_dir: Path,
+) -> Path:
+    prompts, labels_by_dimension = load_feature_examples(data_path)
+    print(f"Loaded {len(prompts)} prompts")
+
+    label_encoders: dict[str, LabelEncoder] = {}
+    encoded_targets: list[np.ndarray[Any, np.dtype[np.int_]]] = []
+    for dim in SEMANTIC_DIMENSIONS:
+        encoder = LabelEncoder()
+        target_raw = encoder.fit_transform(labels_by_dimension[dim])
+        target = cast(np.ndarray[Any, np.dtype[np.int_]], target_raw)
+        label_encoders[dim] = encoder
+        encoded_targets.append(target)
+
+        classes_raw = cast(np.ndarray[Any, np.dtype[Any]], encoder.classes_)
+        classes = [str(label) for label in classes_raw]
+        encoded_class_values_raw = encoder.transform(classes)
+        encoded_class_values = cast(
+            np.ndarray[Any, np.dtype[np.int_]], encoded_class_values_raw
+        )
+        class_mapping = {
+            label: int(encoded_class_values[index])
+            for index, label in enumerate(classes)
+        }
+        print(f"  {dim}: {class_mapping}")
+
+    for dim, labels in labels_by_dimension.items():
+        if len(set(labels)) < 2:
+            raise ValueError(f"Dimension {dim} needs at least two label classes")
+
+    y = np.column_stack(encoded_targets)
+
+    print("\n--- Embeddings ---")
+    client, embedding_model = build_embedding_client()
+    X = load_or_compute_embeddings(client, prompts, cache_dir, embedding_model)
+    print(f"  Shape: {X.shape}")
+
+    # MLP head on scaled embeddings: evaluated via stratified 5-fold CV against
+    # the previous linear head (compare_embeddings.py) — mean accuracy 0.741 →
+    # 0.799, macro-F1 0.699 → 0.742, winning all 14 dimensions. Hyperparameters
+    # match the evaluated configuration.
+    base_clf = Pipeline(
+        [
+            (
+                "scale",
+                StandardScaler(),
+            ),
+            (
+                "mlp",
+                MLPClassifier(
+                    hidden_layer_sizes=(128, 32),
+                    activation="relu",
+                    solver="adam",
+                    alpha=1e-3,
+                    max_iter=120,
+                    early_stopping=True,
+                    n_iter_no_change=10,
+                    random_state=42,
+                ),
+            ),
+        ]
+    )
+    clf = MultiOutputClassifier(base_clf)
+
+    print("\n--- Training model ---")
+    clf.fit(X, y)
+
+    # Drop the per-estimator Adam optimizer state before persisting: the
+    # optimizer moments are training-only and account for ~2/3 of each MLP's
+    # pickle size (~1.06 MB of 1.6 MB). Predictions use only coefs_/intercepts_,
+    # so this is safe and shrinks the bundle ~3x.
+    for estimator in clf.estimators_:
+        step = getattr(estimator, "named_steps", None)
+        if step is None:
+            continue
+        mlp = step.get("mlp")
+        if mlp is not None and hasattr(mlp, "_optimizer"):
+            mlp._optimizer = None
+
+    print("\n--- Training report (in-sample) ---")
+    y_pred = clf.predict(X)
+    for idx, dim in enumerate(SEMANTIC_DIMENSIONS):
+        classes_raw = cast(np.ndarray[Any, np.dtype[Any]], label_encoders[dim].classes_)
+        target_names = [str(name) for name in classes_raw]
+        report = classification_report(
+            y[:, idx],
+            y_pred[:, idx],
+            target_names=target_names,
+            zero_division=cast(Any, 0.0),
+        )
+        print(f"[{dim}]\n{report}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    model_path = output_dir / "feature_classifier.pkl"
+
+    class_distribution: dict[str, dict[str, int]] = {}
+    for dim in SEMANTIC_DIMENSIONS:
+        counts: dict[str, int] = {}
+        for label in labels_by_dimension[dim]:
+            counts[label] = counts.get(label, 0) + 1
+        class_distribution[dim] = counts
+
+    bundle = build_feature_classifier_bundle(
+        classifier=clf,
+        label_encoders=label_encoders,
+        semantic_dimensions=list(SEMANTIC_DIMENSIONS),
+        embedding_model=embedding_model,
+        embedding_dim=int(X.shape[1]),
+        training_size=len(prompts),
+        class_distribution=class_distribution,
+    )
+    with open(model_path, "wb") as f:
+        pickle.dump(bundle, f)
+
+    print(f"Model saved to {model_path}")
+    print(f"  Size: {model_path.stat().st_size / 1024:.1f} KB")
+    return model_path
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Train optiproxai distilled feature classifier"
+    )
+    parser.add_argument(
+        "--data",
+        default="data/distilled_feature_dataset.json",
+        help="Training data JSON",
+    )
+    parser.add_argument(
+        "--output",
+        default="models",
+        help="Output directory for model files",
+    )
+    parser.add_argument(
+        "--cache",
+        default="data/cache",
+        help="Embedding cache directory",
+    )
+    args = parser.parse_args(argv)
+
+    data_path = Path(args.data)
+    if not data_path.exists():
+        print(f"Error: {data_path} not found", file=sys.stderr)
+        return 1
+
+    try:
+        train_feature_classifier(
+            data_path=data_path,
+            output_dir=Path(args.output),
+            cache_dir=Path(args.cache),
+        )
+    except (RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

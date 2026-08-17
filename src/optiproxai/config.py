@@ -1,0 +1,674 @@
+"""OptiProxAI configuration models and loader.
+
+Supports YAML config files with ${ENV_VAR} resolution and merging with defaults.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+from pathlib import Path
+from typing import Any, Literal
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+# ---------------------------------------------------------------------------
+# Custom exceptions
+# ---------------------------------------------------------------------------
+
+
+class ConfigNotFoundError(Exception):
+    """Raised when no configuration file can be found."""
+
+    def __init__(self, searched_paths: list[Path] | None = None) -> None:
+        from optiproxai.dirs import config_dir
+
+        xdg_path = config_dir() / "config.yaml"
+        paths_str = ""
+        if searched_paths:
+            paths_str = "\n".join(f"  - {p}" for p in searched_paths)
+
+        msg = (
+            "No OptiProxAI configuration file found.\n"
+            "\n"
+            "Run `optiproxai init` to create a starter config, or create one manually.\n"
+        )
+        if paths_str:
+            msg += f"\nSearched:\n{paths_str}\n"
+        msg += f"\nDefault location: {xdg_path}\nOr set OPTIPROXAI_CONFIG=/path/to/config.yaml"
+        super().__init__(msg)
+        self.searched_paths = searched_paths
+
+
+class ConfigIncompleteError(Exception):
+    """Raised when config exists but is missing required sections (e.g. profiles)."""
+
+    def __init__(self, missing: str, config_path: Path | None = None) -> None:
+        loc = f" ({config_path})" if config_path else ""
+        msg = (
+            f"Configuration{loc} is missing required section: {missing}\n"
+            "\n"
+            "Run `optiproxai init` to generate a complete starter config,\n"
+            "or add the missing section to your config file.\n"
+            "See: https://github.com/marcusyoung/optiproxai#configuration"
+        )
+        super().__init__(msg)
+        self.missing = missing
+        self.config_path = config_path
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+
+class ContentPartPolicy(BaseModel):
+    """Candidate-specific message content part normalization policy."""
+
+    mode: Literal["preserve", "normalize"] = "preserve"
+    allowed_types: list[str] = Field(default_factory=list)
+    text_types: list[str] = Field(default_factory=list)
+    image_types: list[str] = Field(default_factory=list)
+    drop_types: list[str] = Field(default_factory=list)
+    unknown: Literal["preserve", "text", "drop"] = "preserve"
+
+
+class ProviderConfig(BaseModel):
+    """A backend LLM provider (OpenRouter, Anthropic, local proxy, etc.)."""
+
+    name: str  # e.g. 'openrouter', 'cliproxy', 'anthropic'
+    base_url: str  # e.g. 'https://openrouter.ai/api/v1'
+    api_key: str = ""  # can reference env var with ${ENV_VAR}
+    models: list[str] = Field(default_factory=list)  # optional model whitelist
+    reasoning_style: Literal[
+        "openai", "xai", "anthropic", "dashscope", "gemini", "none"
+    ] = "none"
+    supports_reasoning_content: bool = False
+
+
+class ModelEntry(BaseModel):
+    """A model with optional routing metadata and provider override."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    provider: str = ""  # empty = inherit from tier or default
+    max_input_tokens: int | None = Field(
+        default=None,
+        gt=0,
+        description="Optional maximum input prompt tokens for routing eligibility.",
+    )
+
+
+class ResolvedModelCandidate(BaseModel):
+    """A normalized model candidate with preserved routing metadata."""
+
+    model: str
+    provider: str = ""
+    max_input_tokens: int | None = None
+
+    def as_tuple(self) -> tuple[str, str]:
+        """Return the backward-compatible (model, provider) tuple."""
+        return self.model, self.provider
+
+
+class TierModelConfig(BaseModel):
+    """Model selection for a single complexity tier within a profile."""
+
+    primary: str | ModelEntry | list[str | ModelEntry]
+    fallback: list[str | ModelEntry] = Field(default_factory=list)
+    provider: str = "default"  # tier-level default provider
+    reasoning_effort: str | None = (
+        None  # low | medium | high | none (tier-level override)
+    )
+    primary_selection: Literal["round_robin", "session_sticky"] = "round_robin"
+
+    @model_validator(mode="after")
+    def _validate_primary_not_empty(self) -> "TierModelConfig":
+        """Ensure normalized primary candidate list is non-empty."""
+        if not self.resolve_primary_candidates():
+            raise ValueError("primary must contain at least one candidate")
+        return self
+
+    def resolve_primary_candidate_entries(self) -> list[ResolvedModelCandidate]:
+        """Return ordered primary candidates with routing metadata preserved."""
+        primary_entries: list[str | ModelEntry]
+        if isinstance(self.primary, list):
+            primary_entries = self.primary
+        else:
+            primary_entries = [self.primary]
+
+        return [self._resolve_candidate_entry(entry) for entry in primary_entries]
+
+    def resolve_primary_candidates(self) -> list[tuple[str, str]]:
+        """Return ordered list of (model_id, provider_name) primary candidates."""
+        return [entry.as_tuple() for entry in self.resolve_primary_candidate_entries()]
+
+    def resolve_primary(self) -> tuple[str, str]:
+        """Return first primary candidate for backward compatibility."""
+        return self.resolve_primary_candidates()[0]
+
+    def resolve_fallback_candidate_entries(self) -> list[ResolvedModelCandidate]:
+        """Return fallback candidates with routing metadata preserved."""
+        return [self._resolve_candidate_entry(entry) for entry in self.fallback]
+
+    def resolve_fallbacks(self) -> list[tuple[str, str]]:
+        """Return list of (model_id, provider_name) tuples."""
+        return [entry.as_tuple() for entry in self.resolve_fallback_candidate_entries()]
+
+    @staticmethod
+    def _resolve_candidate_entry(entry: str | ModelEntry) -> ResolvedModelCandidate:
+        """Normalize string/object candidate entries without losing metadata."""
+        if isinstance(entry, ModelEntry):
+            return ResolvedModelCandidate(
+                model=entry.model,
+                provider=entry.provider,
+                max_input_tokens=entry.max_input_tokens,
+            )
+        return ResolvedModelCandidate(model=entry)
+
+    def primary_model_id(self) -> str:
+        """Return first primary model ID (for backward compat)."""
+        model_id, _ = self.resolve_primary()
+        return model_id
+
+    def primary_model_ids(self) -> list[str]:
+        """Return all primary model IDs."""
+        return [model_id for model_id, _ in self.resolve_primary_candidates()]
+
+    def fallback_model_ids(self) -> list[str]:
+        """Return just the model ID strings (for backward compat)."""
+        result: list[str] = []
+        for entry in self.fallback:
+            if isinstance(entry, ModelEntry):
+                result.append(entry.model)
+            else:
+                result.append(entry)
+        return result
+
+
+class ProfileConfig(BaseModel):
+    """A routing profile (auto, eco, premium, agentic)."""
+
+    tiers: dict[str, TierModelConfig]  # SIMPLE, MEDIUM, COMPLEX, REASONING
+
+
+class _AuxLLMConfigBase(BaseModel):
+    """Common base for auxiliary LLM settings."""
+
+    model: str = "google/gemini-2.5-flash-lite"
+    provider: str = ""
+
+    # Disallow direct base_url/api_key storage; they must be resolved by provider.
+    model_config = ConfigDict(extra="forbid")
+
+
+class LLMClassifierConfig(_AuxLLMConfigBase):
+    """Configuration for the LLM-as-judge escalation classifier."""
+
+
+class FeatureAnnotatorConfig(_AuxLLMConfigBase):
+    """Configuration for offline feature annotation."""
+
+
+class EmbeddingConfig(BaseModel):
+    """Configuration for embeddings used by training and scoring."""
+
+    enabled: bool = True
+    mode: Literal["api", "local", "disabled"] = "api"
+    timeout_seconds: float = Field(default=5.0, gt=0.0)
+    local_model: str = ""
+    model: str = "text-embedding-3-small"
+    provider: str = ""
+    base_url: str = ""
+    api_key: str = ""
+
+    @model_validator(mode="after")
+    def _normalize_legacy_enabled(self) -> "EmbeddingConfig":
+        """Preserve legacy enabled=false as explicit disabled mode."""
+        if not self.enabled:
+            self.mode = "disabled"
+        if self.mode == "local" and not self.local_model:
+            raise ValueError(
+                "embedding.local_model is required when embedding.mode=local"
+            )
+        return self
+
+    @property
+    def effective_mode(self) -> Literal["api", "local", "disabled"]:
+        """Return normalized embedding mode."""
+        if not self.enabled:
+            return "disabled"
+        return self.mode
+
+    @property
+    def effective_model(self) -> str:
+        """Return the runtime embedding model identity for diagnostics."""
+        return self.local_model if self.effective_mode == "local" else self.model
+
+
+class SyncCompactionConfig(BaseModel):
+    """Configuration for synchronous request-time context compaction."""
+
+    enabled: bool = False
+    threshold_percent: float = (
+        80.0  # compact when prompt uses ≥ threshold_percent of context
+    )
+    protect_first_n: int = 1  # number of turns to protect at head
+    protect_last_n: int = 2  # number of turns to protect at tail
+    summary_profile: str = (
+        ""  # routing profile for summary model resolution; empty = use default_profile
+    )
+    merge_threshold: int = 768  # token threshold for LLM merge vs concatenation
+    summary_ratio: float = (
+        0.25  # summary max_tokens = middle_tokens * ratio (before clamping)
+    )
+    min_summary_tokens: int = 128  # floor for dynamic summary max_tokens
+    max_summary_tokens: int = 1024  # ceiling for dynamic summary max_tokens
+
+
+class BackgroundPrecompactionConfig(BaseModel):
+    """Configuration for background (async) precompaction."""
+
+    enabled: bool = False
+    trigger_percent: float = 70.0  # start background job when usage crosses this %
+    max_concurrency: int = 2
+    summary_ttl_seconds: int = 3600
+
+
+class SessionConfig(BaseModel):
+    """Configuration for session identity resolution."""
+
+    header_name: str = "X-Optiproxai-Session-Id"
+
+
+class ContextCompactionConfig(BaseModel):
+    """Smart-proxy context compaction sub-configuration."""
+
+    enabled: bool = False
+    sync_compaction: SyncCompactionConfig = Field(default_factory=SyncCompactionConfig)
+    background_precompaction: BackgroundPrecompactionConfig = Field(
+        default_factory=BackgroundPrecompactionConfig
+    )
+    session: SessionConfig = Field(default_factory=SessionConfig)
+    context_window_tokens: int = (
+        128000  # assumed context window for threshold calculation
+    )
+
+
+class FallbackBackoffConfig(BaseModel):
+    """Configuration for process-local fallback exponential backoff."""
+
+    enabled: bool = True
+    initial_delay_seconds: float = Field(default=5.0, ge=0.0)
+    multiplier: float = Field(default=2.0, ge=1.0)
+    max_delay_seconds: float = Field(default=300.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def _validate_delay_bounds(self) -> "FallbackBackoffConfig":
+        """Ensure the max delay is not lower than the initial delay."""
+        if self.max_delay_seconds < self.initial_delay_seconds:
+            raise ValueError(
+                "max_delay_seconds must be greater than or equal to initial_delay_seconds"
+            )
+        return self
+
+
+class RoutingConfig(BaseModel):
+    """Configuration for routing-level settings."""
+
+    session_header: str = "X-Session-Id"
+
+
+class SmartProxyConfig(BaseModel):
+    """Smart-proxy feature configuration."""
+
+    tools_capability_detection: Literal["declared", "active"] = Field(
+        default="declared",
+        description=(
+            "Policy for requiring the tools capability from OpenAI tool/function "
+            "request fields. 'declared' preserves fail-closed legacy behavior; "
+            "'active' ignores decorative schemas unless tool use is explicit or active."
+        ),
+    )
+    decorative_tool_schema_handling: Literal["preserve", "strip"] = Field(
+        default="preserve",
+        description=(
+            "Policy for forwarding decorative top-level tool schemas upstream. "
+            "'preserve' keeps OpenAI-compatible payloads unchanged; 'strip' removes "
+            "top-level tool schema fields only when tool use is declared but not required."
+        ),
+    )
+    context_compaction: ContextCompactionConfig = Field(
+        default_factory=ContextCompactionConfig
+    )
+    fallback_backoff: FallbackBackoffConfig = Field(
+        default_factory=FallbackBackoffConfig
+    )
+
+
+class ModelRuleEntry(BaseModel):
+    """Model rule declaration using prefix matching."""
+
+    prefix: str  # e.g. 'claude-', 'gpt-4', 'google/gemini'
+    provider: str = ""  # optional provider filter; empty matches any provider
+    capabilities: list[str] = Field(
+        default_factory=list
+    )  # e.g. ['vision', 'tools', 'json_mode']
+    reasoning_style: (
+        Literal["openai", "xai", "anthropic", "dashscope", "gemini", "none"] | None
+    ) = None
+    supports_reasoning_content: bool | None = None
+    content_part_policy: ContentPartPolicy | None = None
+    extra_body: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Optional extra request-body fields injected for any candidate "
+            "matching this rule (e.g. {'service_tier': 'flex'}). Merged last, "
+            "so these values win over client-provided fields."
+        ),
+    )
+
+
+ModelCapabilityEntry = ModelRuleEntry
+
+
+def _resolve_provider_for_aux_llm(
+    *,
+    aux_cfg: LLMClassifierConfig
+    | FeatureAnnotatorConfig
+    | EmbeddingConfig
+    | None = None,
+    providers: dict[str, ProviderConfig] | None = None,
+    aux_key: str,
+    default_provider: str,
+) -> tuple[str, str]:
+    """Resolve base_url/api_key for a classifier/annotator/embedding config via provider."""
+
+    resolved_provider = (
+        aux_cfg.provider if aux_cfg and aux_cfg.provider else default_provider
+    )
+    if providers is None:
+        providers = {}
+
+    provider_cfg = providers.get(resolved_provider)
+    if provider_cfg is None:
+        raise ValueError(
+            f"Unknown provider '{resolved_provider}' for {aux_key}; check config or default_provider"
+        )
+
+    return provider_cfg.base_url, resolve_env(provider_cfg.api_key)
+
+
+class OptiproxaiConfig(BaseModel):
+    """Top-level OptiProxAI configuration."""
+
+    host: str = "0.0.0.0"
+    port: int = 18420
+    providers: dict[str, ProviderConfig] = Field(default_factory=dict)
+    default_provider: str = "openrouter"
+    profiles: dict[str, ProfileConfig] = Field(default_factory=dict)
+    default_profile: str = "auto"
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
+    llm_classifier: LLMClassifierConfig | None = None
+    feature_annotator: FeatureAnnotatorConfig | None = None
+    embedding: EmbeddingConfig | None = None
+    smart_proxy: SmartProxyConfig = Field(default_factory=SmartProxyConfig)
+    model_rules: list[ModelRuleEntry] = Field(default_factory=list)
+    model_capabilities: list[ModelRuleEntry] = Field(default_factory=list)
+    disable_axis_overrides: bool = False
+    # Per-boundary ambiguity handling passed to the scorer. Keys are the lower
+    # tier of each boundary pair (SIMPLE, MEDIUM, COMPLEX); values are
+    # {"band": <float>, "fallback": "<TIER>"}. See scorer.ScoringConfig.
+    ambiguous_bands: dict[str, dict[str, float | str]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _normalize_legacy_model_capabilities(self) -> "OptiproxaiConfig":
+        """Use legacy model_capabilities as model_rules when model_rules is unset."""
+        if self.model_rules and self.model_capabilities:
+            raise ValueError(
+                "Specify either model_rules or legacy model_capabilities, not both"
+            )
+        if self.model_capabilities:
+            self.model_rules = self.model_capabilities
+        return self
+
+    @model_validator(mode="after")
+    def _validate_aux_llm_provider_resolution(self) -> "OptiproxaiConfig":
+        """Ensure auxiliary LLM configs resolve to known providers."""
+
+        if self.llm_classifier is not None:
+            _resolve_provider_for_aux_llm(
+                aux_cfg=self.llm_classifier,
+                providers=self.providers,
+                aux_key="llm_classifier",
+                default_provider=self.default_provider,
+            )
+
+        if self.feature_annotator is not None:
+            _resolve_provider_for_aux_llm(
+                aux_cfg=self.feature_annotator,
+                providers=self.providers,
+                aux_key="feature_annotator",
+                default_provider=self.default_provider,
+            )
+
+        if (
+            self.embedding is not None
+            and self.embedding.effective_mode == "api"
+            and self.embedding.provider
+        ):
+            _resolve_provider_for_aux_llm(
+                aux_cfg=self.embedding,
+                providers=self.providers,
+                aux_key="embedding",
+                default_provider=self.default_provider,
+            )
+
+        return self
+
+    def llm_classifier_resolved(self) -> tuple[str, str] | None:
+        """Return (base_url, api_key) resolved from llm_classifier.provider/default_provider."""
+
+        if self.llm_classifier is None:
+            return None
+        return _resolve_provider_for_aux_llm(
+            aux_cfg=self.llm_classifier,
+            providers=self.providers,
+            aux_key="llm_classifier",
+            default_provider=self.default_provider,
+        )
+
+    def feature_annotator_resolved(self) -> tuple[str, str] | None:
+        """Return (base_url, api_key) resolved from feature_annotator.provider/default_provider."""
+
+        if self.feature_annotator is None:
+            return None
+        return _resolve_provider_for_aux_llm(
+            aux_cfg=self.feature_annotator,
+            providers=self.providers,
+            aux_key="feature_annotator",
+            default_provider=self.default_provider,
+        )
+
+    def embedding_resolved(self) -> tuple[str, str] | None:
+        """Return (base_url, api_key) resolved from embedding.provider/default_provider."""
+
+        if self.embedding is None or self.embedding.effective_mode != "api":
+            return None
+        if self.embedding.base_url:
+            return self.embedding.base_url, self.embedding.api_key
+        if self.embedding.provider:
+            return _resolve_provider_for_aux_llm(
+                aux_cfg=self.embedding,
+                providers=self.providers,
+                aux_key="embedding",
+                default_provider=self.default_provider,
+            )
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Env-var resolution
+# ---------------------------------------------------------------------------
+
+_ENV_RE = re.compile(r"\$\{([^}]+)\}")
+
+
+def resolve_env(value: str) -> str:
+    """Replace ${VAR} placeholders with environment variable values."""
+
+    def _replace(m: re.Match) -> str:
+        var = m.group(1)
+        return os.environ.get(var, "")
+
+    return _ENV_RE.sub(_replace, value)
+
+
+def resolve_env_recursive(obj: Any) -> Any:
+    """Walk a data structure and resolve all ${VAR} strings."""
+    if isinstance(obj, str):
+        return resolve_env(obj)
+    if isinstance(obj, dict):
+        return {k: resolve_env_recursive(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [resolve_env_recursive(v) for v in obj]
+    return obj
+
+
+# ---------------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------------
+
+
+def _default_config_paths() -> list[Path]:
+    """Return ordered list of config file search paths.
+
+    Priority: ./config.yaml → $XDG_CONFIG_HOME/optiproxai/config.yaml → /etc/optiproxai/config.yaml
+    """
+    from optiproxai.dirs import config_dir
+
+    return [
+        Path("config.yaml"),
+        Path("config.yml"),
+        config_dir() / "config.yaml",
+        Path("/etc/optiproxai/config.yaml"),
+    ]
+
+
+def _find_config_file(explicit_path: str | Path | None = None) -> Path | None:
+    """Locate a config file, checking explicit path then defaults."""
+    if explicit_path is not None:
+        p = Path(explicit_path).expanduser()
+        return p if p.is_file() else None
+
+    # Check env var
+    env_path = os.environ.get("OPTIPROXAI_CONFIG")
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.is_file():
+            return p
+
+    # Search default locations (XDG-aware)
+    for candidate in _default_config_paths():
+        if candidate.is_file():
+            return candidate
+
+    return None
+
+
+def load_config(
+    path: str | Path | None = None,
+    *,
+    overrides: dict[str, Any] | None = None,
+    strict: bool = False,
+) -> OptiproxaiConfig:
+    """Load OptiproxaiConfig from a YAML file with env-var resolution.
+
+    Args:
+        path: Explicit path to config YAML, or None to auto-discover.
+        overrides: Dict of overrides merged on top of file config.
+        strict: If True, raise ConfigNotFoundError / ConfigIncompleteError
+                when the config is missing or incomplete. Default False
+                preserves backward compatibility (returns empty defaults).
+
+    Returns:
+        Fully resolved OptiproxaiConfig instance.
+    """
+    raw: dict[str, Any] = {}
+
+    config_file = _find_config_file(path)
+
+    if config_file is not None:
+        with open(config_file) as f:
+            loaded = yaml.safe_load(f)
+            if isinstance(loaded, dict):
+                raw = loaded
+    elif strict:
+        # Explicit path given but not found
+        if path is not None:
+            raise ConfigNotFoundError([Path(path).expanduser()])
+        # Auto-discovery failed
+        raise ConfigNotFoundError(_default_config_paths())
+
+    # Merge overrides
+    if overrides:
+        raw = _deep_merge(raw, overrides)
+
+    # Normalize nullable tier fallbacks before validation
+    raw = _normalize_tier_fallback_null(raw)
+
+    # Resolve env vars in raw data
+    raw = resolve_env_recursive(raw)
+
+    cfg = OptiproxaiConfig.model_validate(raw)
+
+    if strict and not cfg.profiles:
+        raise ConfigIncompleteError("profiles", config_file)
+
+    return cfg
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge *override* into *base* (override wins)."""
+    result = dict(base)
+    for key, val in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(val, dict):
+            result[key] = _deep_merge(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+def _normalize_tier_fallback_null(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize profiles.*.tiers.*.fallback null values to empty lists."""
+    normalized = dict(raw)
+    profiles = normalized.get("profiles")
+    if not isinstance(profiles, dict):
+        return normalized
+
+    normalized_profiles: dict[str, Any] = dict(profiles)
+    for profile_name, profile_value in profiles.items():
+        if not isinstance(profile_value, dict):
+            continue
+        tiers = profile_value.get("tiers")
+        if not isinstance(tiers, dict):
+            continue
+
+        normalized_tiers: dict[str, Any] = dict(tiers)
+        for tier_name, tier_value in tiers.items():
+            if not isinstance(tier_value, dict):
+                continue
+            if "fallback" in tier_value and tier_value["fallback"] is None:
+                normalized_tier = dict(tier_value)
+                normalized_tier["fallback"] = []
+                normalized_tiers[tier_name] = normalized_tier
+
+        normalized_profile = dict(profile_value)
+        normalized_profile["tiers"] = normalized_tiers
+        normalized_profiles[profile_name] = normalized_profile
+
+    normalized["profiles"] = normalized_profiles
+    return normalized

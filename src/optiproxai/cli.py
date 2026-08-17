@@ -1,0 +1,550 @@
+"""OptiProxAI CLI — serve, route, and inspect configuration."""
+
+from __future__ import annotations
+
+import json
+import os
+import textwrap
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, NoReturn
+
+import click
+import yaml
+
+from optiproxai.config import ConfigIncompleteError, ConfigNotFoundError
+
+
+@dataclass(frozen=True)
+class DoctorResult:
+    """One human-readable diagnostic finding."""
+
+    severity: str
+    title: str
+    message: str
+
+    def format_line(self) -> str:
+        """Return a concise line with sensitive values redacted defensively."""
+        return f"[{self.severity.upper()}] {self.title}: {_redact_secret_text(self.message)}"
+
+
+_SECRET_MARKERS = ("api_key", "apikey", "authorization", "bearer", "token", "secret")
+
+
+def _redact_secret_text(value: str) -> str:
+    """Best-effort redaction for accidental secret-like substrings in diagnostics."""
+    redacted_words: list[str] = []
+    for word in value.split():
+        lowered = word.lower()
+        if word.startswith(("sk-", "optiproxai_", "optiproxai-")) or any(
+            marker in lowered for marker in _SECRET_MARKERS
+        ):
+            redacted_words.append("***")
+        else:
+            redacted_words.append(word)
+    return " ".join(redacted_words)
+
+
+def _runtime_loads_classifier_asset(asset_name: str) -> bool:
+    """Return whether the current runtime declares support for an asset."""
+    if asset_name != "feature_classifier.pkl":
+        return False
+    try:
+        from optiproxai.scorer import RUNTIME_FEATURE_CLASSIFIER_SUPPORTED
+    except ImportError:
+        return False
+    return RUNTIME_FEATURE_CLASSIFIER_SUPPORTED
+
+
+def _classifier_asset_result(asset_name: str, models_dir: Path) -> DoctorResult:
+    asset_path = models_dir / asset_name
+    if asset_name == "feature_classifier.pkl":
+        from optiproxai.scorer import inspect_feature_classifier_runtime_status
+
+        status = inspect_feature_classifier_runtime_status(models_dir)
+        embedding_summary = (
+            f"embedding_mode={status.embedding_mode} "
+            f"embedding_model={status.embedding_model} "
+            f"timeout_seconds={status.embedding_timeout_seconds} "
+            f"default_only={str(status.default_only).lower()}"
+        )
+        if status.classifier_model:
+            embedding_summary += f" classifier_model={status.classifier_model}"
+        if status.embedding_model_mismatch:
+            embedding_summary += " model_mismatch=true"
+        if not status.exists:
+            return DoctorResult(
+                "warn",
+                asset_name,
+                f"not found at {status.path}; default-only routing mode until a loadable classifier is installed; {embedding_summary}",
+            )
+        if not status.loadable:
+            return DoctorResult(
+                "warn",
+                asset_name,
+                f"present but unloadable at {status.path}; default-only routing mode ({status.message}); {embedding_summary}",
+            )
+        severity = (
+            "warn" if status.default_only or status.embedding_model_mismatch else "ok"
+        )
+        return DoctorResult(
+            severity,
+            asset_name,
+            f"{status.message}; {embedding_summary}",
+        )
+
+    if not asset_path.exists():
+        return DoctorResult(
+            "info",
+            asset_name,
+            f"not found at {asset_path}; legacy classifier is unused by current runtime routing",
+        )
+
+    return DoctorResult(
+        "warn",
+        asset_name,
+        "present but legacy/unused by current runtime routing",
+    )
+
+
+def _profile_tier_count(profile: object) -> int:
+    tiers = getattr(profile, "tiers", {})
+    return len(tiers) if isinstance(tiers, dict) else 0
+
+
+def _load_raw_config_keys(config_path: str | None) -> set[str]:
+    """Return top-level YAML keys before OptiproxaiConfig normalizes legacy aliases."""
+    from optiproxai.config import _find_config_file
+
+    raw_path = _find_config_file(config_path)
+    if raw_path is None:
+        return set()
+
+    try:
+        with raw_path.open() as f:
+            loaded = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as e:
+        raise ValueError(f"failed to read raw config keys: {e}") from e
+
+    if not isinstance(loaded, dict):
+        return set()
+    return {str(key) for key in loaded}
+
+
+def _embedding_result(cfg: object) -> DoctorResult:
+    embedding = getattr(cfg, "embedding", None)
+    if embedding is None:
+        return DoctorResult(
+            "warn",
+            "embedding",
+            "not configured; runtime classifier will use documented environment fallback or default-only mode",
+        )
+
+    mode = embedding.effective_mode
+    model = embedding.effective_model or "(none)"
+    default_only = mode == "disabled"
+    severity = "warn" if default_only else "ok"
+    return DoctorResult(
+        severity,
+        "embedding",
+        (
+            f"mode={mode} model={model} timeout_seconds={embedding.timeout_seconds} "
+            f"default_only={str(default_only).lower()}"
+        ),
+    )
+
+
+def _model_metadata_result(cfg: object, raw_config_keys: set[str]) -> DoctorResult:
+    has_raw_model_rules = "model_rules" in raw_config_keys
+    has_raw_model_capabilities = "model_capabilities" in raw_config_keys
+    model_rules = getattr(cfg, "model_rules", [])
+
+    if has_raw_model_rules and has_raw_model_capabilities:
+        return DoctorResult(
+            "error",
+            "model metadata",
+            "both model_rules and legacy model_capabilities are configured",
+        )
+
+    if has_raw_model_capabilities:
+        return DoctorResult(
+            "warn",
+            "model metadata",
+            f"legacy model_capabilities normalized to {len(model_rules)} model_rules",
+        )
+
+    return DoctorResult(
+        "ok",
+        "model metadata",
+        f"model_rules entries: {len(model_rules)}; legacy model_capabilities entries: 0",
+    )
+
+
+def build_doctor_results(
+    config_path: str | None, *, models_dir: Path | None = None
+) -> list[DoctorResult]:
+    """Build read-only diagnostics for config and bundled classifier assets."""
+    from optiproxai.config import load_config
+
+    raw_config_keys = _load_raw_config_keys(config_path)
+    cfg = load_config(config_path, strict=True)
+    resolved_models_dir = models_dir or Path.cwd() / "models"
+
+    results = [
+        DoctorResult("ok", "config", "strict config loaded successfully"),
+        DoctorResult(
+            "ok" if cfg.providers else "error",
+            "providers",
+            f"{len(cfg.providers)} provider(s) configured: {', '.join(cfg.providers) or '(none)'}",
+        ),
+        DoctorResult(
+            "ok" if cfg.profiles else "error",
+            "profiles",
+            "; ".join(
+                f"{name} ({_profile_tier_count(profile)} tier(s))"
+                for name, profile in cfg.profiles.items()
+            )
+            or "(none)",
+        ),
+    ]
+
+    results.append(_model_metadata_result(cfg, raw_config_keys))
+    results.append(_embedding_result(cfg))
+
+    results.append(_classifier_asset_result("tier_classifier.pkl", resolved_models_dir))
+    results.append(
+        _classifier_asset_result("feature_classifier.pkl", resolved_models_dir)
+    )
+    return results
+
+
+def _handle_config_error(e: ConfigNotFoundError | ConfigIncompleteError) -> NoReturn:
+    """Print a user-friendly config error and exit."""
+    click.echo(f"Error: {e}", err=True)
+    raise SystemExit(1)
+
+
+def _mask_keys_in_decision(value: Any) -> Any:
+    """Mask non-empty api_key values in a routing decision dump."""
+    if isinstance(value, dict):
+        return {
+            key: "***"
+            if key == "api_key" and isinstance(item, str) and item
+            else _mask_keys_in_decision(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_keys_in_decision(item) for item in value]
+    return value
+
+
+@click.group()
+@click.version_option(package_name="optiproxai")
+def main():
+    """OptiProxAI — LLM smart router with OpenAI-compatible proxy."""
+
+
+@main.command()
+@click.option("--config", "config_path", default=None, help="Path to config.yaml")
+@click.option("--host", default=None, help="Bind host (overrides config)")
+@click.option(
+    "--port",
+    default=None,
+    type=click.IntRange(1, 65535),
+    help="Bind port (overrides config)",
+)
+def serve(config_path: str | None, host: str | None, port: int | None):
+    """Start the OptiProxAI proxy server."""
+    import uvicorn
+
+    from optiproxai.config import load_config
+    from optiproxai.proxy import app, configure
+
+    try:
+        cfg = load_config(config_path, strict=True)
+    except (ConfigNotFoundError, ConfigIncompleteError) as e:
+        _handle_config_error(e)
+
+    configure(config_path)
+
+    bind_host = host or cfg.host
+    bind_port = port or cfg.port
+
+    click.echo(f"Starting OptiProxAI proxy on {bind_host}:{bind_port}")
+
+    uvicorn.run(app, host=bind_host, port=bind_port, log_level="info")
+
+
+@main.command("route")
+@click.argument("prompt")
+@click.option("--config", "config_path", default=None, help="Path to config.yaml")
+@click.option(
+    "--profile", default=None, help="Routing profile (e.g. auto, eco, premium)"
+)
+def route_cmd(prompt: str, config_path: str | None, profile: str | None):
+    """Classify a prompt and show the routing decision."""
+    from optiproxai.config import load_config
+    from optiproxai.router import Router, parse_tier_override
+
+    try:
+        cfg = load_config(config_path, strict=True)
+    except (ConfigNotFoundError, ConfigIncompleteError) as e:
+        _handle_config_error(e)
+
+    router = Router(cfg)
+
+    messages = [{"role": "user", "content": prompt}]
+    tier_override, stripped_messages = parse_tier_override(messages)
+    decision = router.route(
+        stripped_messages, profile=profile, tier_override=tier_override
+    )
+    safe_decision = _mask_keys_in_decision(decision.model_dump())
+
+    click.echo(json.dumps(safe_decision, indent=2))
+
+
+@main.command("doctor")
+@click.option("--config", "config_path", default=None, help="Path to config.yaml")
+@click.option(
+    "--models-dir",
+    type=click.Path(file_okay=False, path_type=Path),
+    default=None,
+    help="Directory containing classifier assets (default: ./models)",
+)
+def doctor_cmd(config_path: str | None, models_dir: Path | None):
+    """Run read-only diagnostics for config and classifier assets."""
+    click.echo("OptiProxAI doctor")
+    click.echo("===========")
+    try:
+        results = build_doctor_results(config_path, models_dir=models_dir)
+    except (
+        ConfigNotFoundError,
+        ConfigIncompleteError,
+        ValueError,
+        yaml.YAMLError,
+    ) as e:
+        click.echo(
+            f"[ERROR] config: {_redact_secret_text(type(e).__name__ + ': ' + str(e))}"
+        )
+        raise SystemExit(1) from None
+
+    for result in results:
+        click.echo(result.format_line())
+
+    if any(result.severity == "error" for result in results):
+        raise SystemExit(1)
+
+
+@main.command("config")
+@click.option("--config", "config_path", default=None, help="Path to config.yaml")
+def config_cmd(config_path: str | None):
+    """Show current configuration."""
+    from optiproxai.config import load_config
+
+    try:
+        cfg = load_config(config_path, strict=True)
+    except (ConfigNotFoundError, ConfigIncompleteError) as e:
+        _handle_config_error(e)
+
+    click.echo(f"Host: {cfg.host}")
+    click.echo(f"Port: {cfg.port}")
+    click.echo(f"Default provider: {cfg.default_provider}")
+    click.echo(f"Default profile: {cfg.default_profile}")
+    click.echo()
+
+    click.echo("Providers:")
+    for name, prov in cfg.providers.items():
+        click.echo(f"  {name}:")
+        click.echo(f"    base_url: {prov.base_url}")
+        click.echo(f"    models: {', '.join(prov.models)}")
+        click.echo(f"    api_key: {'***' if prov.api_key else '(none)'}")
+    click.echo()
+
+    click.echo("Profiles:")
+    for name, prof in cfg.profiles.items():
+        click.echo(f"  {name}: {prof}")
+
+
+# ---------------------------------------------------------------------------
+# optiproxai init — generate a starter config
+# ---------------------------------------------------------------------------
+
+_STARTER_CONFIG = textwrap.dedent("""\
+    # OptiProxAI Smart Router — Configuration
+    # Docs: https://github.com/marcusyoung/optiproxai#configuration
+    #
+    # Env vars: use ${VAR_NAME} syntax for secrets.
+
+    host: "0.0.0.0"
+    port: 18420
+
+    default_provider: openrouter
+    default_profile: auto
+
+    # ---------------------------------------------------------------------------
+    # Providers — add your LLM backends here
+    # ---------------------------------------------------------------------------
+    providers:
+      openrouter:
+        name: openrouter
+        base_url: "https://openrouter.ai/api/v1"
+        api_key: "${OPENROUTER_API_KEY}"
+
+    # Runtime embeddings for the distilled feature classifier.
+    # mode: api | local | disabled. local mode requires local_model and optional
+    # sentence-transformers installation; disabled mode uses conservative fallback.
+    embedding:
+      mode: api
+      provider: openrouter
+      model: "openai/text-embedding-3-small"
+      timeout_seconds: 5.0
+      # local_model: "sentence-transformers/all-MiniLM-L6-v2"
+
+    # ---------------------------------------------------------------------------
+    # Routing Profiles
+    # ---------------------------------------------------------------------------
+    profiles:
+      auto:
+        tiers:
+          SIMPLE:
+            primary: "google/gemini-2.5-flash"
+            fallback: []
+            provider: default
+          MEDIUM:
+            primary: "anthropic/claude-sonnet-4"
+            fallback:
+              - "openai/gpt-4.1"
+            provider: default
+          COMPLEX:
+            primary: "anthropic/claude-opus-4"
+            fallback:
+              - "openai/o3"
+            provider: default
+          REASONING:
+            primary: "anthropic/claude-opus-4"
+            fallback:
+              - "openai/o3"
+            provider: default
+""")
+
+
+@main.command("init")
+@click.option(
+    "--path",
+    "output_path",
+    default=None,
+    help="Where to write config (default: XDG config dir)",
+)
+@click.option("--force", is_flag=True, help="Overwrite existing config")
+def init_cmd(output_path: str | None, force: bool):
+    """Create a starter configuration file."""
+    from optiproxai.dirs import config_dir
+
+    if output_path:
+        target = os.path.expanduser(output_path)
+    else:
+        target = str(config_dir() / "config.yaml")
+
+    if os.path.exists(target) and not force:
+        click.echo(f"Config already exists: {target}")
+        click.echo("Use --force to overwrite.")
+        raise SystemExit(1)
+
+    target_dir = os.path.dirname(target)
+    if target_dir:
+        os.makedirs(target_dir, exist_ok=True)
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(_STARTER_CONFIG)
+
+    click.echo(f"Created starter config: {target}")
+    click.echo()
+    click.echo("Next steps:")
+    click.echo("  1. Edit the config to add your API keys and preferred models")
+    click.echo('  2. Run `optiproxai route "hello"` to test routing')
+    click.echo("  3. Run `optiproxai serve` to start the proxy server")
+
+
+# ---------------------------------------------------------------------------
+# optiproxai keys — API key management
+# ---------------------------------------------------------------------------
+
+
+@main.group("keys")
+def keys_group():
+    """Manage API keys for OptiProxAI proxy access."""
+
+
+def _validate_key_name(name: str) -> str:
+    normalized = name.strip()
+    if not normalized or any(ord(char) < 32 for char in normalized):
+        raise click.ClickException(
+            "API key name must be non-empty and must not contain control characters"
+        )
+    return normalized
+
+
+@keys_group.command("add")
+@click.argument("name")
+def keys_add(name: str):
+    """Create a new API key with the given NAME label."""
+    from optiproxai.api_keys import generate_key
+
+    name = _validate_key_name(name)
+    raw = generate_key(name)
+    click.echo(f"Created API key: {name}")
+    click.echo()
+    click.echo(f"  {raw}")
+    click.echo()
+    click.echo("Save this key — it cannot be shown again.")
+
+
+@keys_group.command("list")
+def keys_list():
+    """List all API keys (names and prefixes only)."""
+    from optiproxai.api_keys import list_keys
+
+    entries = list_keys()
+    if not entries:
+        click.echo(
+            "No API keys configured. Use `optiproxai keys add <name>` to create one."
+        )
+        return
+
+    click.echo(f"{'NAME':<20} {'PREFIX':<12}")
+    click.echo("-" * 32)
+    for entry in entries:
+        click.echo(f"{entry.name:<20} {entry.prefix:<12}")
+
+
+@keys_group.command("remove")
+@click.argument("identifier")
+def keys_remove(identifier: str):
+    """Remove an API key by NAME or PREFIX."""
+    from optiproxai.api_keys import list_keys, remove_key
+
+    redacted_identifier = _redact_secret_text(identifier)
+    lookup_identifier = identifier
+    if identifier.startswith("optiproxai-"):
+        lookup_identifier = identifier.removeprefix("optiproxai-")[:8]
+
+    matches = [
+        entry
+        for entry in list_keys()
+        if entry.name == lookup_identifier or entry.prefix == lookup_identifier
+    ]
+    if not matches:
+        click.echo(f"No API key found matching: {redacted_identifier}")
+        raise SystemExit(1)
+    if len(matches) > 1:
+        click.echo(f"Ambiguous API key identifier: {redacted_identifier}")
+        raise SystemExit(1)
+
+    if remove_key(lookup_identifier):
+        click.echo(f"Removed API key: {redacted_identifier}")
+    else:
+        click.echo(f"No API key found matching: {redacted_identifier}")
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

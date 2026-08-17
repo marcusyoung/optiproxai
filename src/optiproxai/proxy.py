@@ -1,0 +1,2366 @@
+"""OpenAI-compatible proxy server for OptiProxAI LLM smart router."""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import logging
+import os
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
+from urllib.parse import unquote
+
+import httpx
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from starlette.middleware.base import BaseHTTPMiddleware
+
+from optiproxai.api_keys import has_keys, validate_key
+from optiproxai.compaction import (
+    BackgroundCompactionWorker,
+    CompactionResult,
+    _merge_summaries,
+    generate_summary,
+    get_worker,
+    set_worker,
+    try_sync_compaction,
+)
+from optiproxai.compaction_store import (
+    enqueue_summary,
+    get_inflight_summary,
+    get_latest_ready_summary_for_session,
+    get_ready_summary,
+    get_snapshot,
+    init_db,
+    mark_stale_summaries,
+    resolve_session_id,
+    save_snapshot,
+    snapshot_hash,
+    upsert_session,
+)
+from optiproxai.config import ContentPartPolicy, OptiproxaiConfig, load_config
+from optiproxai.dashboard import (
+    dashboard_needs_stderr_backfill,
+    get_dashboard_stats,
+    ingest_execution_logs,
+    ingest_jsonl_logs,
+    ingest_stderr_proxy_logs,
+    log_execution_event,
+    recommended_dashboard_ingest_days,
+    render_dashboard_html,
+)
+from optiproxai.fallback_backoff import FallbackBackoffState
+from optiproxai.router import (
+    CapabilityNotSatisfiedError,
+    FallbackEntry,
+    InputLimitNotSatisfiedError,
+    Router,
+    RoutingDecision,
+    parse_tier_override,
+)
+
+logger = logging.getLogger("optiproxai.proxy")
+logger.setLevel(logging.DEBUG)
+_handler = logging.StreamHandler(sys.stderr)
+_handler.setFormatter(
+    logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+)
+logger.addHandler(_handler)
+
+# ── Global state ──────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class RuntimeState:
+    """Active runtime state that can be atomically swapped on reload."""
+
+    config_path: str | None
+    config: OptiproxaiConfig
+    router: Router
+    fallback_backoff_state: FallbackBackoffState
+    config_loaded_at: str
+    version: int
+
+
+@dataclass(frozen=True)
+class ToolsCapabilityDecision:
+    """Auditable result of policy-based tools capability detection."""
+
+    policy: str
+    declared: bool
+    required: bool
+    trigger: str
+
+
+@dataclass(frozen=True)
+class DecorativeToolSchemaAdaptation:
+    """Audit metadata for upstream decorative tool schema handling."""
+
+    policy: str
+    declared: bool
+    required: bool
+    applied: bool
+    stripped_fields: tuple[str, ...]
+
+
+_state: RuntimeState | None = None
+# Backward-compat module globals (kept in sync with _state)
+_config: OptiproxaiConfig | None = None
+_router: Router | None = None
+_http: httpx.AsyncClient | None = None
+_reload_lock = asyncio.Lock()
+
+
+def _resolve_config_path(explicit: str | None = None) -> str | None:
+    """Return the config file path from explicit arg, env-var, or None (auto-discover)."""
+    if explicit:
+        return explicit
+    return os.environ.get("OPTIPROXAI_CONFIG")
+
+
+def _now_utc_iso() -> str:
+    """Return current UTC timestamp in RFC3339 format."""
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _build_runtime_state(
+    config_path: str | None = None, *, strict: bool = False
+) -> RuntimeState:
+    """Load config and build an immutable runtime state snapshot."""
+    path = _resolve_config_path(config_path)
+    cfg = load_config(path, strict=strict)
+    fallback_backoff_state = FallbackBackoffState(cfg.smart_proxy.fallback_backoff)
+    if _state is not None:
+        fallback_backoff_state = _state.fallback_backoff_state
+        fallback_backoff_state.update_config(cfg.smart_proxy.fallback_backoff)
+    router = Router(cfg, fallback_backoff_state=fallback_backoff_state)
+
+    next_version = 1
+    if _state is not None:
+        next_version = _state.version + 1
+
+    return RuntimeState(
+        config_path=path,
+        config=cfg,
+        router=router,
+        fallback_backoff_state=fallback_backoff_state,
+        config_loaded_at=_now_utc_iso(),
+        version=next_version,
+    )
+
+
+def _activate_state(new_state: RuntimeState) -> None:
+    """Atomically publish runtime state and keep legacy globals synchronized."""
+    global _state, _config, _router
+    _state = new_state
+    _config = new_state.config
+    _router = new_state.router
+
+
+def _runtime_state_from_legacy_globals() -> RuntimeState | None:
+    """Build a fallback runtime state from legacy globals when available."""
+    if _config is None or _router is None:
+        return None
+    return RuntimeState(
+        config_path=_resolve_config_path(),
+        config=_config,
+        router=_router,
+        fallback_backoff_state=_router.fallback_backoff_state,
+        config_loaded_at=_now_utc_iso(),
+        version=0,
+    )
+
+
+def _require_runtime_state() -> RuntimeState:
+    """Return active runtime state or fail fast if not configured."""
+    legacy = _runtime_state_from_legacy_globals()
+
+    if _state is not None:
+        if legacy is not None and (
+            _state.config is not _config or _state.router is not _router
+        ):
+            # Test/backward-compat path where legacy globals are swapped directly.
+            return legacy
+        return _state
+
+    if legacy is not None:
+        return legacy
+
+    raise RuntimeError("Runtime state is not configured")
+
+
+def _build_compaction_worker(
+    config: OptiproxaiConfig,
+) -> BackgroundCompactionWorker | None:
+    """Build a background compaction worker from config, if enabled."""
+    cc = config.smart_proxy.context_compaction
+    if not cc.enabled:
+        return None
+
+    init_db()
+    max_conc = cc.background_precompaction.max_concurrency
+    return BackgroundCompactionWorker(max_concurrency=max_conc)
+
+
+def configure(config_path: str | None = None) -> None:
+    """Load config and build the runtime state (called before app startup)."""
+    state = _build_runtime_state(config_path, strict=False)
+    _activate_state(state)
+    logger.info(
+        "Runtime configured config_path=%s version=%d loaded_at=%s",
+        state.config_path,
+        state.version,
+        state.config_loaded_at,
+    )
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http
+    if _state is None:
+        configure()
+
+    _http = httpx.AsyncClient(
+        timeout=httpx.Timeout(connect=10.0, read=300.0, write=10.0, pool=10.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    logger.info("HTTP connection pool started")
+
+    runtime = _require_runtime_state()
+    worker = None
+    try:
+        worker = _build_compaction_worker(runtime.config)
+        set_worker(worker)
+        if worker is not None:
+            logger.info(
+                "Smart-proxy context compaction enabled (worker started) version=%d",
+                runtime.version,
+            )
+    except Exception:
+        set_worker(None)
+        logger.exception("Failed to initialise compaction worker during startup")
+
+    yield
+
+    # Shutdown background worker
+    active_worker = get_worker()
+    if active_worker is not None:
+        await active_worker.shutdown()
+        set_worker(None)
+
+    if _http is not None:
+        await _http.aclose()
+    logger.info("HTTP connection pool closed")
+
+
+# ── App ───────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="optiproxai", version="0.1.0", lifespan=lifespan)
+
+
+# ── Auth middleware ─────────────────────────────────────────────────────────
+
+_AUTH_EXEMPT = {"/health", "/docs", "/openapi.json", "/admin/reload-config"}
+
+
+class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
+    """Require a valid Bearer token when API keys are configured."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Skip auth if no keys configured (backward-compat)
+        if not has_keys():
+            return await call_next(request)
+
+        # Exempt non-API paths
+        if request.url.path in _AUTH_EXEMPT:
+            return await call_next(request)
+
+        auth = request.headers.get("authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:]
+            if validate_key(token):
+                return await call_next(request)
+
+        return _openai_error(401, "Invalid or missing API key", "authentication_error")
+
+
+app.add_middleware(ApiKeyAuthMiddleware)
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _openai_error(
+    status: int, message: str, err_type: str = "invalid_request_error"
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={
+            "error": {
+                "message": message,
+                "type": err_type,
+                "param": None,
+                "code": None,
+            }
+        },
+    )
+
+
+def _has_tool_declarations(body: dict[str, Any]) -> bool:
+    """Return True when the request declares OpenAI tools/functions schemas."""
+    return "tools" in body or "functions" in body
+
+
+def _tool_choice_requires_tools(body: dict[str, Any]) -> bool:
+    """Return True when request fields explicitly force tool/function use."""
+    tool_choice = body.get("tool_choice")
+    tool_choice_forced = False
+    if isinstance(tool_choice, str):
+        tool_choice_forced = tool_choice not in {"auto", "none"}
+    elif isinstance(tool_choice, dict):
+        tool_choice_forced = True
+
+    function_call = body.get("function_call")
+    function_call_forced = False
+    if isinstance(function_call, str):
+        function_call_forced = function_call not in {"auto", "none"}
+    elif isinstance(function_call, dict):
+        function_call_forced = True
+
+    return tool_choice_forced or function_call_forced
+
+
+def _latest_user_message_index(messages: list[Any]) -> int:
+    """Return the latest user message index, or -1 when no user message exists."""
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return idx
+    return -1
+
+
+def _message_has_tool_activity(message: dict[str, Any]) -> bool:
+    """Return True for assistant/tool messages that indicate active tool state."""
+    role = message.get("role")
+    if role in {"tool", "function"}:
+        return True
+    if role == "assistant":
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return True
+        return "function_call" in message and message.get("function_call") is not None
+    return False
+
+
+def _has_active_tool_history(body: dict[str, Any]) -> bool:
+    """Return True when recent message history after the latest user has tool state."""
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return False
+
+    latest_user_idx = _latest_user_message_index(messages)
+    recent_messages = messages[latest_user_idx + 1 :]
+    return any(
+        isinstance(message, dict) and _message_has_tool_activity(message)
+        for message in recent_messages
+    )
+
+
+def _decide_tools_capability(
+    body: dict[str, Any], policy: str = "declared"
+) -> ToolsCapabilityDecision:
+    """Apply the configured tools capability policy to a request body."""
+    if policy not in {"declared", "active"}:
+        raise ValueError(f"Unsupported tools capability detection policy: {policy}")
+
+    declared = _has_tool_declarations(body)
+    if policy == "declared":
+        return ToolsCapabilityDecision(
+            policy=policy,
+            declared=declared,
+            required=declared,
+            trigger="declaration" if declared else "none",
+        )
+
+    forced = _tool_choice_requires_tools(body)
+    if forced:
+        return ToolsCapabilityDecision(
+            policy=policy,
+            declared=declared,
+            required=True,
+            trigger="forced_choice",
+        )
+
+    active_history = _has_active_tool_history(body)
+    if active_history:
+        return ToolsCapabilityDecision(
+            policy=policy,
+            declared=declared,
+            required=True,
+            trigger="active_history",
+        )
+
+    return ToolsCapabilityDecision(
+        policy=policy,
+        declared=declared,
+        required=False,
+        trigger="declaration_ignored" if declared else "none",
+    )
+
+
+_DECORATIVE_TOOL_SCHEMA_FIELDS = ("tools", "functions", "tool_choice", "function_call")
+
+
+def _adapt_decorative_tool_schema_payload(
+    body: dict[str, Any],
+    tools_decision: ToolsCapabilityDecision,
+    handling_policy: str = "preserve",
+) -> tuple[dict[str, Any], DecorativeToolSchemaAdaptation]:
+    """Return an upstream payload copy adapted for decorative tool schemas.
+
+    Only top-level schema/control fields are removed, and only when the existing
+    tools capability decision has already classified declarations as decorative.
+    """
+    if handling_policy not in {"preserve", "strip"}:
+        raise ValueError(
+            f"Unsupported decorative tool schema handling policy: {handling_policy}"
+        )
+
+    should_strip = (
+        handling_policy == "strip"
+        and tools_decision.declared
+        and not tools_decision.required
+    )
+    stripped_fields = tuple(
+        field for field in _DECORATIVE_TOOL_SCHEMA_FIELDS if field in body
+    )
+    if not should_strip:
+        return dict(body), DecorativeToolSchemaAdaptation(
+            policy=handling_policy,
+            declared=tools_decision.declared,
+            required=tools_decision.required,
+            applied=False,
+            stripped_fields=(),
+        )
+
+    adapted_body = {
+        key: value for key, value in body.items() if key not in stripped_fields
+    }
+    return adapted_body, DecorativeToolSchemaAdaptation(
+        policy=handling_policy,
+        declared=tools_decision.declared,
+        required=tools_decision.required,
+        applied=True,
+        stripped_fields=stripped_fields,
+    )
+
+
+def _decorative_tool_schema_adaptation_payload(
+    adaptation: DecorativeToolSchemaAdaptation,
+) -> dict[str, Any]:
+    """Return JSON-safe audit metadata without schema names or contents."""
+    return {
+        "policy": adaptation.policy,
+        "declared": adaptation.declared,
+        "required": adaptation.required,
+        "applied": adaptation.applied,
+        "stripped_fields": list(adaptation.stripped_fields),
+    }
+
+
+def _detect_required_capabilities(
+    body: dict[str, Any], tools_policy: str = "declared"
+) -> set[str]:
+    """Detect required capabilities from request body.
+
+    Returns:
+        Set of required capabilities: 'vision', 'tools', 'json_mode'.
+    """
+    required: set[str] = set()
+
+    # Check for vision capability
+    messages = body.get("messages", [])
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict) and "content" in msg:
+                content = msg["content"]
+                if isinstance(content, list):
+                    for block in content:
+                        if isinstance(block, dict) and block.get("type") == "image_url":
+                            required.add("vision")
+                            break
+
+    tools_decision = _decide_tools_capability(body, tools_policy)
+    if tools_decision.required:
+        required.add("tools")
+
+    # Check for json_mode capability
+    response_format = body.get("response_format")
+    if isinstance(response_format, dict):
+        fmt_type = response_format.get("type")
+        if fmt_type in ("json_object", "json_schema"):
+            required.add("json_mode")
+
+    return required
+
+
+def _optiproxai_headers(
+    decision: RoutingDecision,
+    *,
+    actual_model: str | None = None,
+    actual_provider: str | None = None,
+) -> dict[str, str]:
+    return {
+        "X-Optiproxai-Tier": str(decision.tier),
+        "X-Optiproxai-Model": actual_model or decision.model,
+        "X-Optiproxai-Provider": actual_provider or decision.provider,
+        "X-Optiproxai-Score": f"{decision.score:.4f}",
+        "X-Optiproxai-Signals": json.dumps(decision.signals)
+        if decision.signals
+        else "{}",
+    }
+
+
+def _parse_upstream_json(text: str) -> dict[str, Any]:
+    """Parse JSON, tolerating an erroneous trailing SSE DONE marker."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        data, idx = json.JSONDecoder().raw_decode(text)
+        trailing = text[idx:].strip()
+        if trailing != "data: [DONE]":
+            raise
+        if not isinstance(data, dict):
+            raise TypeError("Upstream JSON root must be an object")
+        return data
+
+
+def _get_default_provider_info(state: RuntimeState) -> tuple[str, str, str]:
+    """Return (base_url, api_key, model) for the default provider."""
+    dp_name = state.config.default_provider
+    dp = state.config.providers[dp_name]
+    base_url = dp.base_url.rstrip("/")
+    api_key = dp.api_key or ""
+    # pick first model from provider as default
+    model = dp.models[0] if dp.models else "gpt-4o-mini"
+    return base_url, api_key, model
+
+
+def _collect_models(state: RuntimeState) -> list[dict[str, Any]]:
+    """Return all available model objects in OpenAI list-models format."""
+    ts = int(time.time())
+    data: list[dict[str, Any]] = []
+
+    # Virtual optiproxai models (one per profile)
+    for profile_name in state.config.profiles:
+        data.append(
+            {
+                "id": f"optiproxai/{profile_name}",
+                "object": "model",
+                "created": ts,
+                "owned_by": "optiproxai",
+            }
+        )
+
+    # Collect underlying models from all profiles
+    seen_models: set[str] = set()
+    for profile in state.config.profiles.values():
+        for tier_cfg in profile.tiers.values():
+            all_model_ids = [
+                *tier_cfg.primary_model_ids(),
+                *tier_cfg.fallback_model_ids(),
+            ]
+            for model_id in all_model_ids:
+                if model_id and model_id not in seen_models:
+                    seen_models.add(model_id)
+                    data.append(
+                        {
+                            "id": model_id,
+                            "object": "model",
+                            "created": ts,
+                            "owned_by": "provider",
+                        }
+                    )
+
+    return data
+
+
+def _log_usage(
+    model: str,
+    provider: str | None,
+    usage: dict[str, Any] | None,
+    profile: str | None = None,
+    elapsed_ms: float | None = None,
+    *,
+    decision: RoutingDecision | None = None,
+    request_id: str | None = None,
+    compaction_result: CompactionResult | None = None,
+) -> None:
+    """Log token usage from an upstream response."""
+    if not usage:
+        return
+    prompt = usage.get("prompt_tokens", 0)
+    completion = usage.get("completion_tokens", 0)
+    total = usage.get("total_tokens", 0) or (prompt + completion)
+    parts = []
+    if request_id:
+        parts.append(f"request_id={request_id}")
+    parts.extend(
+        [
+            f"model={model}",
+            f"provider={provider or 'unknown'}",
+            f"prompt={prompt}",
+            f"completion={completion}",
+            f"total={total}",
+        ]
+    )
+    if profile:
+        parts.append(f"profile={profile}")
+    if elapsed_ms is not None:
+        parts.append(f"elapsed_ms={elapsed_ms:.0f}")
+    logger.info("USAGE %s", " ".join(parts))
+
+    log_execution_event(
+        request_id=request_id,
+        tier=decision.tier if decision else None,
+        score=decision.score if decision else None,
+        confidence=decision.confidence if decision else None,
+        agentic_score=decision.agentic_score if decision else None,
+        model=model,
+        provider=provider,
+        profile=profile,
+        prompt_tokens=prompt,
+        completion_tokens=completion,
+        total_tokens=total,
+        elapsed_ms=elapsed_ms,
+        compaction_mode=compaction_result.mode if compaction_result else None,
+        compaction_tokens_saved=compaction_result.estimated_tokens_saved
+        if compaction_result
+        else 0,
+        compaction_original_tokens=compaction_result.original_tokens
+        if compaction_result
+        else 0,
+        compaction_session_id=compaction_result.session_id
+        if compaction_result
+        else None,
+    )
+
+
+async def _proxy_upstream(
+    base_url: str,
+    api_key: str,
+    body: dict[str, Any],
+    decision: RoutingDecision | None,
+    profile: str | None = None,
+    *,
+    actual_provider: str | None = None,
+    request_id: str | None = None,
+    compaction_result: CompactionResult | None = None,
+) -> StreamingResponse | JSONResponse:
+    """Forward a chat-completion request to the upstream provider."""
+    assert _http is not None
+    # Avoid doubling /v1 if base_url already ends with it
+    if base_url.endswith("/v1"):
+        url = f"{base_url}/chat/completions"
+    else:
+        url = f"{base_url}/v1/chat/completions"
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    is_streaming = body.get("stream", False)
+    model_name = body.get("model", "unknown")
+    extra_headers = (
+        _optiproxai_headers(
+            decision,
+            actual_model=model_name,
+            actual_provider=actual_provider,
+        )
+        if decision
+        else {}
+    )
+    t0 = time.monotonic()
+
+    try:
+        if is_streaming:
+            # Inject stream_options to request usage in final chunk
+            stream_opts = body.get("stream_options") or {}
+            stream_opts["include_usage"] = True
+            body["stream_options"] = stream_opts
+
+            req = _http.build_request("POST", url, json=body, headers=headers)
+            upstream = await _http.send(req, stream=True)
+
+            if upstream.status_code != 200:
+                raw = await upstream.aread()
+                await upstream.aclose()
+                return _openai_error(
+                    upstream.status_code,
+                    f"Upstream error: {raw.decode(errors='replace')[:500]}",
+                    "upstream_error",
+                )
+
+            line_iter = upstream.aiter_lines()
+            buffered_lines: list[str] = []
+            async for line in line_iter:
+                buffered_lines.append(line)
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                try:
+                    first_chunk = json.loads(line[6:])
+                except (json.JSONDecodeError, TypeError):
+                    break
+                successful_failure = _parse_successful_failure(first_chunk)
+                if successful_failure is not None:
+                    await upstream.aclose()
+                    status_code, message, error_type = successful_failure
+                    return _openai_error(
+                        status_code,
+                        f"Upstream error: {message}",
+                        error_type,
+                    )
+                break
+
+            async def _stream():
+                last_usage: dict[str, Any] | None = None
+                try:
+                    for line in buffered_lines:
+                        yield f"{line}\n"
+                        if line.startswith("data: ") and line != "data: [DONE]":
+                            try:
+                                chunk = json.loads(line[6:])
+                                usage = chunk.get("usage")
+                                if usage:
+                                    last_usage = usage
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                    async for line in line_iter:
+                        yield f"{line}\n"
+                        if line.startswith("data: ") and line != "data: [DONE]":
+                            try:
+                                chunk = json.loads(line[6:])
+                                usage = chunk.get("usage")
+                                if usage:
+                                    last_usage = usage
+                            except (json.JSONDecodeError, TypeError):
+                                pass
+                finally:
+                    await upstream.aclose()
+                    if last_usage is not None:
+                        elapsed = (time.monotonic() - t0) * 1000
+                        _log_usage(
+                            model_name,
+                            actual_provider,
+                            last_usage,
+                            profile,
+                            elapsed,
+                            decision=decision,
+                            request_id=request_id,
+                            compaction_result=compaction_result,
+                        )
+
+            resp_headers = dict(extra_headers)
+            resp_headers["Content-Type"] = "text/event-stream"
+            resp_headers["Cache-Control"] = "no-cache"
+            resp_headers["Connection"] = "keep-alive"
+            return StreamingResponse(
+                _stream(),
+                media_type="text/event-stream",
+                headers=resp_headers,
+            )
+        else:
+            resp = await _http.post(url, json=body, headers=headers)
+            elapsed = (time.monotonic() - t0) * 1000
+            if resp.status_code != 200:
+                return _openai_error(
+                    resp.status_code,
+                    f"Upstream error: {resp.text[:500]}",
+                    "upstream_error",
+                )
+            try:
+                resp_data = _parse_upstream_json(resp.text)
+            except Exception:
+                return _openai_error(
+                    resp.status_code,
+                    f"Upstream returned non-JSON: {resp.text[:500]}",
+                    "upstream_error",
+                )
+            successful_failure = _parse_successful_failure(resp_data)
+            if successful_failure is not None:
+                status_code, message, error_type = successful_failure
+                return _openai_error(
+                    status_code,
+                    f"Upstream error: {message}",
+                    error_type,
+                )
+            _log_usage(
+                model_name,
+                actual_provider,
+                resp_data.get("usage"),
+                profile,
+                elapsed,
+                decision=decision,
+                request_id=request_id,
+                compaction_result=compaction_result,
+            )
+            return JSONResponse(
+                content=resp_data,
+                headers=extra_headers,
+            )
+
+    except httpx.TimeoutException:
+        return _openai_error(504, "Upstream provider timed out", "timeout_error")
+    except httpx.HTTPError as exc:
+        return _openai_error(
+            502, f"Upstream connection error: {exc!r}", "upstream_error"
+        )
+
+
+# ── Fallback helpers ──────────────────────────────────────────────────────────
+
+
+def _is_retryable_error(result: StreamingResponse | JSONResponse) -> bool:
+    """Check if a response is a retryable upstream error (4xx, 5xx, timeout, connection error)."""
+    if isinstance(result, JSONResponse):
+        return 400 <= result.status_code < 600
+    return False
+
+
+def _parse_successful_failure(payload: Any) -> tuple[int, str, str] | None:
+    """Detect upstream errors encoded inside an HTTP 200 payload."""
+    if not isinstance(payload, dict):
+        return None
+
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+
+    error_type = str(error.get("type") or payload.get("type") or "")
+    message = str(error.get("message") or payload.get("message") or "")
+
+    if error_type.lower() == "overloaded_error" or message.lower() == "overloaded":
+        return 529, message or "Overloaded", "overloaded_error"
+
+    code = error.get("code") or ""
+    status = int(error.get("status") or error.get("status_code") or 0)
+    if not status:
+        code_lower = str(code).lower()
+        if "blocked" in code_lower or "spending" in code_lower or "limit" in code_lower:
+            status = 403
+        elif code_lower:
+            status = 500
+    if status:
+        return (
+            status,
+            message or str(code) or "Upstream error",
+            error_type or "upstream_error",
+        )
+
+    if message:
+        return 500, message, error_type or "upstream_error"
+
+    return None
+
+
+def _record_successful_candidate(
+    state: RuntimeState,
+    *,
+    model: str,
+    provider: str,
+) -> None:
+    """Reset retryable failure streak after a successful request."""
+    try:
+        state.fallback_backoff_state.record_success(model, provider)
+    except Exception:
+        logger.exception(
+            "Failed to reset fallback cooldown model=%s provider=%s",
+            model,
+            provider,
+        )
+
+
+def _record_retryable_failure(
+    state: RuntimeState,
+    *,
+    model: str,
+    provider: str,
+    status_code: int,
+) -> None:
+    """Record retryable failure for future cooldown filtering."""
+    try:
+        delay_seconds = None
+        if status_code in {401, 402, 403}:
+            delay_seconds = state.config.smart_proxy.fallback_backoff.max_delay_seconds
+        state.fallback_backoff_state.record_retryable_failure(
+            model,
+            provider,
+            delay_seconds=delay_seconds,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to apply fallback cooldown model=%s provider=%s status=%d",
+            model,
+            provider,
+            status_code,
+        )
+
+
+def _is_candidate_in_cooldown(
+    state: RuntimeState,
+    *,
+    model: str,
+    provider: str,
+) -> bool:
+    """Return True when the candidate should be skipped due to cooldown."""
+    try:
+        return state.fallback_backoff_state.is_in_cooldown(model, provider)
+    except Exception:
+        logger.exception(
+            "Failed to read fallback cooldown model=%s provider=%s",
+            model,
+            provider,
+        )
+        return False
+
+
+def _unique_fallbacks(decision: RoutingDecision) -> list[tuple[int, FallbackEntry]]:
+    """Return unique fallback entries excluding the selected primary candidate."""
+    primary_key = (decision.model, decision.provider)
+    seen: set[tuple[str, str]] = {primary_key}
+    unique: list[tuple[int, FallbackEntry]] = []
+    for original_idx, fb in enumerate(decision.fallbacks):
+        fb_key = (fb.model, fb.provider)
+        if fb_key in seen:
+            logger.debug(
+                "Skip fallback duplicate model=%s provider=%s original_idx=%d",
+                fb.model,
+                fb.provider,
+                original_idx,
+            )
+            continue
+        seen.add(fb_key)
+        unique.append((original_idx, fb))
+    return unique
+
+
+async def _try_with_fallbacks(
+    body: dict[str, Any],
+    decision: RoutingDecision,
+    profile: str | None = None,
+    *,
+    request_id: str | None = None,
+    compaction_result: CompactionResult | None = None,
+    state: RuntimeState | None = None,
+    fallback_body_base: dict[str, Any] | None = None,
+) -> StreamingResponse | JSONResponse:
+    """Try primary, then fallbacks on failure."""
+    runtime = state or _require_runtime_state()
+
+    # Try primary
+    primary_body = _prepare_body_for_candidate(
+        body, decision.model, decision.provider, runtime
+    )
+    result = await _proxy_upstream(
+        decision.base_url.rstrip("/"),
+        decision.api_key or "",
+        primary_body,
+        decision,
+        profile=profile,
+        actual_provider=decision.provider,
+        request_id=request_id,
+        compaction_result=compaction_result,
+    )
+
+    if not _is_retryable_error(result):
+        _record_successful_candidate(
+            runtime,
+            model=decision.model,
+            provider=decision.provider,
+        )
+        return result
+
+    _record_retryable_failure(
+        runtime,
+        model=decision.model,
+        provider=decision.provider,
+        status_code=result.status_code,
+    )
+
+    # Try fallbacks (exclude selected primary + deduplicate fallback candidates)
+    unique_fallbacks = _unique_fallbacks(decision)
+    for i, (original_idx, fb) in enumerate(unique_fallbacks):
+        if _is_candidate_in_cooldown(runtime, model=fb.model, provider=fb.provider):
+            logger.info(
+                "Skipping cooled fallback model=%s provider=%s source_idx=%d request_id=%s",
+                fb.model,
+                fb.provider,
+                original_idx,
+                request_id,
+            )
+            continue
+
+        logger.warning(
+            "FALLBACK [%d/%d] model=%s provider=%s (primary=%s failed, source_idx=%d)",
+            i + 1,
+            len(unique_fallbacks),
+            fb.model,
+            fb.provider,
+            decision.model,
+            original_idx,
+        )
+        fb_body_base = fallback_body_base if fallback_body_base is not None else body
+        fb_body = copy.deepcopy(fb_body_base)
+        fb_body["model"] = fb.model
+        # Restyle from a body without primary-provider proxy-injected reasoning controls.
+        if decision.reasoning_effort:
+            fb_style = _get_reasoning_style_for_candidate(
+                fb.model, fb.provider, runtime
+            )
+            fb_normalized_effort = _normalize_reasoning_effort(
+                fb_style, decision.reasoning_effort
+            )
+            fb_body = _apply_reasoning_for_style(
+                fb_body, fb_style, effort=decision.reasoning_effort
+            )
+            logger.info(
+                "REASONING_CONTROL injected (fallback) request_id=%s tier=%s style=%s original_effort=%s normalized_effort=%s provider=%s",
+                request_id,
+                decision.tier,
+                fb_style,
+                decision.reasoning_effort,
+                fb_normalized_effort,
+                fb.provider,
+            )
+        fb_body = _prepare_body_for_candidate(fb_body, fb.model, fb.provider, runtime)
+        result = await _proxy_upstream(
+            fb.base_url.rstrip("/"),
+            fb.api_key or "",
+            fb_body,
+            decision,
+            profile=profile,
+            actual_provider=fb.provider,
+            request_id=request_id,
+            compaction_result=compaction_result,
+        )
+        if not _is_retryable_error(result):
+            _record_successful_candidate(
+                runtime,
+                model=fb.model,
+                provider=fb.provider,
+            )
+            return result
+
+        _record_retryable_failure(
+            runtime,
+            model=fb.model,
+            provider=fb.provider,
+            status_code=result.status_code,
+        )
+
+    # All failed, return last error
+    return result
+
+
+# ── Reasoning control injection helpers ───────────────────────────────────────
+
+
+def _get_model_reasoning_style(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> str | None:
+    """Return model-specific reasoning_style override using prefix/provider matching."""
+    best_style: str | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        if not entry.reasoning_style:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_style = entry.reasoning_style
+    return best_style
+
+
+def _get_provider_reasoning_style(provider_name: str, runtime: RuntimeState) -> str:
+    """Return provider reasoning_style or default 'none'."""
+    provider_cfg = runtime.config.providers.get(provider_name)
+    if provider_cfg and hasattr(provider_cfg, "reasoning_style"):
+        return provider_cfg.reasoning_style  # type: ignore[attr-defined]
+    return "none"
+
+
+def _get_reasoning_style(decision: RoutingDecision, runtime: RuntimeState) -> str:
+    """Return model override reasoning_style, then provider reasoning_style."""
+    return _get_model_reasoning_style(
+        decision.model, decision.provider, runtime
+    ) or _get_provider_reasoning_style(decision.provider, runtime)
+
+
+def _get_reasoning_style_for_candidate(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> str:
+    """Return reasoning_style for arbitrary model/provider candidate."""
+    return _get_model_reasoning_style(
+        model, provider_name, runtime
+    ) or _get_provider_reasoning_style(provider_name, runtime)
+
+
+def _get_model_extra_body(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> dict[str, Any] | None:
+    """Return the best-matching model rule's extra_body, or None.
+
+    Uses the same prefix/provider scoring as reasoning_style: provider-specific
+    rules outrank provider-agnostic rules before prefix specificity is compared.
+    """
+    best_extra: dict[str, Any] | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        if not entry.extra_body:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_extra = entry.extra_body
+    return best_extra
+
+
+def _get_model_content_part_policy(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> ContentPartPolicy | None:
+    best_policy: ContentPartPolicy | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        if entry.content_part_policy is None:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_policy = entry.content_part_policy
+    return best_policy
+
+
+def _get_model_reasoning_content_support(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> bool | None:
+    """Return model-specific reasoning_content support using prefix/provider matching.
+
+    Provider-matching rules outrank provider-agnostic rules before prefix
+    specificity is considered. For example, a provider-specific wildcard rule
+    beats a longer provider-agnostic prefix rule for the same model.
+    """
+    best_support: bool | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        if entry.supports_reasoning_content is None:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_support = entry.supports_reasoning_content
+    return best_support
+
+
+def _supports_reasoning_content(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> bool:
+    """Return whether selected upstream explicitly supports messages[].reasoning_content."""
+    model_support = _get_model_reasoning_content_support(model, provider_name, runtime)
+    if model_support is not None:
+        return model_support
+    provider_cfg = runtime.config.providers.get(provider_name)
+    if provider_cfg is None:
+        provider_cfg = runtime.config.providers.get(runtime.config.default_provider)
+    if provider_cfg is None:
+        logger.warning(
+            "Unknown provider for reasoning_content support fallback model=%s provider=%s",
+            model,
+            provider_name,
+        )
+        return False
+    return bool(provider_cfg.supports_reasoning_content)
+
+
+def _sanitize_reasoning_content_for_candidate(
+    body: dict[str, Any], model: str, provider_name: str, runtime: RuntimeState
+) -> dict[str, Any]:
+    """Remove messages[].reasoning_content unless selected upstream declares support."""
+    if _supports_reasoning_content(model, provider_name, runtime):
+        return body
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    affected_indexes = [
+        idx
+        for idx, msg in enumerate(messages)
+        if isinstance(msg, dict) and "reasoning_content" in msg
+    ]
+    if not affected_indexes:
+        return body
+
+    sanitized_body = dict(body)
+    sanitized_messages = list(messages)
+    for idx in affected_indexes:
+        sanitized_msg = dict(messages[idx])
+        sanitized_msg.pop("reasoning_content")
+        sanitized_messages[idx] = sanitized_msg
+
+    removed_count = len(affected_indexes)
+    sanitized_body["messages"] = sanitized_messages
+    logger.debug(
+        "REASONING_CONTENT sanitized model=%s provider=%s removed_messages=%d",
+        model,
+        provider_name,
+        removed_count,
+    )
+    return sanitized_body
+
+
+def _text_from_content_part(part: dict[str, Any]) -> str:
+    for key in ("text", "content", "output"):
+        value = part.get(key)
+        if isinstance(value, str):
+            return value
+    return json.dumps(part, ensure_ascii=False, separators=(",", ":"))
+
+
+def _image_url_from_content_part(part: dict[str, Any]) -> dict[str, Any] | None:
+    image_url = part.get("image_url")
+    if isinstance(image_url, str):
+        return {"url": image_url, "detail": part.get("detail", "auto")}
+    if isinstance(image_url, dict):
+        return image_url
+    file_id = part.get("file_id")
+    if isinstance(file_id, str):
+        return {"url": file_id, "detail": part.get("detail", "auto")}
+    return None
+
+
+def _normalize_content_part(
+    part: dict[str, Any], policy: ContentPartPolicy
+) -> dict[str, Any] | None:
+    part_type = str(part.get("type") or "")
+    if part_type in policy.drop_types:
+        return None
+    if part_type in policy.text_types:
+        return {"type": "text", "text": _text_from_content_part(part)}
+    if part_type in policy.image_types:
+        image_url = _image_url_from_content_part(part)
+        if image_url is None:
+            return (
+                None
+                if policy.unknown == "drop"
+                else {"type": "text", "text": _text_from_content_part(part)}
+            )
+        return {"type": "image_url", "image_url": image_url}
+    if part_type in policy.allowed_types:
+        return part
+    if policy.unknown == "text":
+        return {"type": "text", "text": _text_from_content_part(part)}
+    if policy.unknown == "drop":
+        return None
+    return part
+
+
+def _normalize_message_content_for_candidate(
+    body: dict[str, Any], model: str, provider_name: str, runtime: RuntimeState
+) -> dict[str, Any]:
+    policy = _get_model_content_part_policy(model, provider_name, runtime)
+    if policy is None or policy.mode == "preserve":
+        return body
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    changed_indexes: list[int] = []
+    normalized_messages = list(messages)
+    normalized_parts_count = 0
+    removed_parts_count = 0
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict) or not isinstance(msg.get("content"), list):
+            continue
+        next_content: list[Any] = []
+        changed = False
+        for part in msg["content"]:
+            if not isinstance(part, dict):
+                next_content.append(part)
+                continue
+            normalized_part = _normalize_content_part(part, policy)
+            if normalized_part is None:
+                changed = True
+                removed_parts_count += 1
+                continue
+            if normalized_part != part:
+                changed = True
+                normalized_parts_count += 1
+            next_content.append(normalized_part)
+        if changed:
+            next_msg = dict(msg)
+            next_msg["content"] = next_content or ""
+            normalized_messages[idx] = next_msg
+            changed_indexes.append(idx)
+
+    if not changed_indexes:
+        return body
+
+    normalized_body = dict(body)
+    normalized_body["messages"] = normalized_messages
+    logger.debug(
+        "MESSAGE_CONTENT normalized model=%s provider=%s changed_messages=%d normalized_parts=%d removed_parts=%d",
+        model,
+        provider_name,
+        len(changed_indexes),
+        normalized_parts_count,
+        removed_parts_count,
+    )
+    return normalized_body
+
+
+def _prepare_body_for_candidate(
+    body: dict[str, Any], model: str, provider_name: str, runtime: RuntimeState
+) -> dict[str, Any]:
+    prepared = _sanitize_reasoning_content_for_candidate(
+        body, model, provider_name, runtime
+    )
+    prepared = _normalize_message_content_for_candidate(
+        prepared, model, provider_name, runtime
+    )
+    extra_body = _get_model_extra_body(model, provider_name, runtime)
+    if extra_body:
+        prepared = {**prepared, **extra_body}
+        logger.info(
+            "EXTRA_BODY model=%s provider=%s extra_body=%s",
+            model,
+            provider_name,
+            json.dumps(extra_body, sort_keys=True),
+        )
+    return prepared
+
+
+def _has_explicit_reasoning_control(body: dict[str, Any]) -> bool:
+    """Return True if body already contains any supported reasoning control field."""
+    if "reasoning" in body or "reasoning_effort" in body:
+        return True
+    if "thinking" in body:
+        return True
+    if "enable_thinking" in body:
+        return True
+    oc = body.get("output_config")
+    if isinstance(oc, dict) and "effort" in oc:
+        return True
+    gc = body.get("generationConfig")
+    if isinstance(gc, dict):
+        tc = gc.get("thinkingConfig")
+        if isinstance(tc, dict) and "thinkingBudget" in tc:
+            return True
+    return False
+
+
+def _normalize_reasoning_effort(style: str, effort: str) -> str:
+    """Normalize effort labels to values supported by each reasoning_style."""
+    normalized = effort.strip().lower()
+    aliases = {
+        "off": "none",
+        "false": "none",
+        "0": "none",
+        "highx": "xhigh",
+        "extra-high": "xhigh",
+        "extra_high": "xhigh",
+    }
+    normalized = aliases.get(normalized, normalized)
+
+    allowed_by_style = {
+        "openai": {"none", "low", "medium", "high"},
+        "xai": {"none", "low", "medium", "high"},
+        "anthropic": {"low", "medium", "high", "xhigh", "max"},
+        "dashscope": {"none", "low", "medium", "high"},
+        "gemini": {"none", "low", "medium", "high", "xhigh", "max"},
+    }
+    allowed = allowed_by_style.get(style, {"low", "medium", "high"})
+    if normalized in allowed:
+        return normalized
+    if normalized in {"xhigh", "max"}:
+        return "high"
+    return "medium"
+
+
+def _gemini_thinking_budget(effort: str) -> int:
+    """Map normalized effort labels to Gemini thinking budgets."""
+    return {
+        "none": 0,
+        "low": 1024,
+        "medium": 8192,
+        "high": 24576,
+        "xhigh": 32768,
+        "max": 32768,
+    }.get(effort, 8192)
+
+
+def _apply_reasoning_for_style(
+    body: dict[str, Any],
+    style: str,
+    effort: str = "medium",
+) -> dict[str, Any]:
+    """Apply provider-specific reasoning field shape for given style.
+
+    Does not overwrite explicit client-provided reasoning controls.
+    """
+    if style == "none":
+        return body
+    if _has_explicit_reasoning_control(body):
+        return body
+    normalized_effort = _normalize_reasoning_effort(style, effort)
+    if style == "openai":
+        body.setdefault("reasoning", {"effort": normalized_effort})
+    elif style == "xai":
+        body.setdefault("reasoning_effort", normalized_effort)
+    elif style == "anthropic":
+        oc = body.setdefault("output_config", {})
+        if isinstance(oc, dict):
+            oc.setdefault("effort", normalized_effort)
+    elif style == "dashscope":
+        body.setdefault("enable_thinking", normalized_effort != "none")
+    elif style == "gemini":
+        gc = body.setdefault("generationConfig", {})
+        if isinstance(gc, dict):
+            tc = gc.setdefault("thinkingConfig", {})
+            if isinstance(tc, dict):
+                tc.setdefault(
+                    "thinkingBudget", _gemini_thinking_budget(normalized_effort)
+                )
+    return body
+
+
+# ── Compaction helpers ────────────────────────────────────────────────────────
+
+
+def _compaction_headers(result: CompactionResult) -> dict[str, str]:
+    """Build X-Optiproxai-Compaction-* response headers from a CompactionResult."""
+    h: dict[str, str] = {
+        "X-Optiproxai-Compaction": result.mode,
+    }
+    if result.session_id:
+        h["X-Optiproxai-Compaction-Session"] = result.session_mode
+    if result.estimated_tokens_saved > 0:
+        h["X-Optiproxai-Compaction-Saved-Tokens"] = str(result.estimated_tokens_saved)
+    return h
+
+
+async def _resolve_compaction(
+    messages: list[dict[str, Any]],
+    request: Request,
+    profile: str | None,
+    request_id: str | None,
+    model: str | None = None,
+    *,
+    state: RuntimeState | None = None,
+) -> CompactionResult:
+    """Run compaction logic for a routed request.
+
+    Returns a CompactionResult describing the outcome. On any error the result
+    will have mode='failed' and the caller must use the original messages.
+    """
+    active_state = state or _require_runtime_state()
+    cc = active_state.config.smart_proxy.context_compaction
+    if not cc.enabled:
+        return CompactionResult(mode="off", messages=messages)
+
+    sync_cfg = cc.sync_compaction
+    bg_cfg = cc.background_precompaction
+
+    # Resolve session
+    explicit_header = request.headers.get(cc.session.header_name)
+    try:
+        session_id, session_mode = resolve_session_id(
+            messages,
+            explicit_header=explicit_header,
+            model=str(request.headers.get("x-optiproxai-model", "")),
+        )
+    except Exception as exc:
+        logger.warning("COMPACTION session resolution failed: %s", exc)
+        return CompactionResult(mode="failed", messages=messages, error=str(exc))
+
+    # Estimate token usage
+    from optiproxai.compaction import _estimate_tokens
+
+    prompt_tokens = _estimate_tokens(messages, model)
+    threshold_tokens = int(cc.context_window_tokens * sync_cfg.threshold_percent / 100)
+    bg_trigger_tokens = int(cc.context_window_tokens * bg_cfg.trigger_percent / 100)
+
+    # Persist session state (skipped when no session ID is available)
+    snap_hash_val = snapshot_hash(messages)
+    if session_id is not None:
+        try:
+            upsert_session(
+                session_id,
+                profile=profile,
+                request_id=request_id,
+                snapshot_hash=snap_hash_val,
+                prompt_tokens=prompt_tokens,
+            )
+            mark_stale_summaries(session_id, snap_hash_val)
+        except Exception as exc:
+            logger.warning("COMPACTION session persistence failed: %s", exc)
+
+    # Check for a ready cached summary (Phase B reuse)
+    compacted_messages = messages
+    mode = "skipped"
+    estimated_saved = 0
+
+    if sync_cfg.enabled:
+        # Cache lookup is only possible when a session ID is present
+        ready = None
+        if session_id is not None:
+            try:
+                ready = get_ready_summary(session_id, snap_hash_val)
+            except Exception as exc:
+                logger.warning("COMPACTION cache lookup failed: %s", exc)
+
+        if ready and ready.get("summary_text"):
+            # Reuse cached summary (Phase B hit)
+            compacted, saved = try_sync_compaction(
+                messages,
+                ready["summary_text"],
+                sync_cfg.protect_first_n,
+                sync_cfg.protect_last_n,
+                prompt_tokens,
+                model,
+            )
+            if compacted is not None:
+                compacted_messages = compacted
+                mode = "cached"
+                estimated_saved = saved
+                logger.info(
+                    "COMPACTION mode=cached session=%s snap=%s saved=%d original_tokens=%d compacted_tokens=%d request_id=%s",
+                    session_id,
+                    snap_hash_val[:8],
+                    saved,
+                    prompt_tokens,
+                    max(0, prompt_tokens - saved),
+                    request_id,
+                )
+            else:
+                mode = "skipped"
+        elif prompt_tokens >= threshold_tokens:
+            # Phase A: generate summary inline
+            summary_model = ""
+            base_url_for_summary = ""
+            api_key_for_summary = ""
+
+            try:
+                decision = active_state.router.resolve_model(
+                    profile=sync_cfg.summary_profile or None,
+                    tier="SIMPLE",
+                )
+                summary_model = decision.model
+                base_url_for_summary = decision.base_url.rstrip("/")
+                api_key_for_summary = decision.api_key
+            except Exception as exc:
+                logger.warning("COMPACTION resolve_model failed: %s", exc)
+
+            if summary_model and base_url_for_summary:
+                try:
+                    # Look up prior summary for incremental path (only when session is known)
+                    prior_summary_row = (
+                        get_latest_ready_summary_for_session(session_id)
+                        if session_id is not None
+                        else None
+                    )
+                    prior_text: str | None = None
+                    prior_covered: int = 0
+                    new_covered: int = 0
+
+                    if prior_summary_row and prior_summary_row.get("summary_text"):
+                        # Validate prior summary still applies to current messages
+                        prior_snap = get_snapshot(prior_summary_row["snapshot_hash"])
+                        if prior_snap:
+                            import json as _json
+
+                            prior_msgs = _json.loads(prior_snap["messages_json"])
+                            prior_covered_raw = (
+                                prior_summary_row.get("covered_message_count", 0) or 0
+                            )
+                            n = len(messages)
+                            has_system = (
+                                messages[0].get("role") == "system"
+                                if messages
+                                else False
+                            )
+                            head_end = sync_cfg.protect_first_n + (
+                                1 if has_system else 0
+                            )
+                            covered_end = head_end + prior_covered_raw
+                            # Validate: covered prefix of prior matches current messages
+                            if (
+                                covered_end <= len(prior_msgs)
+                                and covered_end <= n
+                                and prior_msgs[:covered_end] == messages[:covered_end]
+                            ):
+                                prior_text = prior_summary_row["summary_text"]
+                                prior_covered = prior_covered_raw
+
+                    if prior_text is not None:
+                        # Incremental path: summarize only the delta
+                        n = len(messages)
+                        has_system = (
+                            messages[0].get("role") == "system" if messages else False
+                        )
+                        head_end = sync_cfg.protect_first_n + (1 if has_system else 0)
+                        tail_start = n - sync_cfg.protect_last_n
+                        delta_messages = messages[head_end + prior_covered : tail_start]
+
+                        if not delta_messages:
+                            # No new messages since last summary — reuse prior
+                            delta_summary = ""
+                            final_summary = prior_text
+                            new_covered = prior_covered
+                        else:
+                            delta_summary = await generate_summary(
+                                delta_messages + messages[tail_start:],
+                                summary_model=summary_model,
+                                base_url=base_url_for_summary,
+                                api_key=api_key_for_summary,
+                                protect_first_n=0,
+                                protect_last_n=sync_cfg.protect_last_n,
+                                summary_ratio=sync_cfg.summary_ratio,
+                                min_summary_tokens=sync_cfg.min_summary_tokens,
+                                max_summary_tokens=sync_cfg.max_summary_tokens,
+                            )
+                            final_summary = await _merge_summaries(
+                                prior_text,
+                                delta_summary,
+                                sync_cfg.merge_threshold,
+                                summary_model=summary_model,
+                                base_url=base_url_for_summary,
+                                api_key=api_key_for_summary,
+                            )
+                            new_covered = max(0, tail_start - head_end)
+
+                        compacted, saved = try_sync_compaction(
+                            messages,
+                            final_summary,
+                            sync_cfg.protect_first_n,
+                            sync_cfg.protect_last_n,
+                            prompt_tokens,
+                            model,
+                        )
+                        summary_text = final_summary
+                    else:
+                        # Full single-pass (no prior summary)
+                        summary_text = await generate_summary(
+                            messages,
+                            summary_model=summary_model,
+                            base_url=base_url_for_summary,
+                            api_key=api_key_for_summary,
+                            protect_first_n=sync_cfg.protect_first_n,
+                            protect_last_n=sync_cfg.protect_last_n,
+                            summary_ratio=sync_cfg.summary_ratio,
+                            min_summary_tokens=sync_cfg.min_summary_tokens,
+                            max_summary_tokens=sync_cfg.max_summary_tokens,
+                        )
+                        n = len(messages)
+                        has_system = (
+                            messages[0].get("role") == "system" if messages else False
+                        )
+                        head_end = sync_cfg.protect_first_n + (1 if has_system else 0)
+                        tail_start = n - sync_cfg.protect_last_n
+                        new_covered = max(0, tail_start - head_end)
+                        compacted, saved = try_sync_compaction(
+                            messages,
+                            summary_text,
+                            sync_cfg.protect_first_n,
+                            sync_cfg.protect_last_n,
+                            prompt_tokens,
+                            model,
+                        )
+
+                    if compacted is not None:
+                        # Persist the generated summary for future reuse (only when session is known)
+                        if session_id is not None:
+                            try:
+                                snap_h = save_snapshot(
+                                    session_id, messages, prompt_tokens
+                                )
+                                from optiproxai.compaction_store import update_summary
+
+                                new_id = enqueue_summary(
+                                    session_id, snap_h, new_covered
+                                )
+                                update_summary(
+                                    new_id,
+                                    status="ready",
+                                    summary_text=summary_text,
+                                    estimated_tokens_saved=saved,
+                                    covered_message_count=new_covered,
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "COMPACTION persist inline summary failed: %s", exc
+                                )
+
+                        compacted_messages = compacted
+                        mode = "inline"
+                        estimated_saved = saved
+                        logger.info(
+                            "COMPACTION mode=inline session=%s snap=%s saved=%d original_tokens=%d compacted_tokens=%d request_id=%s",
+                            session_id,
+                            snap_hash_val[:8],
+                            saved,
+                            prompt_tokens,
+                            max(0, prompt_tokens - saved),
+                            request_id,
+                        )
+                    else:
+                        mode = "skipped"
+                        logger.info(
+                            "COMPACTION mode=skipped (unsafe structure) session=%s original_tokens=%d compacted_tokens=%d request_id=%s",
+                            session_id,
+                            prompt_tokens,
+                            prompt_tokens,
+                            request_id,
+                        )
+                except Exception as exc:
+                    mode = "failed"
+                    logger.warning(
+                        "COMPACTION inline failed session=%s error=%s request_id=%s",
+                        session_id,
+                        exc,
+                        request_id,
+                    )
+            else:
+                mode = "skipped"
+
+    # Phase B: schedule background precompaction if threshold crossed (requires session ID)
+    if bg_cfg.enabled and session_id is not None and prompt_tokens >= bg_trigger_tokens:
+        try:
+            if not get_inflight_summary(session_id, snap_hash_val):
+                snap_h = save_snapshot(session_id, messages, prompt_tokens)
+                # Look up prior summary for incremental background compaction
+                bg_prior_row = get_latest_ready_summary_for_session(session_id)
+                bg_prior_text: str | None = None
+                bg_prior_covered: int = 0
+                if bg_prior_row and bg_prior_row.get("summary_text"):
+                    bg_prior_snap = get_snapshot(bg_prior_row["snapshot_hash"])
+                    if bg_prior_snap:
+                        import json as _json2
+
+                        bg_prior_msgs = _json2.loads(bg_prior_snap["messages_json"])
+                        bg_covered_raw = (
+                            bg_prior_row.get("covered_message_count", 0) or 0
+                        )
+                        n = len(messages)
+                        has_system = (
+                            messages[0].get("role") == "system" if messages else False
+                        )
+                        head_end = sync_cfg.protect_first_n + (1 if has_system else 0)
+                        covered_end = head_end + bg_covered_raw
+                        if (
+                            covered_end <= len(bg_prior_msgs)
+                            and covered_end <= n
+                            and bg_prior_msgs[:covered_end] == messages[:covered_end]
+                        ):
+                            bg_prior_text = bg_prior_row["summary_text"]
+                            bg_prior_covered = bg_covered_raw
+
+                summary_id = enqueue_summary(session_id, snap_h)
+                worker = get_worker()
+                if worker is not None:
+                    bg_decision = active_state.router.resolve_model(
+                        profile=sync_cfg.summary_profile or None,
+                        tier="SIMPLE",
+                    )
+                    worker.schedule(
+                        summary_id,
+                        session_id,
+                        snap_h,
+                        messages,
+                        summary_model=bg_decision.model,
+                        base_url=bg_decision.base_url.rstrip("/"),
+                        api_key=bg_decision.api_key,
+                        protect_first_n=sync_cfg.protect_first_n,
+                        protect_last_n=sync_cfg.protect_last_n,
+                        original_tokens=prompt_tokens,
+                        merge_threshold=sync_cfg.merge_threshold,
+                        prior_summary=bg_prior_text,
+                        prior_covered_count=bg_prior_covered,
+                        model=model,
+                        summary_ratio=sync_cfg.summary_ratio,
+                        min_summary_tokens=sync_cfg.min_summary_tokens,
+                        max_summary_tokens=sync_cfg.max_summary_tokens,
+                    )
+                    logger.info(
+                        "COMPACTION_BG queued session=%s snap=%s request_id=%s incremental=%s",
+                        session_id,
+                        snap_h[:8],
+                        request_id,
+                        bg_prior_text is not None,
+                    )
+        except Exception as exc:
+            logger.warning("COMPACTION_BG scheduling failed: %s", exc)
+
+    return CompactionResult(
+        applied=mode in ("inline", "cached"),
+        messages=compacted_messages,
+        mode=mode,
+        session_id=session_id,
+        session_mode=session_mode,
+        estimated_tokens_saved=estimated_saved,
+        original_tokens=prompt_tokens,
+    )
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    """Main proxy endpoint — OpenAI-compatible chat completions."""
+    state = _require_runtime_state()
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _openai_error(400, "Invalid JSON body")
+    if not isinstance(body, dict):
+        return _openai_error(400, "JSON body must be an object")
+
+    model_field = str(body.get("model", ""))
+    if "messages" not in body:
+        return _openai_error(400, "messages is required")
+    messages = body["messages"]
+    if not isinstance(messages, list):
+        return _openai_error(400, "messages must be an array")
+    if not all(isinstance(message, dict) for message in messages):
+        return _openai_error(400, "messages must contain only objects")
+
+    if model_field.startswith("optiproxai/"):
+        # ── Routed request ────────────────────────────────────────────────
+        profile_name = model_field.split("/", 1)[1]  # e.g. "auto", "eco"
+        request_id = uuid.uuid4().hex[:12]
+
+        # Detect required capabilities from request body
+        tools_capability_decision = _decide_tools_capability(
+            body,
+            state.config.smart_proxy.tools_capability_detection,
+        )
+        required_capabilities = _detect_required_capabilities(
+            body,
+            state.config.smart_proxy.tools_capability_detection,
+        )
+        logger.info(
+            "TOOLS_CAPABILITY policy=%s declared=%s required=%s trigger=%s request_id=%s profile=%s state_version=%d",
+            tools_capability_decision.policy,
+            tools_capability_decision.declared,
+            tools_capability_decision.required,
+            tools_capability_decision.trigger,
+            request_id,
+            profile_name,
+            state.version,
+        )
+
+        # Extract session key for session-sticky primary selection
+        session_key = request.headers.get(state.config.routing.session_header)
+
+        # Strip a per-turn /optiproxai:<tier> override token from the latest user
+        # message before compaction/routing so it never leaks upstream.
+        tier_override, stripped_messages = parse_tier_override(messages)
+        if tier_override is not None or stripped_messages is not messages:
+            body = dict(body)
+            body["messages"] = stripped_messages
+            messages = stripped_messages
+        if tier_override is not None:
+            logger.info(
+                "TIER_OVERRIDE request_id=%s tier_override=%s",
+                request_id,
+                tier_override,
+            )
+
+        try:
+            decision: RoutingDecision = state.router.route(
+                messages,
+                profile=profile_name,
+                required_capabilities=required_capabilities,
+                session_key=session_key,
+                tier_override=tier_override,
+            )
+        except CapabilityNotSatisfiedError:
+            logger.warning(
+                "Capability not satisfied request_id=%s profile=%s capabilities=%s state_version=%d",
+                request_id,
+                profile_name,
+                required_capabilities,
+                state.version,
+            )
+            return _openai_error(
+                400,
+                f"No available model supports required capabilities: {', '.join(sorted(required_capabilities))}",
+                "capability_not_satisfied",
+            )
+        except InputLimitNotSatisfiedError as exc:
+            logger.warning(
+                "Input limit not satisfied request_id=%s profile=%s tier=%s prompt_tokens=%d state_version=%d",
+                request_id,
+                exc.profile,
+                exc.tier,
+                exc.prompt_tokens,
+                state.version,
+            )
+            return _openai_error(400, str(exc), "input_limit_not_satisfied")
+        except Exception as exc:
+            logger.exception(
+                "Router error request_id=%s profile=%s state_version=%d",
+                request_id,
+                profile_name,
+                state.version,
+            )
+            return _openai_error(500, f"Routing failed: {exc}", "router_error")
+
+        logger.info(
+            "ROUTE request_id=%s model=%s provider=%s tier=%s score=%.4f confidence=%.4f agentic=%.4f profile=%s state_version=%d",
+            request_id,
+            decision.model,
+            decision.provider,
+            decision.tier,
+            decision.score,
+            decision.confidence,
+            decision.agentic_score,
+            profile_name,
+            state.version,
+        )
+
+        # Smart-proxy context compaction (Phase A + B)
+        compaction_result = await _resolve_compaction(
+            messages,
+            request,
+            profile_name,
+            request_id,
+            model=decision.model,
+            state=state,
+        )
+        if compaction_result.applied:
+            body = dict(body)
+            body["messages"] = compaction_result.messages
+
+        body, decorative_tool_schema_adaptation = _adapt_decorative_tool_schema_payload(
+            body,
+            tools_capability_decision,
+            state.config.smart_proxy.decorative_tool_schema_handling,
+        )
+        logger.info(
+            "DECORATIVE_TOOL_SCHEMA policy=%s declared=%s required=%s applied=%s stripped_fields=%s request_id=%s profile=%s state_version=%d",
+            decorative_tool_schema_adaptation.policy,
+            decorative_tool_schema_adaptation.declared,
+            decorative_tool_schema_adaptation.required,
+            decorative_tool_schema_adaptation.applied,
+            list(decorative_tool_schema_adaptation.stripped_fields),
+            request_id,
+            profile_name,
+            state.version,
+        )
+
+        fallback_body_base = copy.deepcopy(body)
+
+        # Replace the model field with the actual model name
+        body["model"] = decision.model
+
+        # Inject provider-specific reasoning control if tier has reasoning_effort set
+        # (preserve explicit client controls)
+        if decision.reasoning_effort:
+            style = _get_reasoning_style(decision, state)
+            normalized_effort = _normalize_reasoning_effort(
+                style, decision.reasoning_effort
+            )
+            body = _apply_reasoning_for_style(
+                body, style, effort=decision.reasoning_effort
+            )
+            logger.info(
+                "REASONING_CONTROL injected request_id=%s tier=%s style=%s original_effort=%s normalized_effort=%s provider=%s",
+                request_id,
+                decision.tier,
+                style,
+                decision.reasoning_effort,
+                normalized_effort,
+                decision.provider,
+            )
+
+        response = await _try_with_fallbacks(
+            body,
+            decision,
+            profile_name,
+            request_id=request_id,
+            compaction_result=compaction_result,
+            state=state,
+            fallback_body_base=fallback_body_base,
+        )
+
+        # Attach compaction headers
+        compaction_hdrs = _compaction_headers(compaction_result)
+        if compaction_hdrs:
+            for k, v in compaction_hdrs.items():
+                response.headers[k] = v
+
+        return response
+
+    # ── Pass-through to default provider ──────────────────────────────
+    base_url, api_key, _ = _get_default_provider_info(state)
+    logger.info(
+        "PASSTHROUGH model=%s provider=%s state_version=%d",
+        model_field,
+        state.config.default_provider,
+        state.version,
+    )
+    return await _proxy_upstream(
+        base_url,
+        api_key,
+        body,
+        decision=None,
+        profile=None,
+        actual_provider=state.config.default_provider,
+    )
+
+
+@app.get("/v1/models")
+async def list_models():
+    """Return available optiproxai/* virtual models plus underlying models."""
+    state = _require_runtime_state()
+    return {"object": "list", "data": _collect_models(state)}
+
+
+@app.get("/v1/models/{model_id:path}")
+async def retrieve_model(model_id: str):
+    """Return single model object for compatibility with OpenAI SDK style clients."""
+    state = _require_runtime_state()
+    normalized = unquote(model_id)
+    for m in _collect_models(state):
+        if m.get("id") == normalized:
+            return m
+    return _openai_error(404, f"The model `{normalized}` does not exist")
+
+
+@app.get("/health")
+async def health():
+    state = _require_runtime_state()
+    return {
+        "status": "ok",
+        "version": "0.1.0",
+        "config_loaded_at": state.config_loaded_at,
+        "config_version": state.version,
+    }
+
+
+def _get_admin_token() -> str:
+    """Return admin token from environment."""
+    return os.environ.get("OPTIPROXAI_ADMIN_TOKEN", "").strip()
+
+
+def _validate_admin_authorization(request: Request) -> tuple[bool, str]:
+    """Validate admin bearer token for management endpoints."""
+    expected = _get_admin_token()
+    if not expected:
+        return False, "Admin token is not configured"
+
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return False, "Missing admin bearer token"
+
+    token = auth_header[7:]
+    if token != expected:
+        return False, "Invalid admin bearer token"
+
+    return True, ""
+
+
+def _non_reloadable_changes(
+    current: OptiproxaiConfig, candidate: OptiproxaiConfig
+) -> list[str]:
+    """Return changed fields that require process restart."""
+    changed: list[str] = []
+    if current.host != candidate.host:
+        changed.append("host")
+    if current.port != candidate.port:
+        changed.append("port")
+    return changed
+
+
+async def _reload_compaction_worker(candidate: OptiproxaiConfig) -> tuple[bool, str]:
+    """Switch background compaction worker according to new config."""
+    old_worker = get_worker()
+    try:
+        new_worker = _build_compaction_worker(candidate)
+    except Exception as exc:
+        logger.exception("Failed to build compaction worker for reload")
+        return False, str(exc)
+
+    set_worker(new_worker)
+    if old_worker is not None and old_worker is not new_worker:
+        try:
+            await old_worker.shutdown()
+        except Exception:
+            logger.exception(
+                "Failed to shutdown previous compaction worker after reload"
+            )
+            return False, "Old compaction worker shutdown failed"
+
+    return True, ""
+
+
+@app.post("/admin/reload-config")
+async def reload_config(request: Request):
+    """Reload configuration safely with strict validation and atomic swap."""
+    is_authorized, auth_error = _validate_admin_authorization(request)
+    if not is_authorized:
+        return _openai_error(403, auth_error, "permission_error")
+
+    async with _reload_lock:
+        before = _require_runtime_state()
+        logger.info(
+            "ADMIN_RELOAD start config_path=%s version=%d",
+            before.config_path,
+            before.version,
+        )
+
+        try:
+            candidate = _build_runtime_state(before.config_path, strict=True)
+        except Exception as exc:
+            logger.exception(
+                "ADMIN_RELOAD strict validation failed config_path=%s version=%d",
+                before.config_path,
+                before.version,
+            )
+            return _openai_error(
+                400, f"Reload validation failed: {exc}", "config_error"
+            )
+
+        non_reloadable = _non_reloadable_changes(before.config, candidate.config)
+        if non_reloadable:
+            logger.warning(
+                "ADMIN_RELOAD rejected due to non-reloadable changes fields=%s config_path=%s version=%d",
+                non_reloadable,
+                before.config_path,
+                before.version,
+            )
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "ok": False,
+                    "reloaded": False,
+                    "config_path": before.config_path,
+                    "config_loaded_at": before.config_loaded_at,
+                    "non_reloadable_changes": non_reloadable,
+                    "error": "Restart required for non-reloadable fields",
+                },
+            )
+
+        _activate_state(candidate)
+
+        ok, worker_error = await _reload_compaction_worker(candidate.config)
+        if not ok:
+            _activate_state(before)
+            await _reload_compaction_worker(before.config)
+            logger.error(
+                "ADMIN_RELOAD rolled back due to worker error config_path=%s old_version=%d candidate_version=%d error=%s",
+                before.config_path,
+                before.version,
+                candidate.version,
+                worker_error,
+            )
+            return _openai_error(
+                500,
+                f"Reload failed during worker switch: {worker_error}",
+                "reload_error",
+            )
+
+        changed = {
+            "default_provider": before.config.default_provider
+            != candidate.config.default_provider,
+            "default_profile": before.config.default_profile
+            != candidate.config.default_profile,
+            "providers_count": len(before.config.providers)
+            != len(candidate.config.providers),
+            "profiles_count": len(before.config.profiles)
+            != len(candidate.config.profiles),
+            "compaction_enabled": before.config.smart_proxy.context_compaction.enabled
+            != candidate.config.smart_proxy.context_compaction.enabled,
+            "compaction_concurrency": before.config.smart_proxy.context_compaction.background_precompaction.max_concurrency
+            != candidate.config.smart_proxy.context_compaction.background_precompaction.max_concurrency,
+        }
+
+        logger.info(
+            "ADMIN_RELOAD success config_path=%s old_version=%d new_version=%d changed=%s",
+            candidate.config_path,
+            before.version,
+            candidate.version,
+            changed,
+        )
+
+        return {
+            "ok": True,
+            "reloaded": True,
+            "config_path": candidate.config_path,
+            "config_loaded_at": candidate.config_loaded_at,
+            "version": candidate.version,
+            "changed": changed,
+            "non_reloadable_changes": [],
+        }
+
+
+@app.post("/v1/route")
+async def route_debug(request: Request):
+    """Debug endpoint: return routing decision without proxying."""
+    state = _require_runtime_state()
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _openai_error(400, "Invalid JSON body")
+    if not isinstance(body, dict):
+        return _openai_error(400, "JSON body must be an object")
+
+    if "messages" not in body:
+        return _openai_error(400, "messages is required")
+    messages = body["messages"]
+    if not isinstance(messages, list):
+        return _openai_error(400, "messages must be an array")
+    if not all(isinstance(message, dict) for message in messages):
+        return _openai_error(400, "messages must contain only objects")
+    profile = body.get("profile", None)
+    tier_override, stripped_messages = parse_tier_override(messages)
+    tools_capability_decision = _decide_tools_capability(
+        body,
+        state.config.smart_proxy.tools_capability_detection,
+    )
+    required_capabilities = _detect_required_capabilities(
+        body,
+        state.config.smart_proxy.tools_capability_detection,
+    )
+
+    try:
+        decision = state.router.route(
+            stripped_messages,
+            profile=profile,
+            required_capabilities=required_capabilities,
+            tier_override=tier_override,
+        )
+    except CapabilityNotSatisfiedError:
+        logger.warning(
+            "Capability not satisfied in debug endpoint profile=%s capabilities=%s state_version=%d",
+            profile,
+            required_capabilities,
+            state.version,
+        )
+        return _openai_error(
+            400,
+            f"No available model supports required capabilities: {', '.join(sorted(required_capabilities))}",
+            "capability_not_satisfied",
+        )
+    except InputLimitNotSatisfiedError as exc:
+        logger.warning(
+            "Input limit not satisfied in debug endpoint profile=%s tier=%s prompt_tokens=%d state_version=%d",
+            exc.profile,
+            exc.tier,
+            exc.prompt_tokens,
+            state.version,
+        )
+        return _openai_error(400, str(exc), "input_limit_not_satisfied")
+    except Exception as exc:
+        logger.exception(
+            "Router error in debug endpoint profile=%s state_version=%d",
+            profile,
+            state.version,
+        )
+        return _openai_error(500, f"Routing failed: {exc}", "router_error")
+
+    _, decorative_tool_schema_adaptation = _adapt_decorative_tool_schema_payload(
+        body,
+        tools_capability_decision,
+        state.config.smart_proxy.decorative_tool_schema_handling,
+    )
+
+    payload = decision.model_dump()
+    payload["tier_override"] = tier_override
+    payload["tools_capability_detection"] = {
+        "policy": tools_capability_decision.policy,
+        "declared": tools_capability_decision.declared,
+        "required": tools_capability_decision.required,
+        "trigger": tools_capability_decision.trigger,
+    }
+    payload["decorative_tool_schema_handling"] = (
+        _decorative_tool_schema_adaptation_payload(decorative_tool_schema_adaptation)
+    )
+    return payload
+
+
+# ── Dashboard endpoints ────────────────────────────────────────────────────
+
+
+@app.get("/dashboard")
+async def dashboard(profiles: list[str] | None = Query(default=None)):
+    """HTML dashboard showing routing analytics."""
+    ingest_days = recommended_dashboard_ingest_days(full_days=30, incremental_days=2)
+    ingest_jsonl_logs(days=ingest_days)
+    execution_ingested = ingest_execution_logs(days=ingest_days)
+    if execution_ingested == 0 and dashboard_needs_stderr_backfill():
+        ingest_stderr_proxy_logs()
+
+    stats = get_dashboard_stats(hours=24, profiles=profiles)
+    html = render_dashboard_html(stats)
+    return HTMLResponse(content=html)
+
+
+@app.get("/dashboard/stats")
+async def dashboard_stats(
+    hours: int = 24, profiles: list[str] | None = Query(default=None)
+):
+    """JSON endpoint for dashboard stats."""
+    ingest_days = max(
+        max(1, hours // 24),
+        recommended_dashboard_ingest_days(full_days=30, incremental_days=2),
+    )
+    ingest_jsonl_logs(days=ingest_days)
+    execution_ingested = ingest_execution_logs(days=ingest_days)
+    if execution_ingested == 0 and dashboard_needs_stderr_backfill():
+        ingest_stderr_proxy_logs()
+    return get_dashboard_stats(hours=hours, profiles=profiles)

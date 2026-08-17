@@ -1,0 +1,427 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from optiproxai.classification_context import DEFAULT_CLASSIFICATION_INPUT_MAX_CHARS
+from optiproxai.scorer import SEMANTIC_DIMENSIONS
+from optiproxai.training_data import (
+    ANNOTATION_PROMPT_MAX_CHARS,
+    LLMFeatureAnnotator,
+    SEMANTIC_DIMENSION_CALIBRATION,
+    _classification_prompt_from_record,
+    _semantic_dimension_calibration_text,
+    build_feature_dataset,
+    deterministic_token_count,
+    extract_distilled_feature_examples,
+)
+
+
+class _StubAnnotator:
+    def __init__(self, labels: dict[str, dict[str, str] | None]) -> None:
+        self._labels = labels
+        self.calls: list[str] = []
+
+    def annotate(self, prompt: str) -> dict[str, str] | None:
+        self.calls.append(prompt)
+        return self._labels.get(prompt)
+
+
+def _labels(agentic: str = "medium") -> dict[str, str]:
+    return {
+        "codePresence": "low",
+        "reasoningMarkers": "low",
+        "technicalTerms": "low",
+        "creativeMarkers": "low",
+        "simpleIndicators": "high",
+        "multiStepPatterns": "low",
+        "questionComplexity": "low",
+        "imperativeVerbs": "low",
+        "constraintCount": "low",
+        "outputFormat": "low",
+        "referenceComplexity": "low",
+        "negationComplexity": "low",
+        "domainSpecificity": "low",
+        "agenticTask": agentic,
+    }
+
+
+def test_deterministic_token_count() -> None:
+    assert deterministic_token_count("hello world") == 2
+    assert deterministic_token_count("") == 1
+
+
+def test_semantic_dimension_calibration_covers_every_dimension() -> None:
+    assert set(SEMANTIC_DIMENSION_CALIBRATION) == set(SEMANTIC_DIMENSIONS)
+    for dim in SEMANTIC_DIMENSIONS:
+        labels = SEMANTIC_DIMENSION_CALIBRATION[dim]
+        assert set(labels) == {"low", "medium", "high"}
+        assert all(labels[label].strip() for label in ("low", "medium", "high"))
+
+
+def test_semantic_dimension_calibration_text_includes_representative_guidance() -> None:
+    text = _semantic_dimension_calibration_text()
+
+    for dim in ("codePresence", "reasoningMarkers", "agenticTask"):
+        assert f"- {dim}:" in text
+    for label in ("low", "medium", "high"):
+        assert f"- {label}:" in text
+
+
+def test_llm_feature_annotator_system_prompt_is_eager() -> None:
+    """_SYSTEM_PROMPT is a class attribute computed at import time (no lazy calibration)."""
+    # _SYSTEM_PROMPT is a class-level constant; accessing it must not raise.
+    prompt = LLMFeatureAnnotator._SYSTEM_PROMPT
+    assert isinstance(prompt, str)
+    assert len(prompt) > 0
+
+
+def test_llm_feature_annotator_prompt_includes_calibration_and_json_contract() -> None:
+    system_prompt = LLMFeatureAnnotator._SYSTEM_PROMPT
+
+    assert "Return ONLY a JSON object with exactly these keys:" in system_prompt
+    assert "Each value MUST be one of: low, medium, high" in system_prompt
+    keys_intro = system_prompt.split(
+        "Return ONLY a JSON object with exactly these keys: ", 1
+    )[1]
+    declared_keys = keys_intro.split(". Each value MUST be", 1)[0].split(", ")
+    assert declared_keys == list(SEMANTIC_DIMENSIONS)
+    for dim in SEMANTIC_DIMENSIONS:
+        assert dim in system_prompt
+    assert "- codePresence:" in system_prompt
+    assert "- reasoningMarkers:" in system_prompt
+    assert "- agenticTask:" in system_prompt
+
+
+def test_extract_distilled_feature_examples_prefers_log_labels_and_dedupes() -> None:
+    records = [
+        {
+            "timestamp": "2026-03-23T10:00:00+00:00",
+            "prompt": "Open the repo and update config",
+            "classification_context": {
+                "text": "[conversation]\nuser: Open the repo and update config",
+                "selected_turn_count": 1,
+                "selected_user_turn_count": 1,
+            },
+            "signals": {"semanticLabels": _labels("high")},
+        },
+        {
+            "timestamp": "2026-03-23T10:05:00+00:00",
+            "prompt": "Open the repo and update config",
+            "classification_context": {
+                "text": "[conversation]\nuser: Open the repo and update config",
+                "selected_turn_count": 1,
+                "selected_user_turn_count": 1,
+            },
+            "signals": {"semanticLabels": _labels("medium")},
+        },
+    ]
+
+    examples = extract_distilled_feature_examples(records)
+
+    assert len(examples) == 1
+    assert (
+        examples[0]["prompt"] == "[conversation]\nuser: Open the repo and update config"
+    )
+    assert examples[0]["agenticTask"] == "medium"
+    assert examples[0]["source"] == "log"
+    assert examples[0]["tokenCount"] == 8
+
+
+def test_classification_prompt_from_record_prefers_context_text() -> None:
+    record = {
+        "prompt": "short",
+        "classification_context": {"text": "[conversation]\nuser: long context"},
+    }
+
+    prompt = _classification_prompt_from_record(record)
+
+    assert prompt == "[conversation]\nuser: long context"
+
+
+def test_classification_prompt_from_record_can_rebuild_from_messages() -> None:
+    record = {
+        "messages": [
+            {"role": "system", "content": "Use concise output"},
+            {
+                "role": "user",
+                "content": "Create migration steps for the database",
+            },
+            {"role": "user", "content": "続けて"},
+        ]
+    }
+
+    prompt = _classification_prompt_from_record(record)
+
+    assert "続けて" in prompt
+    assert "Create migration steps for the database" in prompt
+
+
+def test_extract_distilled_feature_examples_can_annotate_missing_labels() -> None:
+    records = [
+        {
+            "timestamp": "2026-03-23T10:00:00+00:00",
+            "prompt": "Explain the architecture",
+            "signals": {},
+        },
+    ]
+    annotator = _StubAnnotator({"Explain the architecture": _labels("low")})
+
+    examples = extract_distilled_feature_examples(records, annotator=annotator)
+
+    assert len(examples) == 1
+    assert examples[0]["source"] == "annotated"
+    assert examples[0]["agenticTask"] == "low"
+    assert annotator.calls == ["Explain the architecture"]
+
+
+def test_build_feature_dataset_persists_examples(tmp_path: Path) -> None:
+    log_path = tmp_path / "routing-2026-03-23.jsonl"
+    line = {
+        "timestamp": "2026-03-23T10:00:00+00:00",
+        "prompt": "Summarize this article",
+        "signals": {"semanticLabels": _labels("low")},
+    }
+    log_path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+    output_path = tmp_path / "distilled_feature_dataset.json"
+    examples = build_feature_dataset([log_path], output_path)
+
+    assert len(examples) == 1
+    persisted = json.loads(output_path.read_text(encoding="utf-8"))
+    assert persisted == examples
+
+
+def test_llm_feature_annotator_rejects_extra_json_keys(
+    monkeypatch,
+) -> None:
+    class _Response:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {**_labels("high"), "extra": "ignored"}
+                            )
+                        }
+                    }
+                ]
+            }
+
+    def _post(*args, **kwargs):
+        return _Response()
+
+    monkeypatch.setattr("optiproxai.training_data.httpx.post", _post)
+
+    labels = LLMFeatureAnnotator(api_key="test-key").annotate("Implement feature")
+
+    assert labels is None
+
+
+def test_llm_feature_annotator_rejects_missing_or_invalid_labels(monkeypatch) -> None:
+    responses = iter(
+        [
+            json.dumps(
+                {key: value for key, value in _labels().items() if key != "agenticTask"}
+            ),
+            json.dumps({**_labels(), "agenticTask": "extreme"}),
+        ]
+    )
+
+    class _Response:
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def json() -> dict[str, object]:
+            return {"choices": [{"message": {"content": next(responses)}}]}
+
+    def _post(*args, **kwargs):
+        return _Response()
+
+    monkeypatch.setattr("optiproxai.training_data.httpx.post", _post)
+    annotator = LLMFeatureAnnotator(api_key="test-key")
+
+    assert annotator.annotate("Implement feature") is None
+    assert annotator.annotate("Implement feature") is None
+
+
+def test_llm_feature_annotator_uses_provider_resolved_config_defaults(
+    monkeypatch,
+) -> None:
+    class _FeatureAnnotatorConfig:
+        model = "gemini-2.5-flash-lite"
+        provider = "local"
+
+    class _Config:
+        feature_annotator = _FeatureAnnotatorConfig()
+
+        @staticmethod
+        def feature_annotator_resolved() -> tuple[str, str]:
+            return ("http://127.0.0.1:8317/v1", "test-key")
+
+    monkeypatch.delenv("OPTIPROXAI_LLM_ANNOTATOR_MODEL", raising=False)
+    monkeypatch.delenv("OPTIPROXAI_LLM_ANNOTATOR_BASE_URL", raising=False)
+    monkeypatch.delenv("OPTIPROXAI_LLM_ANNOTATOR_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.setattr("optiproxai.training_data.load_config", lambda: _Config())
+
+    annotator = LLMFeatureAnnotator()
+
+    assert annotator.model == "gemini-2.5-flash-lite"
+    assert annotator.base_url == "http://127.0.0.1:8317/v1"
+    assert annotator.api_key == "test-key"
+
+
+class _AnnotatorResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return {
+            "choices": [
+                {
+                    "message": {
+                        "content": json.dumps(
+                            {dimension: "low" for dimension in SEMANTIC_DIMENSIONS}
+                        )
+                    }
+                }
+            ]
+        }
+
+
+def _capture_annotation_prompt(monkeypatch, prompt: str) -> str:
+    captured: dict[str, object] = {}
+
+    def _post(*args: object, **kwargs: object) -> _AnnotatorResponse:
+        captured["json"] = kwargs["json"]
+        return _AnnotatorResponse()
+
+    monkeypatch.setattr("optiproxai.training_data.httpx.post", _post)
+    annotator = LLMFeatureAnnotator(
+        model="test-model",
+        base_url="http://annotator.example/v1",
+        api_key="test-key",
+    )
+
+    labels = annotator.annotate(prompt)
+
+    assert labels == {dimension: "low" for dimension in SEMANTIC_DIMENSIONS}
+    request_json = captured["json"]
+    assert isinstance(request_json, dict)
+    messages = request_json["messages"]
+    assert isinstance(messages, list)
+    # System/user split: messages[0] is system, messages[1] is user prompt
+    user_message = next(
+        (m for m in messages if isinstance(m, dict) and m.get("role") == "user"),
+        None,
+    )
+    assert user_message is not None
+    content = user_message["content"]
+    assert isinstance(content, str)
+    return content
+
+
+def test_llm_feature_annotator_requests_json_object_response_format(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def _post(*args: object, **kwargs: object) -> _AnnotatorResponse:
+        captured["json"] = kwargs["json"]
+        return _AnnotatorResponse()
+
+    monkeypatch.setattr("optiproxai.training_data.httpx.post", _post)
+    annotator = LLMFeatureAnnotator(
+        model="test-model",
+        base_url="http://annotator.example/v1",
+        api_key="test-key",
+    )
+
+    labels = annotator.annotate("Implement feature")
+
+    assert labels is not None
+    request_json = captured["json"]
+    assert isinstance(request_json, dict)
+    assert request_json.get("response_format") == {"type": "json_object"}
+
+
+def test_annotation_prompt_limit_matches_runtime_classification_default() -> None:
+    assert ANNOTATION_PROMPT_MAX_CHARS == DEFAULT_CLASSIFICATION_INPUT_MAX_CHARS
+
+
+def test_llm_feature_annotator_bounds_prompt_at_runtime_classification_default(
+    monkeypatch,
+) -> None:
+    prompt = "a" * (DEFAULT_CLASSIFICATION_INPUT_MAX_CHARS + 300)
+
+    sent_prompt = _capture_annotation_prompt(monkeypatch, prompt)
+
+    assert len(sent_prompt) == ANNOTATION_PROMPT_MAX_CHARS
+    assert sent_prompt == prompt[:ANNOTATION_PROMPT_MAX_CHARS]
+
+
+def test_llm_feature_annotator_does_not_truncate_varied_prompt_at_2000(
+    monkeypatch,
+) -> None:
+    sections = [
+        "System context: route requests between small and reasoning models.\n",
+        "User story: an operator asks for calibration, verification, and examples.\n",
+        "Code excerpt: def choose_model(prompt: str) -> str: return 'auto'\n",
+        "Japanese note: これは長い分類入力が保持されることを確認するための現実的な文です。\n",
+        "Constraints: preserve JSON keys, fail fast on schema drift, keep audit logs.\n",
+    ]
+    prompt = "".join(sections[index % len(sections)] for index in range(45))
+    assert len(prompt) > 2000
+    sentinel = "AFTER_2000_SENTINEL: retain this calibration-relevant tail."
+    prompt = f"{prompt[:2000]}{sentinel}{prompt[2000:]}"
+    assert len(prompt) <= ANNOTATION_PROMPT_MAX_CHARS
+
+    sent_prompt = _capture_annotation_prompt(monkeypatch, prompt)
+
+    assert len(sent_prompt) == len(prompt)
+    assert sent_prompt == prompt
+    assert sentinel in sent_prompt[2000:]
+
+
+def test_checkpoint_resumes_and_skips_already_annotated(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "dataset.json"
+    existing = [
+        {
+            "prompt": "Already done",
+            "tokenCount": 2,
+            **_labels("high"),
+            "timestamp": "2026-04-01T00:00:00",
+            "source": "annotated",
+        }
+    ]
+    checkpoint.write_text(json.dumps(existing), encoding="utf-8")
+
+    records = [
+        {
+            "timestamp": "2026-04-02T00:00:00",
+            "prompt": "Already done",
+            "signals": {},
+        },
+        {
+            "timestamp": "2026-04-02T01:00:00",
+            "prompt": "New prompt",
+            "signals": {},
+        },
+    ]
+    annotator = _StubAnnotator({"New prompt": _labels("medium")})
+
+    examples = extract_distilled_feature_examples(
+        records, annotator=annotator, checkpoint_path=checkpoint
+    )
+
+    assert len(examples) == 2
+    assert annotator.calls == ["New prompt"]
