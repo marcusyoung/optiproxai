@@ -209,6 +209,149 @@ class TestDistilledFeatureScorer:
         assert "Runtime embedding timed out, using default fallback" in caplog.text
         assert "Traceback" not in caplog.text
 
+    def test_embedding_timeout_aborts_within_bound(self, tmp_path) -> None:
+        """A stalled upstream must not block past the configured timeout."""
+        _write_bundle(tmp_path)
+        # 2s upstream delay vs 0.05s configured timeout: the call must return
+        # well before the upstream finishes (wall-clock bound, AC #1).
+        embedding_client = _FakeEmbeddingClient([0.1, 0.2, 0.3], delay=2.0)
+
+        with (
+            patch(
+                "optiproxai.scorer._resolve_runtime_embedding_settings",
+                return_value=RuntimeEmbeddingSettings(
+                    mode="api",
+                    model="text-embedding-test",
+                    base_url="http://example.test/v1",
+                    api_key="test-key",
+                    timeout_seconds=0.05,
+                ),
+            ),
+            patch(
+                "optiproxai.scorer._resolve_runtime_embedding_client",
+                return_value=(embedding_client, "text-embedding-test", 0.05),
+            ),
+        ):
+            start = time.monotonic()
+            result = Scorer(
+                feature_model_dir=tmp_path, enable_routing_log=False
+            ).classify("hello")
+            elapsed = time.monotonic() - start
+
+        assert result.signals["method"]["raw"] == "default"
+        assert elapsed < 1.0, (
+            f"embedding timeout did not bound the call: {elapsed:.2f}s"
+        )
+
+    def test_embedding_settings_are_memoized(self, tmp_path, monkeypatch) -> None:
+        """config.yaml is not re-parsed per embedding request (AC #3)."""
+        _write_bundle(tmp_path)
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            """
+default_provider: openrouter
+providers:
+  openrouter:
+    name: openrouter
+    base_url: https://openrouter.ai/api/v1
+profiles:
+  auto:
+    tiers:
+      SIMPLE:
+        primary: model-a
+embedding:
+  mode: api
+  provider: openrouter
+  model: embed-model
+  timeout_seconds: 1.25
+"""
+        )
+        monkeypatch.setenv("OPTIPROXAI_CONFIG", str(config_path))
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+        from optiproxai.scorer import _resolve_runtime_embedding_settings
+
+        # Clear any prior cache state.
+        import optiproxai.scorer as scorer_mod
+
+        scorer_mod._embedding_settings_cache = None
+
+        with patch(
+            "optiproxai.config.load_config",
+            wraps=__import__("optiproxai.config", fromlist=["load_config"]).load_config,
+        ) as mock_load:
+            first = _resolve_runtime_embedding_settings()
+            second = _resolve_runtime_embedding_settings()
+            third = _resolve_runtime_embedding_settings()
+
+        assert first == second == third
+        assert mock_load.call_count == 1
+
+    def test_local_embedding_backend_reused(self, tmp_path) -> None:
+        """A single LocalEmbeddingBackend is reused across calls (AC #4)."""
+        _write_bundle(tmp_path)
+
+        import optiproxai.scorer as scorer_mod
+
+        scorer_mod._local_embedding_backend = None
+
+        real_init = LocalEmbeddingBackend.__init__
+        init_count = 0
+
+        def counting_init(self, model_name: str) -> None:
+            nonlocal init_count
+            init_count += 1
+            real_init(self, model_name)
+
+        with (
+            patch(
+                "optiproxai.scorer._resolve_runtime_embedding_settings",
+                return_value=RuntimeEmbeddingSettings(
+                    mode="local",
+                    model="local-test-model",
+                    base_url=None,
+                    api_key="",
+                    timeout_seconds=1.0,
+                ),
+            ),
+            patch.object(
+                LocalEmbeddingBackend,
+                "embed",
+                return_value=np.asarray([0.1, 0.2, 0.3], dtype=np.float32),
+            ),
+            patch.object(LocalEmbeddingBackend, "__init__", counting_init),
+        ):
+            scorer = Scorer(feature_model_dir=tmp_path, enable_routing_log=False)
+            scorer.classify("hello")
+            scorer.classify("world")
+
+        assert init_count == 1
+
+    def test_openai_client_gets_timeout(self, tmp_path) -> None:
+        """The OpenAI client is constructed with the configured timeout (AC #12)."""
+        _write_bundle(tmp_path)
+
+        with (
+            patch(
+                "optiproxai.scorer._resolve_runtime_embedding_settings",
+                return_value=RuntimeEmbeddingSettings(
+                    mode="api",
+                    model="text-embedding-test",
+                    base_url="http://example.test/v1",
+                    api_key="test-key",
+                    timeout_seconds=2.5,
+                ),
+            ),
+            patch("optiproxai.scorer.OpenAI") as mock_openai,
+        ):
+            from optiproxai.scorer import _resolve_runtime_embedding_client
+
+            _resolve_runtime_embedding_client()
+
+        mock_openai.assert_called_once()
+        kwargs = mock_openai.call_args.kwargs
+        assert kwargs.get("timeout") == 2.5
+
     def test_api_embedding_uses_configured_model_and_timeout(self, tmp_path) -> None:
         _write_bundle(tmp_path)
         embedding_client = _FakeEmbeddingClient([0.1, 0.2, 0.3])

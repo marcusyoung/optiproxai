@@ -25,7 +25,6 @@ from optiproxai.scorer import SEMANTIC_DIMENSIONS, LocalEmbeddingBackend
 
 EMBEDDING_MODEL = "text-embedding-3-small"
 EMBEDDING_MODEL_OPENROUTER = "openai/text-embedding-3-small"
-EMBEDDING_DIM = 1024
 BATCH_SIZE = 100
 EMBEDDING_TEXT_LIMIT = 4000
 VALID_DIMENSION_LABELS = {"low", "medium", "high"}

@@ -110,3 +110,64 @@ embedding:
         assert cfg.embedding is not None
         assert cfg.embedding.effective_mode == "disabled"
         assert cfg.embedding_resolved() is None
+
+
+class TestConfigEncoding:
+    def test_config_loads_non_ascii_yaml(self, tmp_path) -> None:
+        """Non-ASCII YAML must load on all platforms (AC #5)."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            """
+# Config with non-ASCII content — café, naïve, 日本語
+default_provider: openrouter
+providers:
+  openrouter:
+    name: openrouter
+    base_url: https://openrouter.ai/api/v1
+profiles:
+  auto:
+    tiers:
+      SIMPLE:
+        primary: "model-éclair"
+"""
+        )
+
+        cfg = load_config(str(config_path), strict=True)
+
+        assert cfg.profiles["auto"].tiers["SIMPLE"].primary == "model-éclair"
+
+
+class TestAmbiguousBandsValidation:
+    def test_invalid_ambiguous_bands_fails_at_load_time(self) -> None:
+        """Bad ambiguous_bands config must fail at load, not silently fall back (AC #8)."""
+        from pydantic import ValidationError
+
+        from optiproxai.config import OptiproxaiConfig
+
+        with pytest.raises(ValidationError):
+            OptiproxaiConfig(
+                ambiguous_bands={"UNKNOWN_BOUNDARY": {"band": 0.05, "prefer": "UPPER"}}
+            )
+
+        with pytest.raises(ValidationError):
+            OptiproxaiConfig(
+                ambiguous_bands={"SIMPLE_MEDIUM": {"band": -1.0, "prefer": "UPPER"}}
+            )
+
+        with pytest.raises(ValidationError):
+            OptiproxaiConfig(
+                ambiguous_bands={"SIMPLE_MEDIUM": {"band": 0.05, "prefer": "FAST"}}
+            )
+
+    def test_valid_ambiguous_bands_loads(self) -> None:
+        from optiproxai.config import OptiproxaiConfig
+
+        cfg = OptiproxaiConfig(
+            ambiguous_bands={
+                "SIMPLE_MEDIUM": {"band": 0.02, "prefer": "UPPER"},
+                "MEDIUM_COMPLEX": {"band": 0.02, "prefer": "UPPER"},
+                "COMPLEX_REASONING": {"band": 0.02, "prefer": "LOWER"},
+            }
+        )
+
+        assert cfg.ambiguous_bands["SIMPLE_MEDIUM"]["prefer"] == "UPPER"

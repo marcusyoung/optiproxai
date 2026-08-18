@@ -417,6 +417,34 @@ class OptiproxaiConfig(BaseModel):
 
         return self
 
+    @model_validator(mode="after")
+    def _validate_ambiguous_bands(self) -> "OptiproxaiConfig":
+        """Fail at load time on invalid ambiguous_bands instead of silently
+        degrading every request to the conservative default tier."""
+        _AMBIGUOUS_BAND_KEYS = ("SIMPLE_MEDIUM", "MEDIUM_COMPLEX", "COMPLEX_REASONING")
+        for boundary_name, spec in self.ambiguous_bands.items():
+            if not isinstance(spec, dict) or boundary_name not in _AMBIGUOUS_BAND_KEYS:
+                raise ValueError(
+                    f"ambiguous_bands entries must be dicts keyed by "
+                    f"SIMPLE_MEDIUM/MEDIUM_COMPLEX/COMPLEX_REASONING; got {boundary_name!r}"
+                )
+            try:
+                band = float(spec.get("band", 0.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"ambiguous_bands[{boundary_name}].band must be numeric"
+                ) from exc
+            if band < 0:
+                raise ValueError(
+                    f"ambiguous_bands[{boundary_name}].band must be >= 0; got {band}"
+                )
+            prefer_name = str(spec.get("prefer", "")).strip().upper()
+            if prefer_name not in ("LOWER", "UPPER"):
+                raise ValueError(
+                    f"ambiguous_bands[{boundary_name}].prefer must be 'LOWER' or 'UPPER'; got {prefer_name!r}"
+                )
+        return self
+
     def llm_classifier_resolved(self) -> tuple[str, str] | None:
         """Return (base_url, api_key) resolved from llm_classifier.provider/default_provider."""
 
@@ -550,7 +578,7 @@ def load_config(
     config_file = _find_config_file(path)
 
     if config_file is not None:
-        with open(config_file) as f:
+        with open(config_file, encoding="utf-8") as f:
             loaded = yaml.safe_load(f)
             if isinstance(loaded, dict):
                 raw = loaded

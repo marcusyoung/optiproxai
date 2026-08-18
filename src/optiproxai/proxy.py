@@ -7,6 +7,7 @@ import copy
 import json
 import logging
 import os
+import secrets
 import sys
 import time
 import uuid
@@ -1575,6 +1576,12 @@ async def chat_completions(request: Request):
         return response
 
     # ── Pass-through to default provider ──────────────────────────────
+    if state.config.default_provider not in state.config.providers:
+        return _openai_error(
+            500,
+            f"Default provider '{state.config.default_provider}' is not configured",
+            "server_error",
+        )
     base_url, api_key, _ = _get_default_provider_info(state)
     logger.info(
         "PASSTHROUGH model=%s provider=%s state_version=%d",
@@ -1637,7 +1644,7 @@ def _validate_admin_authorization(request: Request) -> tuple[bool, str]:
         return False, "Missing admin bearer token"
 
     token = auth_header[7:]
-    if token != expected:
+    if not secrets.compare_digest(token, expected):
         return False, "Invalid admin bearer token"
 
     return True, ""

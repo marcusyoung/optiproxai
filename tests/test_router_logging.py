@@ -583,3 +583,33 @@ class TestSessionStickyRouting:
 
         # Round-robin still alternates despite session_key
         assert [r1.model, r2.model, r3.model] == ["model-a", "model-b", "model-a"]
+
+
+class TestRouterPersistentScorer:
+    def test_scorer_constructed_once_across_route_calls(self) -> None:
+        """Router holds a persistent Scorer so the classifier loads once (AC #2)."""
+        router = Router(_make_config())
+
+        with patch(
+            "optiproxai.scorer.Scorer",
+            autospec=True,
+        ) as mock_scorer_cls:
+            mock_scorer = mock_scorer_cls.return_value
+            mock_scorer.classify.return_value = type(
+                "Result",
+                (),
+                {
+                    "tier": "SIMPLE",
+                    "score": 0.1,
+                    "confidence": 0.9,
+                    "signals": {"method": {"raw": "distilled-features"}},
+                    "agentic_score": 0.0,
+                },
+            )()
+
+            router.route([{"role": "user", "content": "hello"}], profile="agentic")
+            router.route([{"role": "user", "content": "world"}], profile="agentic")
+            router.route([{"role": "user", "content": "again"}], profile="agentic")
+
+        assert mock_scorer_cls.call_count == 1
+        assert mock_scorer.classify.call_count == 3

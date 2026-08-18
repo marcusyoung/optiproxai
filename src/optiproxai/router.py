@@ -195,6 +195,9 @@ class Router:
         self.fallback_backoff_state = fallback_backoff_state or FallbackBackoffState(
             config.smart_proxy.fallback_backoff
         )
+        # Persistent scorer so feature_classifier.pkl is loaded at most once per
+        # Router lifetime (a new Router is constructed on config reload).
+        self._scorer: Any | None = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -637,40 +640,6 @@ class Router:
             tier_provider=tier_cfg.provider,
         )
 
-    def _eligible_primary_candidates(
-        self,
-        tier_cfg: Any,
-        required_capabilities: set[str],
-        *,
-        prompt_tokens: int,
-    ) -> list[ResolvedModelCandidate]:
-        """Return primary candidates that satisfy capability and input-limit metadata."""
-        capable_candidates = self._capable_primary_candidates(
-            tier_cfg, required_capabilities
-        )
-        return self._filter_input_limit_candidates(
-            capable_candidates,
-            prompt_tokens=prompt_tokens,
-            tier_provider=tier_cfg.provider,
-        )
-
-    def _eligible_fallback_candidates(
-        self,
-        tier_cfg: Any,
-        required_capabilities: set[str],
-        *,
-        prompt_tokens: int,
-    ) -> list[ResolvedModelCandidate]:
-        """Return fallback candidates that satisfy capability and input-limit metadata."""
-        capable_candidates = self._capable_fallback_candidates(
-            tier_cfg, required_capabilities
-        )
-        return self._filter_input_limit_candidates(
-            capable_candidates,
-            prompt_tokens=prompt_tokens,
-            tier_provider=tier_cfg.provider,
-        )
-
     def _filter_capable_candidates(
         self,
         candidates: list[ResolvedModelCandidate] | list[tuple[str, str]],
@@ -923,14 +892,15 @@ class Router:
         try:
             from optiproxai.scorer import Scorer, ScoringConfig
 
-            scorer = Scorer(
-                ScoringConfig(
-                    disable_axis_overrides=self.config.disable_axis_overrides,
-                    ambiguous_bands=self.config.ambiguous_bands,
-                ),
-                enable_routing_log=False,
-            )
-            result = scorer.classify(classification_input.text)
+            if self._scorer is None:
+                self._scorer = Scorer(
+                    ScoringConfig(
+                        disable_axis_overrides=self.config.disable_axis_overrides,
+                        ambiguous_bands=self.config.ambiguous_bands,
+                    ),
+                    enable_routing_log=False,
+                )
+            result = self._scorer.classify(classification_input.text)
             tier_val = result.tier
             if hasattr(tier_val, "value"):
                 tier_val = tier_val.value
@@ -978,11 +948,3 @@ class Router:
                     if candidate in profile_cfg.tiers:
                         return candidate
         return None
-
-    @classmethod
-    def _fallback_tier(cls, profile_cfg: Any, tier: str) -> Any:
-        """Try adjacent tiers if the exact tier is missing from the profile."""
-        fallback_tier = cls._fallback_tier_name(profile_cfg, tier)
-        if fallback_tier is None:
-            return None
-        return profile_cfg.tiers[fallback_tier]
