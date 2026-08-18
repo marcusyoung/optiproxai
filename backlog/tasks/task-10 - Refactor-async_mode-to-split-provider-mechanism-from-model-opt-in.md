@@ -4,6 +4,7 @@ title: Refactor async_mode to split provider mechanism from model opt-in
 status: To Do
 assignee: []
 created_date: '2026-08-18 22:03'
+updated_date: '2026-08-18 22:14'
 labels:
   - refactor
 dependencies:
@@ -15,6 +16,9 @@ documentation:
   - >-
     decisions/doc-5 -
     Decision-Candidate-preparation-returns-body-plus-upstream-headers-tuple-return.md
+  - >-
+    decisions/doc-6 -
+    Decision-async_mode-splits-provider-mechanism-from-model-opt-in.md
 priority: medium
 type: enhancement
 ordinal: 14000
@@ -89,3 +93,71 @@ This changes the meaning of `ProviderConfig.async_mode.enabled: true`. In TASK-6
 
 Depends on TASK-6 (shipped). Branch off `task/TASK-6` (or `main` after TASK-6 merges).
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+# Implementation Plan: async_mode mechanism/opt-in split
+
+## Approach
+
+Flip async_mode from opt-out (TASK-6) to opt-in: **provider declares the mechanism** (delivery/field/value/suffix), **model/rule declares intent** (`enabled: true` opts in, default `false`). Resolution becomes a field-by-field merge instead of "highest-precedence level wins entirely".
+
+### Merge semantics (new `_resolve_async_mode`)
+
+Collect candidate configs by precedence: ModelEntry (via `entry_async_mode`) → best ModelRuleEntry (existing prefix/provider scoring) → ProviderConfig. Merge field-by-field using `model_fields_set` to distinguish explicit from default:
+
+- **Mechanism fields** (`delivery`, `field`, `value`, `suffix`): highest-precedence level that explicitly sets the field wins. A model/rule CAN override the provider's mechanism (e.g. rule sets `delivery: header` while provider declares body).
+- **`enabled`**: resolved from entry → rule only. **Provider-level `enabled` is ignored (vestigial)** — the provider declares capability, not intent. Default `false`.
+- Return the merged `AsyncModeConfig` when any level declared anything (enabled or mechanism); return `None` when nothing is set anywhere.
+
+Application gate (unchanged caller shape): `async_mode is not None and async_mode.enabled` → `_apply_async_mode`. If merged `enabled: true` but the mechanism is incomplete (no field/value for body/header, no suffix for model_suffix) → `logger.warning` + no-op (return None). This check must live at runtime because config-load time cannot know the provider context.
+
+### Validator decision (open question in task description — resolved)
+
+Relaxed per-level + partial-mechanism rejection, not strict per-level:
+
+- `{enabled: true}` alone is **valid** (pure flag — mechanism may come from the provider).
+- When any mechanism field (`delivery`/`field`/`value`/`suffix`) is **explicitly set** (`model_fields_set`), the mechanism must be complete for the effective delivery (body/header → field+value; model_suffix → suffix). Partial mechanisms are rejected at config load regardless of `enabled` — catches typos without needing provider context.
+- "enabled but no mechanism anywhere" is only detectable at runtime → warning + no-op.
+
+Rationale: strict per-level validation would force every opt-in rule to repeat the mechanism, defeating the split. The relaxed validator + runtime warning matches the task's proposed change and the user's stated goal.
+
+### Provider-level `enabled` handling
+
+Ignored (vestigial). Documented in README + config.example.yaml as a breaking change from TASK-6: configs with `provider.async_mode.enabled: true` no longer make models async — models must opt in.
+
+## Files
+
+- `src/optiproxai/config.py` — `AsyncModeConfig._validate_enabled_fields` rework: pure-flag acceptance + partial-mechanism rejection via `model_fields_set`.
+- `src/optiproxai/proxy.py` — `_resolve_async_mode` rewrite to field-by-field merge; warning on enabled-without-mechanism. `_apply_async_mode` and `_prepare_body_for_candidate` gate unchanged.
+- `tests/test_async_mode.py` — rework resolution tests to merge semantics; add: enabled-at-model + mechanism-at-provider, model-overrides-provider-mechanism, provider-mechanism-alone no-ops (opt-in default), enabled-without-mechanism warns + no-ops, pure-flag valid, partial-mechanism rejected.
+- `tests/test_proxy_reload.py` — verify `TestModelExtraBody` unaffected (extra_body path unchanged); adjust only if a test breaks.
+- `config.example.yaml` — rewrite the three async examples to the split shape (provider mechanism; rule `enabled: true` opt-in).
+- `README.md` — rewrite Async / batch routing section: provider = capability + mechanism, model/rule = opt-in flag, default false, merge semantics, warning behavior.
+- `docs/decisions/doc-6` — created (Decision: async_mode splits provider mechanism from model opt-in).
+
+## Constraints / Risks / Open Questions
+
+- **Breaking change**: TASK-6 provider-level `enabled: true` semantics change. Documented; user's config migrated post-merge (step 5).
+- **Merge completeness**: `delivery` defaults to `body` when unset; completeness is checked against the effective delivery after merge.
+- **No open questions** — validator strictness resolved above (relaxed + partial rejection).
+
+## Sub-steps
+
+1. Config validator rework + config-level tests.
+2. Proxy merge resolution + application + resolution tests.
+3. Docs: README + config.example.yaml.
+4. Full CI gates + PR to main.
+5. (Post-merge, outside PR) Migrate user's `C:\Users\myoun\.config\optiproxai\config.yaml`: doubleword provider gains mechanism; 3 rules gain `enabled: true`; Hy3 untouched.
+
+## Task Manifest
+
+| # | Title | Files | Depends On | Labels | Acceptance Criterion |
+|---|---|---|---|---|---|
+| 1 | Rework AsyncModeConfig validator for opt-in semantics | src/optiproxai/config.py, tests/test_async_mode.py | — | logic, test | AsyncModeConfig accepts `{enabled: true}` pure flag and rejects partial mechanisms; config-level tests pass |
+| 2 | Rewrite _resolve_async_mode as field-by-field merge | src/optiproxai/proxy.py, tests/test_async_mode.py, tests/test_proxy_reload.py | 1 | logic, test | Merged resolution applies enabled-at-model + mechanism-at-provider, honors model/rule mechanism override, no-ops provider-mechanism-alone, warns + no-ops enabled-without-mechanism; all tests pass |
+| 3 | Update docs and example config | README.md, config.example.yaml | 2 | docs | README async section and config.example.yaml show provider mechanism + model/rule opt-in shape |
+| 4 | Run full CI gates and open PR | (none) | 3 | infra | ruff check, ruff format --check, pyright, pytest, uv build all pass; PR opened to main |
+| 5 | Migrate user config to opt-in shape (post-merge) | C:\Users\myoun\.config\optiproxai\config.yaml | 4 | infra | doubleword provider declares mechanism; 3 rules declare `enabled: true`; Hy3 untouched; `uv run optiproxai config` validates |
+<!-- SECTION:PLAN:END -->
