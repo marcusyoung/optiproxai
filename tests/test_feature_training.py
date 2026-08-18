@@ -23,7 +23,6 @@ class _FakeLocalEmbeddingBackend(LocalEmbeddingBackend):
         return np.asarray([0.1, 0.2, 0.3], dtype=np.float32)
 
 
-@pytest.mark.heavy
 def test_training_local_embedding_records_configured_model_identity(
     tmp_path, monkeypatch
 ) -> None:

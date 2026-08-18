@@ -257,7 +257,7 @@ profiles:
         primary: "gpt-4o"
 ```
 
-For a full example with embeddings, model metadata, fallback backoff, tool detection, and context compaction, see `config.example.yaml`.
+For a full example with embeddings, model metadata, fallback backoff, and tool detection, see `config.example.yaml`.
 
 Config path resolution order:
 
@@ -409,36 +409,23 @@ Routing improves through retraining and calibration rather than runtime prompt e
 
 ## Advanced features
 
-### Smart-proxy context compaction
+### Input-limit routing
 
-Context compaction is opt-in and disabled by default. It can compact oversized message histories inline before proxying upstream and pre-compute summaries in the background for later reuse.
-
-Minimal shape:
+Models declare an input-token limit in config with `max_input_tokens`:
 
 ```yaml
-smart_proxy:
-  context_compaction:
-    enabled: true
-    sync_compaction:
-      enabled: true
-      threshold_percent: 80.0
-    background_precompaction:
-      enabled: true
-      trigger_percent: 70.0
-    session:
-      header_name: X-Optiproxai-Session-Id
-    context_window_tokens: 128000
+profiles:
+  auto:
+    tiers:
+      SIMPLE:
+        primary: [{model: "gpt-4o-mini", max_input_tokens: 128000}]
 ```
 
-Compaction headers:
+During routing, OptiProxAI estimates the prompt token count (via tiktoken, falling back to chars/4) and filters model candidates in the scored tier whose `max_input_tokens` is lower than the estimate. When a model has no `max_input_tokens` configured, it is always considered eligible.
 
-| Header | Values | Meaning |
-|--------|--------|---------|
-| `X-Optiproxai-Compaction` | `off` \| `skipped` \| `inline` \| `cached` \| `failed` | What compaction did |
-| `X-Optiproxai-Compaction-Session` | `explicit` \| `none` | How session was resolved |
-| `X-Optiproxai-Compaction-Saved-Tokens` | integer | Estimated tokens saved |
+When no candidate in the scored tier can accept the prompt and required capabilities are declared, the router escalates to higher tiers (MEDIUM → COMPLEX → REASONING), applying the same input-limit filter to each tier's candidates. If no tier can accept the prompt, the proxy responds with HTTP 400 and error type `input_limit_not_satisfied`.
 
-Compaction state is persisted in SQLite under `$XDG_DATA_HOME/optiproxai/compaction.db` by default. Override with `OPTIPROXAI_DATA_DIR`.
+Because the proxy filters per model, clients should set their own context limit to the largest model's context window. For example, opencode's `max_input` can be set to the largest context window of any model in the routing table and the proxy handles the per-model filtering.
 
 ### Safe config hot reload
 

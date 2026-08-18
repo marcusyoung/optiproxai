@@ -14,7 +14,6 @@ from optiproxai.classification_context import (
     ClassificationInput,
     build_classification_input,
 )
-from optiproxai.compaction import _estimate_tokens
 from optiproxai.config import (
     OptiproxaiConfig,
     ProviderConfig,
@@ -22,6 +21,7 @@ from optiproxai.config import (
     resolve_env,
 )
 from optiproxai.fallback_backoff import FallbackBackoffState
+from optiproxai.tokens import _estimate_tokens
 
 log = logging.getLogger(__name__)
 
@@ -514,9 +514,9 @@ class Router:
     ) -> RoutingDecision:
         """Resolve a model for internal use without running scorer or logging.
 
-        Used by compaction to find the summary model via the Router's
-        profile/tier resolution path, skipping scorer classification and
-        RoutingLogger so internal resolution is not polluted with routing logs.
+        Resolves via the Router's profile/tier resolution path, skipping scorer
+        classification and RoutingLogger so internal resolution is not polluted
+        with routing logs.
 
         Args:
             profile: Profile name, or None to use default_profile.

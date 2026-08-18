@@ -182,8 +182,6 @@ src/optiproxai/
 ├── api_keys.py               # OptiProxAI proxy API key storage and validation
 ├── logger.py                 # JSONL routing log writer
 ├── dirs.py                   # XDG/platformdirs helpers
-├── compaction.py             # Smart-proxy context compaction logic
-├── compaction_store.py       # SQLite-backed compaction state
 ├── dashboard.py              # Dashboard ingestion, stats, and HTML rendering
 ├── training_data.py          # Distilled feature dataset data structures/helpers
 ├── feature_training.py       # Multi-output feature classifier training
@@ -351,7 +349,6 @@ When changing `src/optiproxai/proxy.py`, check whether the change affects:
 - error shape
 - API key middleware
 - config hot reload
-- compaction behavior
 - dashboard ingestion
 - fallback execution
 
@@ -360,7 +357,6 @@ Relevant tests:
 ```bash
 uv run pytest tests/test_proxy_reload.py -q
 uv run pytest tests/test_api_keys_proxy.py -q
-uv run pytest tests/test_compaction.py -q
 uv run pytest tests/test_dashboard.py -q
 ```
 
@@ -382,48 +378,6 @@ When changing reload behavior, run:
 ```bash
 uv run pytest tests/test_proxy_reload.py -q
 uv run pytest tests/test_config.py -q
-```
-
-## Smart-proxy context compaction
-
-Context compaction is opt-in and disabled by default.
-
-Main modules:
-
-- `src/optiproxai/compaction.py`
-- `src/optiproxai/compaction_store.py`
-- `src/optiproxai/proxy.py`
-
-Compaction failures should not break the proxied user request.
-If compaction fails, the proxy should route and proxy the original request.
-
-When changing compaction behavior, run:
-
-```bash
-uv run pytest tests/test_compaction.py -q
-```
-
-Also check:
-
-```bash
-curl -s http://localhost:18420/health | jq .
-```
-
-And inspect response headers on a routed request:
-
-```bash
-curl -i http://localhost:18420/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -H "X-Optiproxai-Session-Id: dev-session" \
-  -d '{"model":"optiproxai/auto","messages":[{"role":"user","content":"hello"}]}'
-```
-
-Relevant headers:
-
-```text
-X-Optiproxai-Compaction
-X-Optiproxai-Compaction-Session
-X-Optiproxai-Compaction-Saved-Tokens
 ```
 
 ## Routing logs
@@ -474,14 +428,6 @@ X-Optiproxai-Tier
 X-Optiproxai-Model
 X-Optiproxai-Score
 X-Optiproxai-Signals
-```
-
-Compaction may add:
-
-```text
-X-Optiproxai-Compaction
-X-Optiproxai-Compaction-Session
-X-Optiproxai-Compaction-Saved-Tokens
 ```
 
 If adding, renaming, or removing headers, update:
@@ -664,12 +610,6 @@ When changing auth:
 - update API key tests
 - verify auth-exempt endpoints
 - ensure secrets are redacted
-
-When changing compaction:
-
-- update compaction tests
-- update README compaction docs
-- update dashboard/log ingestion if fields change
 
 When changing training:
 

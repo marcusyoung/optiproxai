@@ -36,8 +36,6 @@ def _config_text(
     port: int = 18420,
     default_profile: str = "auto",
     include_alt_profile: bool = False,
-    compaction_enabled: bool = False,
-    compaction_concurrency: int = 2,
     fallback_backoff_enabled: bool = False,
     tools_capability_detection: str | None = None,
     decorative_tool_schema_handling: str | None = None,
@@ -59,18 +57,6 @@ def _config_text(
 """
 
     smart_proxy_sections: list[str] = []
-    if compaction_enabled:
-        smart_proxy_sections.append(
-            """
-  context_compaction:
-    enabled: true
-    sync_compaction:
-      enabled: false
-    background_precompaction:
-      enabled: true
-      max_concurrency: {compaction_concurrency}
-""".format(compaction_concurrency=compaction_concurrency)
-        )
     smart_proxy_sections.append(
         f"""
   fallback_backoff:
@@ -509,7 +495,6 @@ class TestReasoningContentCompatibility:
         config_text = _config_text(
             provider_body=provider_body,
             model_rules=model_rules,
-            compaction_enabled=True,
         )
         path.write_text(config_text)
 
@@ -1380,34 +1365,7 @@ providers:
             assert after["config_version"] == before["config_version"]
 
 
-class TestCompactionWorkerReload:
-    def test_reload_recreates_worker_on_concurrency_change(
-        self,
-        tmp_path: Path,
-        admin_token,
-    ):
-        path = tmp_path / "config.yaml"
-        path.write_text(_config_text(compaction_enabled=True, compaction_concurrency=1))
-        configure(str(path))
-
-        with TestClient(app, raise_server_exceptions=False) as client:
-            before_worker = proxy_mod.get_worker()
-            assert before_worker is not None
-            before_limit = before_worker._semaphore._value
-
-            path.write_text(
-                _config_text(compaction_enabled=True, compaction_concurrency=3)
-            )
-            resp = client.post(
-                "/admin/reload-config",
-                headers=_admin_headers(admin_token),
-            )
-            assert resp.status_code == 200
-
-            after_worker = proxy_mod.get_worker()
-            assert after_worker is not None
-            assert after_worker._semaphore._value != before_limit
-
+class TestAdminReloadBackoff:
     def test_reload_updates_backoff_config_without_resetting_state(
         self,
         tmp_path: Path,
@@ -1441,26 +1399,6 @@ class TestCompactionWorkerReload:
         assert (
             after_state.config.smart_proxy.fallback_backoff.initial_delay_seconds == 9
         )
-
-    def test_reload_disable_compaction_stops_worker(
-        self,
-        tmp_path: Path,
-        admin_token,
-    ):
-        path = tmp_path / "config.yaml"
-        path.write_text(_config_text(compaction_enabled=True, compaction_concurrency=2))
-        configure(str(path))
-
-        with TestClient(app, raise_server_exceptions=False) as client:
-            assert proxy_mod.get_worker() is not None
-
-            path.write_text(_config_text(compaction_enabled=False))
-            resp = client.post(
-                "/admin/reload-config",
-                headers=_admin_headers(admin_token),
-            )
-            assert resp.status_code == 200
-            assert proxy_mod.get_worker() is None
 
 
 class TestInFlightSnapshotBehavior:
@@ -1507,14 +1445,14 @@ class TestInFlightSnapshotBehavior:
         fallback_response = JSONResponse(content={"ok": True})
         try:
 
-            async def fake_resolve_compaction(
-                messages: list[dict[str, Any]],
-                request,
-                profile,
-                request_id,
-                model,
+            async def fake_try_with_fallbacks(
+                body,
+                decision,
+                profile=None,
                 *,
-                state,
+                request_id=None,
+                state=None,
+                fallback_body_base=None,
             ):
                 proxy_mod._activate_state(
                     RuntimeState(
@@ -1526,13 +1464,10 @@ class TestInFlightSnapshotBehavior:
                         version=old_state.version + 1,
                     )
                 )
-                from optiproxai.compaction import CompactionResult
-
-                return CompactionResult(mode="off", messages=messages)
+                return fallback_response
 
             with pytest.MonkeyPatch.context() as mp:
-                mp.setattr(proxy_mod, "_resolve_compaction", fake_resolve_compaction)
-                try_with_fallbacks = AsyncMock(return_value=fallback_response)
+                try_with_fallbacks = AsyncMock(side_effect=fake_try_with_fallbacks)
                 mp.setattr(proxy_mod, "_try_with_fallbacks", try_with_fallbacks)
 
                 with TestClient(app, raise_server_exceptions=False) as client:
