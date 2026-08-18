@@ -536,7 +536,7 @@ def test_daily_trends_includes_compaction_columns(configured_dashboard):
     now = datetime.now(timezone.utc)
     rows = [
         {
-            "timestamp": (now - timedelta(hours=1)).isoformat(),
+            "timestamp": (now - timedelta(minutes=1)).isoformat(),
             "request_id": "r3",
             "tier": "SIMPLE",
             "score": 0.2,

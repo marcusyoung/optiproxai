@@ -136,8 +136,10 @@ def test_train_feature_classifier_writes_model_bundle(
 ) -> None:
     data_path = tmp_path / "distilled_feature_dataset.json"
     rows = []
-    # ensure each dimension has at least two classes
-    for index in range(8):
+    # ensure each dimension has at least two classes; use 20 rows so the
+    # MLPClassifier early_stopping internal train_test_split has enough samples
+    # per class (sklearn requires test_size >= n_classes, default 10% of 8 = 1)
+    for index in range(20):
         row = {
             "prompt": f"prompt-{index}",
             "codePresence": "high" if index % 2 else "low",
