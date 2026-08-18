@@ -322,6 +322,8 @@ model_rules:
 | `/v1/models` | GET | List available models |
 | `/v1/route` | POST | Return routing decision without proxying upstream |
 | `/admin/reload-config` | POST | Admin-only safe config hot reload |
+| `/dashboard` | GET | HTML dashboard of routing analytics |
+| `/dashboard/stats` | GET | JSON dashboard stats (`?hours=24&profiles=auto,premium`) |
 | `/health` | GET | Health and active config version metadata |
 
 ## Debug routing
@@ -353,6 +355,25 @@ Look for:
 - `X-Optiproxai-Model`
 - `X-Optiproxai-Score`
 - `X-Optiproxai-Signals`
+
+## Dashboard
+
+OptiProxAI ships a live analytics dashboard. Start the proxy, then open:
+
+```text
+http://localhost:18420/dashboard
+```
+
+The dashboard shows request volume, tier distribution, average scores and confidence, model usage, and daily trends. It supports filtering by routing profile and a light/dark theme toggle.
+
+Data is ingested automatically from the JSONL routing and execution logs into a SQLite database at `$XDG_DATA_HOME/optiproxai/dashboard.db` (default `~/.local/share/optiproxai/dashboard.db`). The dashboard backfills recent logs on page load, so it works even if the proxy was restarted.
+
+The same stats are available as JSON for scripting:
+
+```bash
+curl "http://localhost:18420/dashboard/stats?hours=24"
+curl "http://localhost:18420/dashboard/stats?hours=24&profiles=auto,premium"
+```
 
 ## How it works
 
@@ -521,6 +542,8 @@ src/optiproxai/
 ├── config.py    # YAML config loading and env var resolution
 ├── dirs.py      # XDG-compliant directory paths
 ├── logger.py    # JSONL routing log
+├── dashboard.py # routing analytics dashboard
+├── tokens.py    # token estimation (tiktoken + fallback)
 └── cli.py       # Click CLI
 ```
 

@@ -2,7 +2,6 @@
 
 This document is for developers changing OptiProxAI internals.
 For user-facing setup and usage, see `README.md`.
-For dashboard and production deployment notes, see `README.DASHBOARD.md`.
 For coding-agent-specific instructions, see `AGENTS.md`.
 
 ## Project snapshot
@@ -56,13 +55,13 @@ Set at least one provider key in your shell environment:
 export OPENROUTER_API_KEY="..."
 ```
 
-Local `uv run OptiProxAI ...` does not automatically load `.env`.
+Local `uv run optiproxai ...` does not automatically load `.env`.
 Use your shell, direnv, dotenvx, or another dotenv loader if you prefer keeping secrets in a file.
 
 Check the local configuration:
 
 ```bash
-uv run OptiProxAI doctor --config config.yaml
+uv run optiproxai doctor --config config.yaml
 uv run optiproxai config --config config.yaml
 ```
 
@@ -183,6 +182,7 @@ src/optiproxai/
 ├── logger.py                 # JSONL routing log writer
 ├── dirs.py                   # XDG/platformdirs helpers
 ├── dashboard.py              # Dashboard ingestion, stats, and HTML rendering
+├── tokens.py                 # Token estimation (tiktoken with char/4 fallback)
 ├── training_data.py          # Distilled feature dataset data structures/helpers
 ├── feature_training.py       # Multi-output feature classifier training
 └── agentic_training.py       # Agentic training helpers
@@ -198,6 +198,7 @@ scripts/
 ├── train_agentic_classifier.py   # Legacy/experimental agentic classifier path
 ├── annotate_reasoning.py         # Offline annotation helper
 ├── annotate_synthetic.py         # Offline synthetic annotation helper
+├── compare_embeddings.py         # Embedding and classifier-head evaluation
 └── test_scorer.py                # Manual scorer script
 ```
 
@@ -501,10 +502,7 @@ uv run pytest tests/test_scorer.py -q
 Dashboard-related files:
 
 - `src/optiproxai/dashboard.py`
-- `README.DASHBOARD.md`
-- `grafana-dashboard-optiproxai.json`
-- `grafana-datasource-optiproxai-sqlite.yml`
-- `optiproxai-dashboard-optiproxai.json`
+- `README.md` (Dashboard section)
 
 Relevant test:
 
@@ -620,7 +618,7 @@ When changing training:
 When changing dashboard:
 
 - update dashboard tests
-- update `README.DASHBOARD.md`
+- update the Dashboard section in `README.md`
 - check local dashboard manually
 
 ## Pull request checklist

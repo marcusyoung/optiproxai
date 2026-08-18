@@ -1221,7 +1221,7 @@ def render_dashboard_html(stats: dict[str, Any]) -> str:
     filter_html = _render_profile_filters(available_profiles, selected_profiles)
 
     # Text wordmark for the logo and favicon.
-    logo_svg = '<div class="flex h-8 items-center justify-center rounded-lg bg-primary text-sm font-bold leading-none text-primary-foreground shadow-sm px-2">OPA</div>'
+    logo_svg = '<div class="flex h-8 items-center justify-center rounded-lg bg-primary text-sm font-bold leading-none text-primary-foreground shadow-sm px-2">OPX</div>'
 
     # Theme toggle SVG icons
     sun_icon = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><circle cx="12" cy="12" r="5"/><path stroke-linecap="round" d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>'
@@ -1234,7 +1234,7 @@ def render_dashboard_html(stats: dict[str, Any]) -> str:
         '    <meta charset="utf-8">',
         '    <meta name="viewport" content="width=device-width, initial-scale=1">',
         "    <title>OptiProxAI Dashboard</title>",
-        '    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%226%22 fill=%22%236366f1%22/%3E%3Ctext x=%2216%22 y=%2222%22 text-anchor=%22middle%22 font-size=%2214%22 font-weight=%22bold%22 fill=%22white%22%3EOPA%3C/text%3E%3C/svg%3E">',
+        '    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 32 32%22%3E%3Crect width=%2232%22 height=%2232%22 rx=%226%22 fill=%22%236366f1%22/%3E%3Ctext x=%2216%22 y=%2222%22 text-anchor=%22middle%22 font-size=%2214%22 font-weight=%22bold%22 fill=%22white%22%3EOPX%3C/text%3E%3C/svg%3E">',
         '    <script src="https://d3js.org/d3.v7.min.js"></script>',
         '    <script src="https://cdn.tailwindcss.com"></script>',
         "    <script>",
