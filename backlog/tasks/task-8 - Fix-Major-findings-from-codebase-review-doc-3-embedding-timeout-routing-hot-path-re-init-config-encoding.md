@@ -3,10 +3,10 @@ id: TASK-8
 title: >-
   Fix Major findings from codebase review (doc-3): embedding timeout, routing
   hot-path re-init, config encoding
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-18 14:08'
-updated_date: '2026-08-18 14:36'
+updated_date: '2026-08-18 15:03'
 labels: []
 dependencies: []
 documentation:
