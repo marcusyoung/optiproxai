@@ -816,13 +816,15 @@ class Scorer:
         feature_model_dir: Any | None = None,
         enable_routing_log: bool = True,
     ) -> None:
-        global _embedding_settings_cache, _local_embedding_backend
+        global _embedding_settings_cache
         # A new Scorer means a new config state (the proxy constructs a new
         # Router per config reload, which constructs a new Scorer). Clear the
-        # memoized embedding settings and local backend so the next request
-        # re-resolves against the current config.
+        # memoized embedding settings so the next request re-resolves against
+        # the current config. The local embedding backend is intentionally
+        # preserved: _embed_text already replaces it when settings.model
+        # changes, so keeping it lets the sentence-transformers model survive
+        # config reloads that don't change the model.
         _embedding_settings_cache = None
-        _local_embedding_backend = None
         self.config = config or ScoringConfig()
         self.feature_model_dir = (
             Path(feature_model_dir).expanduser() if feature_model_dir else None
