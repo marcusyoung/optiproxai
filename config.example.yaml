@@ -132,18 +132,18 @@ model_rules:
     # - prefix: "moonshotai/kimi-k3"
     #   provider: "doubleword"
     #   async_mode:
-    #       enabled: true
-    #       delivery: header
-    #       field: X-Async-Batch
-    #       value: "1"
+    #     enabled: true
+    #     delivery: header
+    #     field: X-Async-Batch
+    #     value: "1"
     # Rule-level async_mode with model_suffix delivery.
     #
     # - prefix: "moonshotai/kimi-k3"
     #   provider: "doubleword"
     #   async_mode:
-    #       enabled: true
-    #       delivery: model_suffix
-    #       suffix: flex            # sends model as "moonshotai/kimi-k3:flex"
+    #     enabled: true
+    #     delivery: model_suffix
+    #     suffix: flex            # sends model as "moonshotai/kimi-k3:flex"
 
 # ---------------------------------------------------------------------------
 # Providers

@@ -617,7 +617,15 @@ async def _proxy_upstream(
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     if extra_headers:
-        headers.update(extra_headers)
+        reserved = {"content-type", "authorization"}
+        for key, value in extra_headers.items():
+            if key.lower() in reserved:
+                logger.warning(
+                    "Skipping reserved header override from async_mode header=%s",
+                    key,
+                )
+                continue
+            headers[key] = value
 
     is_streaming = body.get("stream", False)
     model_name = body.get("model", "unknown")

@@ -93,6 +93,30 @@ class AsyncModeConfig(BaseModel):
     value: str = ""  # body/header: the value to send
     suffix: str = ""  # model_suffix: the suffix appended after ':'
 
+    @model_validator(mode="after")
+    def _validate_enabled_fields(self) -> "AsyncModeConfig":
+        """Reject enabled configs with empty field/value/suffix for their delivery mode."""
+        if not self.enabled:
+            return self
+        if self.delivery in ("body", "header"):
+            if not self.field:
+                raise ValueError(
+                    f"async_mode.field is required when delivery={self.delivery!r} "
+                    f"and enabled is true"
+                )
+            if not self.value:
+                raise ValueError(
+                    f"async_mode.value is required when delivery={self.delivery!r} "
+                    f"and enabled is true"
+                )
+        elif self.delivery == "model_suffix":
+            if not self.suffix:
+                raise ValueError(
+                    "async_mode.suffix is required when delivery='model_suffix' "
+                    "and enabled is true"
+                )
+        return self
+
 
 class ProviderConfig(BaseModel):
     """A backend LLM provider (OpenRouter, Anthropic, local proxy, etc.)."""
