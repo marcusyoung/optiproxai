@@ -842,6 +842,7 @@ def get_dashboard_stats(
             FROM routing_logs
             WHERE timestamp > ?
             {profile_sql}
+              AND signals NOT LIKE '%tier_override%'
             GROUP BY tier
             ORDER BY avg_score DESC, tier ASC
             """,
@@ -861,6 +862,7 @@ def get_dashboard_stats(
             FROM routing_logs
             WHERE timestamp > ?
             {profile_sql}
+              AND signals NOT LIKE '%tier_override%'
             GROUP BY bucket
             ORDER BY count DESC
             """,
