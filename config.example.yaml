@@ -43,8 +43,6 @@ default_profile: auto
 # is "session_sticky", OptiProxAI reads the session key from this HTTP header
 # and uses hash(session_key) % len(candidates) for deterministic selection.
 # When the header is absent, falls back to round-robin (no regression).
-#
-# This is separate from smart_proxy.context_compaction.session.header_name.
 
 routing:
     session_header: X-Session-Id
@@ -83,32 +81,6 @@ routing:
 # smart_proxy:
 #   tools_capability_detection: declared       # declared | active
 #   decorative_tool_schema_handling: preserve  # preserve | strip
-#
-# Context compaction is optional — all features disabled by default.
-# Uncomment and adjust to enable inline and/or background context compaction.
-#
-# smart_proxy:
-#   context_compaction:
-#     enabled: true
-#     sync_compaction:
-#       enabled: true
-#       threshold_percent: 80.0    # compact when prompt ≥ 80% of context window
-#       protect_first_n: 1
-#       protect_last_n: 2
-#       summary_profile: ""        # routing profile for summary model; empty = use default_profile
-#       summary_ratio: 0.25        # summary max_tokens = middle_tokens * ratio
-#       min_summary_tokens: 128    # floor for dynamic summary token budget
-#       max_summary_tokens: 1024   # ceiling for dynamic summary token budget
-#     background_precompaction:
-#       enabled: true
-#       trigger_percent: 70.0
-#       max_concurrency: 2
-#       summary_ttl_seconds: 3600
-#     session:
-#       # Explicit session header. If omitted by the client, OptiProxAI does not derive
-#       # a session ID; inline compaction may run, but cache/background reuse is unavailable.
-#       header_name: X-Optiproxai-Session-Id
-#     context_window_tokens: 128000
 
 # ---------------------------------------------------------------------------
 # Runtime embeddings for the distilled feature classifier

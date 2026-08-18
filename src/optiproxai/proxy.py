@@ -22,28 +22,6 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from optiproxai.api_keys import has_keys, validate_key
-from optiproxai.compaction import (
-    BackgroundCompactionWorker,
-    CompactionResult,
-    _merge_summaries,
-    generate_summary,
-    get_worker,
-    set_worker,
-    try_sync_compaction,
-)
-from optiproxai.compaction_store import (
-    enqueue_summary,
-    get_inflight_summary,
-    get_latest_ready_summary_for_session,
-    get_ready_summary,
-    get_snapshot,
-    init_db,
-    mark_stale_summaries,
-    resolve_session_id,
-    save_snapshot,
-    snapshot_hash,
-    upsert_session,
-)
 from optiproxai.config import ContentPartPolicy, OptiproxaiConfig, load_config
 from optiproxai.dashboard import (
     dashboard_needs_stderr_backfill,
@@ -195,19 +173,6 @@ def _require_runtime_state() -> RuntimeState:
     raise RuntimeError("Runtime state is not configured")
 
 
-def _build_compaction_worker(
-    config: OptiproxaiConfig,
-) -> BackgroundCompactionWorker | None:
-    """Build a background compaction worker from config, if enabled."""
-    cc = config.smart_proxy.context_compaction
-    if not cc.enabled:
-        return None
-
-    init_db()
-    max_conc = cc.background_precompaction.max_concurrency
-    return BackgroundCompactionWorker(max_concurrency=max_conc)
-
-
 def configure(config_path: str | None = None) -> None:
     """Load config and build the runtime state (called before app startup)."""
     state = _build_runtime_state(config_path, strict=False)
@@ -235,27 +200,7 @@ async def lifespan(app: FastAPI):
     )
     logger.info("HTTP connection pool started")
 
-    runtime = _require_runtime_state()
-    worker = None
-    try:
-        worker = _build_compaction_worker(runtime.config)
-        set_worker(worker)
-        if worker is not None:
-            logger.info(
-                "Smart-proxy context compaction enabled (worker started) version=%d",
-                runtime.version,
-            )
-    except Exception:
-        set_worker(None)
-        logger.exception("Failed to initialise compaction worker during startup")
-
     yield
-
-    # Shutdown background worker
-    active_worker = get_worker()
-    if active_worker is not None:
-        await active_worker.shutdown()
-        set_worker(None)
 
     if _http is not None:
         await _http.aclose()
@@ -603,7 +548,6 @@ def _log_usage(
     *,
     decision: RoutingDecision | None = None,
     request_id: str | None = None,
-    compaction_result: CompactionResult | None = None,
 ) -> None:
     """Log token usage from an upstream response."""
     if not usage:
@@ -642,16 +586,6 @@ def _log_usage(
         completion_tokens=completion,
         total_tokens=total,
         elapsed_ms=elapsed_ms,
-        compaction_mode=compaction_result.mode if compaction_result else None,
-        compaction_tokens_saved=compaction_result.estimated_tokens_saved
-        if compaction_result
-        else 0,
-        compaction_original_tokens=compaction_result.original_tokens
-        if compaction_result
-        else 0,
-        compaction_session_id=compaction_result.session_id
-        if compaction_result
-        else None,
     )
 
 
@@ -664,7 +598,6 @@ async def _proxy_upstream(
     *,
     actual_provider: str | None = None,
     request_id: str | None = None,
-    compaction_result: CompactionResult | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Forward a chat-completion request to the upstream provider."""
     assert _http is not None
@@ -765,7 +698,6 @@ async def _proxy_upstream(
                             elapsed,
                             decision=decision,
                             request_id=request_id,
-                            compaction_result=compaction_result,
                         )
 
             resp_headers = dict(extra_headers)
@@ -810,7 +742,6 @@ async def _proxy_upstream(
                 elapsed,
                 decision=decision,
                 request_id=request_id,
-                compaction_result=compaction_result,
             )
             return JSONResponse(
                 content=resp_data,
@@ -958,7 +889,6 @@ async def _try_with_fallbacks(
     profile: str | None = None,
     *,
     request_id: str | None = None,
-    compaction_result: CompactionResult | None = None,
     state: RuntimeState | None = None,
     fallback_body_base: dict[str, Any] | None = None,
 ) -> StreamingResponse | JSONResponse:
@@ -977,7 +907,6 @@ async def _try_with_fallbacks(
         profile=profile,
         actual_provider=decision.provider,
         request_id=request_id,
-        compaction_result=compaction_result,
     )
 
     if not _is_retryable_error(result):
@@ -1049,7 +978,6 @@ async def _try_with_fallbacks(
             profile=profile,
             actual_provider=fb.provider,
             request_id=request_id,
-            compaction_result=compaction_result,
         )
         if not _is_retryable_error(result):
             _record_successful_candidate(
@@ -1474,384 +1402,6 @@ def _apply_reasoning_for_style(
     return body
 
 
-# ── Compaction helpers ────────────────────────────────────────────────────────
-
-
-def _compaction_headers(result: CompactionResult) -> dict[str, str]:
-    """Build X-Optiproxai-Compaction-* response headers from a CompactionResult."""
-    h: dict[str, str] = {
-        "X-Optiproxai-Compaction": result.mode,
-    }
-    if result.session_id:
-        h["X-Optiproxai-Compaction-Session"] = result.session_mode
-    if result.estimated_tokens_saved > 0:
-        h["X-Optiproxai-Compaction-Saved-Tokens"] = str(result.estimated_tokens_saved)
-    return h
-
-
-async def _resolve_compaction(
-    messages: list[dict[str, Any]],
-    request: Request,
-    profile: str | None,
-    request_id: str | None,
-    model: str | None = None,
-    *,
-    state: RuntimeState | None = None,
-) -> CompactionResult:
-    """Run compaction logic for a routed request.
-
-    Returns a CompactionResult describing the outcome. On any error the result
-    will have mode='failed' and the caller must use the original messages.
-    """
-    active_state = state or _require_runtime_state()
-    cc = active_state.config.smart_proxy.context_compaction
-    if not cc.enabled:
-        return CompactionResult(mode="off", messages=messages)
-
-    sync_cfg = cc.sync_compaction
-    bg_cfg = cc.background_precompaction
-
-    # Resolve session
-    explicit_header = request.headers.get(cc.session.header_name)
-    try:
-        session_id, session_mode = resolve_session_id(
-            messages,
-            explicit_header=explicit_header,
-            model=str(request.headers.get("x-optiproxai-model", "")),
-        )
-    except Exception as exc:
-        logger.warning("COMPACTION session resolution failed: %s", exc)
-        return CompactionResult(mode="failed", messages=messages, error=str(exc))
-
-    # Estimate token usage
-    from optiproxai.compaction import _estimate_tokens
-
-    prompt_tokens = _estimate_tokens(messages, model)
-    threshold_tokens = int(cc.context_window_tokens * sync_cfg.threshold_percent / 100)
-    bg_trigger_tokens = int(cc.context_window_tokens * bg_cfg.trigger_percent / 100)
-
-    # Persist session state (skipped when no session ID is available)
-    snap_hash_val = snapshot_hash(messages)
-    if session_id is not None:
-        try:
-            upsert_session(
-                session_id,
-                profile=profile,
-                request_id=request_id,
-                snapshot_hash=snap_hash_val,
-                prompt_tokens=prompt_tokens,
-            )
-            mark_stale_summaries(session_id, snap_hash_val)
-        except Exception as exc:
-            logger.warning("COMPACTION session persistence failed: %s", exc)
-
-    # Check for a ready cached summary (Phase B reuse)
-    compacted_messages = messages
-    mode = "skipped"
-    estimated_saved = 0
-
-    if sync_cfg.enabled:
-        # Cache lookup is only possible when a session ID is present
-        ready = None
-        if session_id is not None:
-            try:
-                ready = get_ready_summary(session_id, snap_hash_val)
-            except Exception as exc:
-                logger.warning("COMPACTION cache lookup failed: %s", exc)
-
-        if ready and ready.get("summary_text"):
-            # Reuse cached summary (Phase B hit)
-            compacted, saved = try_sync_compaction(
-                messages,
-                ready["summary_text"],
-                sync_cfg.protect_first_n,
-                sync_cfg.protect_last_n,
-                prompt_tokens,
-                model,
-            )
-            if compacted is not None:
-                compacted_messages = compacted
-                mode = "cached"
-                estimated_saved = saved
-                logger.info(
-                    "COMPACTION mode=cached session=%s snap=%s saved=%d original_tokens=%d compacted_tokens=%d request_id=%s",
-                    session_id,
-                    snap_hash_val[:8],
-                    saved,
-                    prompt_tokens,
-                    max(0, prompt_tokens - saved),
-                    request_id,
-                )
-            else:
-                mode = "skipped"
-        elif prompt_tokens >= threshold_tokens:
-            # Phase A: generate summary inline
-            summary_model = ""
-            base_url_for_summary = ""
-            api_key_for_summary = ""
-
-            try:
-                decision = active_state.router.resolve_model(
-                    profile=sync_cfg.summary_profile or None,
-                    tier="SIMPLE",
-                )
-                summary_model = decision.model
-                base_url_for_summary = decision.base_url.rstrip("/")
-                api_key_for_summary = decision.api_key
-            except Exception as exc:
-                logger.warning("COMPACTION resolve_model failed: %s", exc)
-
-            if summary_model and base_url_for_summary:
-                try:
-                    # Look up prior summary for incremental path (only when session is known)
-                    prior_summary_row = (
-                        get_latest_ready_summary_for_session(session_id)
-                        if session_id is not None
-                        else None
-                    )
-                    prior_text: str | None = None
-                    prior_covered: int = 0
-                    new_covered: int = 0
-
-                    if prior_summary_row and prior_summary_row.get("summary_text"):
-                        # Validate prior summary still applies to current messages
-                        prior_snap = get_snapshot(prior_summary_row["snapshot_hash"])
-                        if prior_snap:
-                            import json as _json
-
-                            prior_msgs = _json.loads(prior_snap["messages_json"])
-                            prior_covered_raw = (
-                                prior_summary_row.get("covered_message_count", 0) or 0
-                            )
-                            n = len(messages)
-                            has_system = (
-                                messages[0].get("role") == "system"
-                                if messages
-                                else False
-                            )
-                            head_end = sync_cfg.protect_first_n + (
-                                1 if has_system else 0
-                            )
-                            covered_end = head_end + prior_covered_raw
-                            # Validate: covered prefix of prior matches current messages
-                            if (
-                                covered_end <= len(prior_msgs)
-                                and covered_end <= n
-                                and prior_msgs[:covered_end] == messages[:covered_end]
-                            ):
-                                prior_text = prior_summary_row["summary_text"]
-                                prior_covered = prior_covered_raw
-
-                    if prior_text is not None:
-                        # Incremental path: summarize only the delta
-                        n = len(messages)
-                        has_system = (
-                            messages[0].get("role") == "system" if messages else False
-                        )
-                        head_end = sync_cfg.protect_first_n + (1 if has_system else 0)
-                        tail_start = n - sync_cfg.protect_last_n
-                        delta_messages = messages[head_end + prior_covered : tail_start]
-
-                        if not delta_messages:
-                            # No new messages since last summary — reuse prior
-                            delta_summary = ""
-                            final_summary = prior_text
-                            new_covered = prior_covered
-                        else:
-                            delta_summary = await generate_summary(
-                                delta_messages + messages[tail_start:],
-                                summary_model=summary_model,
-                                base_url=base_url_for_summary,
-                                api_key=api_key_for_summary,
-                                protect_first_n=0,
-                                protect_last_n=sync_cfg.protect_last_n,
-                                summary_ratio=sync_cfg.summary_ratio,
-                                min_summary_tokens=sync_cfg.min_summary_tokens,
-                                max_summary_tokens=sync_cfg.max_summary_tokens,
-                            )
-                            final_summary = await _merge_summaries(
-                                prior_text,
-                                delta_summary,
-                                sync_cfg.merge_threshold,
-                                summary_model=summary_model,
-                                base_url=base_url_for_summary,
-                                api_key=api_key_for_summary,
-                            )
-                            new_covered = max(0, tail_start - head_end)
-
-                        compacted, saved = try_sync_compaction(
-                            messages,
-                            final_summary,
-                            sync_cfg.protect_first_n,
-                            sync_cfg.protect_last_n,
-                            prompt_tokens,
-                            model,
-                        )
-                        summary_text = final_summary
-                    else:
-                        # Full single-pass (no prior summary)
-                        summary_text = await generate_summary(
-                            messages,
-                            summary_model=summary_model,
-                            base_url=base_url_for_summary,
-                            api_key=api_key_for_summary,
-                            protect_first_n=sync_cfg.protect_first_n,
-                            protect_last_n=sync_cfg.protect_last_n,
-                            summary_ratio=sync_cfg.summary_ratio,
-                            min_summary_tokens=sync_cfg.min_summary_tokens,
-                            max_summary_tokens=sync_cfg.max_summary_tokens,
-                        )
-                        n = len(messages)
-                        has_system = (
-                            messages[0].get("role") == "system" if messages else False
-                        )
-                        head_end = sync_cfg.protect_first_n + (1 if has_system else 0)
-                        tail_start = n - sync_cfg.protect_last_n
-                        new_covered = max(0, tail_start - head_end)
-                        compacted, saved = try_sync_compaction(
-                            messages,
-                            summary_text,
-                            sync_cfg.protect_first_n,
-                            sync_cfg.protect_last_n,
-                            prompt_tokens,
-                            model,
-                        )
-
-                    if compacted is not None:
-                        # Persist the generated summary for future reuse (only when session is known)
-                        if session_id is not None:
-                            try:
-                                snap_h = save_snapshot(
-                                    session_id, messages, prompt_tokens
-                                )
-                                from optiproxai.compaction_store import update_summary
-
-                                new_id = enqueue_summary(
-                                    session_id, snap_h, new_covered
-                                )
-                                update_summary(
-                                    new_id,
-                                    status="ready",
-                                    summary_text=summary_text,
-                                    estimated_tokens_saved=saved,
-                                    covered_message_count=new_covered,
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "COMPACTION persist inline summary failed: %s", exc
-                                )
-
-                        compacted_messages = compacted
-                        mode = "inline"
-                        estimated_saved = saved
-                        logger.info(
-                            "COMPACTION mode=inline session=%s snap=%s saved=%d original_tokens=%d compacted_tokens=%d request_id=%s",
-                            session_id,
-                            snap_hash_val[:8],
-                            saved,
-                            prompt_tokens,
-                            max(0, prompt_tokens - saved),
-                            request_id,
-                        )
-                    else:
-                        mode = "skipped"
-                        logger.info(
-                            "COMPACTION mode=skipped (unsafe structure) session=%s original_tokens=%d compacted_tokens=%d request_id=%s",
-                            session_id,
-                            prompt_tokens,
-                            prompt_tokens,
-                            request_id,
-                        )
-                except Exception as exc:
-                    mode = "failed"
-                    logger.warning(
-                        "COMPACTION inline failed session=%s error=%s request_id=%s",
-                        session_id,
-                        exc,
-                        request_id,
-                    )
-            else:
-                mode = "skipped"
-
-    # Phase B: schedule background precompaction if threshold crossed (requires session ID)
-    if bg_cfg.enabled and session_id is not None and prompt_tokens >= bg_trigger_tokens:
-        try:
-            if not get_inflight_summary(session_id, snap_hash_val):
-                snap_h = save_snapshot(session_id, messages, prompt_tokens)
-                # Look up prior summary for incremental background compaction
-                bg_prior_row = get_latest_ready_summary_for_session(session_id)
-                bg_prior_text: str | None = None
-                bg_prior_covered: int = 0
-                if bg_prior_row and bg_prior_row.get("summary_text"):
-                    bg_prior_snap = get_snapshot(bg_prior_row["snapshot_hash"])
-                    if bg_prior_snap:
-                        import json as _json2
-
-                        bg_prior_msgs = _json2.loads(bg_prior_snap["messages_json"])
-                        bg_covered_raw = (
-                            bg_prior_row.get("covered_message_count", 0) or 0
-                        )
-                        n = len(messages)
-                        has_system = (
-                            messages[0].get("role") == "system" if messages else False
-                        )
-                        head_end = sync_cfg.protect_first_n + (1 if has_system else 0)
-                        covered_end = head_end + bg_covered_raw
-                        if (
-                            covered_end <= len(bg_prior_msgs)
-                            and covered_end <= n
-                            and bg_prior_msgs[:covered_end] == messages[:covered_end]
-                        ):
-                            bg_prior_text = bg_prior_row["summary_text"]
-                            bg_prior_covered = bg_covered_raw
-
-                summary_id = enqueue_summary(session_id, snap_h)
-                worker = get_worker()
-                if worker is not None:
-                    bg_decision = active_state.router.resolve_model(
-                        profile=sync_cfg.summary_profile or None,
-                        tier="SIMPLE",
-                    )
-                    worker.schedule(
-                        summary_id,
-                        session_id,
-                        snap_h,
-                        messages,
-                        summary_model=bg_decision.model,
-                        base_url=bg_decision.base_url.rstrip("/"),
-                        api_key=bg_decision.api_key,
-                        protect_first_n=sync_cfg.protect_first_n,
-                        protect_last_n=sync_cfg.protect_last_n,
-                        original_tokens=prompt_tokens,
-                        merge_threshold=sync_cfg.merge_threshold,
-                        prior_summary=bg_prior_text,
-                        prior_covered_count=bg_prior_covered,
-                        model=model,
-                        summary_ratio=sync_cfg.summary_ratio,
-                        min_summary_tokens=sync_cfg.min_summary_tokens,
-                        max_summary_tokens=sync_cfg.max_summary_tokens,
-                    )
-                    logger.info(
-                        "COMPACTION_BG queued session=%s snap=%s request_id=%s incremental=%s",
-                        session_id,
-                        snap_h[:8],
-                        request_id,
-                        bg_prior_text is not None,
-                    )
-        except Exception as exc:
-            logger.warning("COMPACTION_BG scheduling failed: %s", exc)
-
-    return CompactionResult(
-        applied=mode in ("inline", "cached"),
-        messages=compacted_messages,
-        mode=mode,
-        session_id=session_id,
-        session_mode=session_mode,
-        estimated_tokens_saved=estimated_saved,
-        original_tokens=prompt_tokens,
-    )
-
-
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
@@ -1905,7 +1455,7 @@ async def chat_completions(request: Request):
         session_key = request.headers.get(state.config.routing.session_header)
 
         # Strip a per-turn /optiproxai:<tier> override token from the latest user
-        # message before compaction/routing so it never leaks upstream.
+        # message before routing so it never leaks upstream.
         tier_override, stripped_messages = parse_tier_override(messages)
         if tier_override is not None or stripped_messages is not messages:
             body = dict(body)
@@ -1971,19 +1521,6 @@ async def chat_completions(request: Request):
             state.version,
         )
 
-        # Smart-proxy context compaction (Phase A + B)
-        compaction_result = await _resolve_compaction(
-            messages,
-            request,
-            profile_name,
-            request_id,
-            model=decision.model,
-            state=state,
-        )
-        if compaction_result.applied:
-            body = dict(body)
-            body["messages"] = compaction_result.messages
-
         body, decorative_tool_schema_adaptation = _adapt_decorative_tool_schema_payload(
             body,
             tools_capability_decision,
@@ -2031,16 +1568,9 @@ async def chat_completions(request: Request):
             decision,
             profile_name,
             request_id=request_id,
-            compaction_result=compaction_result,
             state=state,
             fallback_body_base=fallback_body_base,
         )
-
-        # Attach compaction headers
-        compaction_hdrs = _compaction_headers(compaction_result)
-        if compaction_hdrs:
-            for k, v in compaction_hdrs.items():
-                response.headers[k] = v
 
         return response
 
@@ -2125,28 +1655,6 @@ def _non_reloadable_changes(
     return changed
 
 
-async def _reload_compaction_worker(candidate: OptiproxaiConfig) -> tuple[bool, str]:
-    """Switch background compaction worker according to new config."""
-    old_worker = get_worker()
-    try:
-        new_worker = _build_compaction_worker(candidate)
-    except Exception as exc:
-        logger.exception("Failed to build compaction worker for reload")
-        return False, str(exc)
-
-    set_worker(new_worker)
-    if old_worker is not None and old_worker is not new_worker:
-        try:
-            await old_worker.shutdown()
-        except Exception:
-            logger.exception(
-                "Failed to shutdown previous compaction worker after reload"
-            )
-            return False, "Old compaction worker shutdown failed"
-
-    return True, ""
-
-
 @app.post("/admin/reload-config")
 async def reload_config(request: Request):
     """Reload configuration safely with strict validation and atomic swap."""
@@ -2196,23 +1704,6 @@ async def reload_config(request: Request):
 
         _activate_state(candidate)
 
-        ok, worker_error = await _reload_compaction_worker(candidate.config)
-        if not ok:
-            _activate_state(before)
-            await _reload_compaction_worker(before.config)
-            logger.error(
-                "ADMIN_RELOAD rolled back due to worker error config_path=%s old_version=%d candidate_version=%d error=%s",
-                before.config_path,
-                before.version,
-                candidate.version,
-                worker_error,
-            )
-            return _openai_error(
-                500,
-                f"Reload failed during worker switch: {worker_error}",
-                "reload_error",
-            )
-
         changed = {
             "default_provider": before.config.default_provider
             != candidate.config.default_provider,
@@ -2222,10 +1713,6 @@ async def reload_config(request: Request):
             != len(candidate.config.providers),
             "profiles_count": len(before.config.profiles)
             != len(candidate.config.profiles),
-            "compaction_enabled": before.config.smart_proxy.context_compaction.enabled
-            != candidate.config.smart_proxy.context_compaction.enabled,
-            "compaction_concurrency": before.config.smart_proxy.context_compaction.background_precompaction.max_concurrency
-            != candidate.config.smart_proxy.context_compaction.background_precompaction.max_concurrency,
         }
 
         logger.info(
