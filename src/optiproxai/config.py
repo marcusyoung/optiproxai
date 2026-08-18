@@ -83,8 +83,15 @@ class AsyncModeConfig(BaseModel):
     - ``header``: inject HTTP header ``{field: value}`` on the upstream request.
     - ``model_suffix``: append ``:{suffix}`` to the model name sent upstream.
 
-    When ``enabled`` is false the config acts as an explicit opt-out: it wins
-    over lower-precedence levels that have async enabled.
+    Opt-in model (TASK-10): the **provider** declares the mechanism
+    (``delivery``/``field``/``value``/``suffix``), the **model/rule** declares
+    intent (``enabled: true`` opts in).  Provider-level ``enabled`` is ignored
+    (vestigial).  Default is ``enabled: false`` (sync).
+
+    ``{enabled: true}`` alone is valid — the mechanism may be inherited from
+    a lower-precedence level at runtime.  Partial mechanisms (some mechanism
+    fields explicitly set but incomplete for the effective delivery) are
+    rejected at config load to catch typos.
     """
 
     enabled: bool = False
@@ -95,25 +102,36 @@ class AsyncModeConfig(BaseModel):
 
     @model_validator(mode="after")
     def _validate_enabled_fields(self) -> "AsyncModeConfig":
-        """Reject enabled configs with empty field/value/suffix for their delivery mode."""
-        if not self.enabled:
+        """Reject partial mechanisms; accept ``{enabled: true}`` as a pure flag.
+
+        Only fires when mechanism fields are explicitly set (via
+        ``model_fields_set``).  A pure ``{enabled: true}`` flag is valid —
+        the mechanism may come from a lower-precedence level at runtime.
+        """
+        explicit = self.model_fields_set
+        # No mechanism fields explicitly set → pure flag (or pure default).
+        mechanism_fields = explicit & {"delivery", "field", "value", "suffix"}
+        if not mechanism_fields:
             return self
+
+        # At least one mechanism field is set — require a complete mechanism
+        # for the effective delivery.
         if self.delivery in ("body", "header"):
             if not self.field:
                 raise ValueError(
                     f"async_mode.field is required when delivery={self.delivery!r} "
-                    f"and enabled is true"
+                    f"and mechanism fields are set"
                 )
             if not self.value:
                 raise ValueError(
                     f"async_mode.value is required when delivery={self.delivery!r} "
-                    f"and enabled is true"
+                    f"and mechanism fields are set"
                 )
         elif self.delivery == "model_suffix":
             if not self.suffix:
                 raise ValueError(
                     "async_mode.suffix is required when delivery='model_suffix' "
-                    "and enabled is true"
+                    "and mechanism fields are set"
                 )
         return self
 
@@ -132,8 +150,10 @@ class ProviderConfig(BaseModel):
     async_mode: AsyncModeConfig | None = Field(
         default=None,
         description=(
-            "Provider-level async/batch routing default. ModelEntry and "
-            "ModelRuleEntry async_mode values override this."
+            "Provider-level async/batch mechanism declaration (delivery/"
+            "field/value/suffix).  The provider declares HOW async works; "
+            "model/rule-level async_mode.enabled declares WHO opts in.  "
+            "Provider-level enabled is ignored (vestigial)."
         ),
     )
 
@@ -153,8 +173,10 @@ class ModelEntry(BaseModel):
     async_mode: AsyncModeConfig | None = Field(
         default=None,
         description=(
-            "Per-model async/batch routing override. Presence wins over "
-            "rule/provider levels; enabled: false explicitly opts out."
+            "Per-model async/batch opt-in or override.  Set enabled: true to "
+            "opt in (mechanism inherited from provider/rule).  Set enabled: "
+            "false to explicitly opt out.  Mechanism fields (delivery/field/"
+            "value/suffix) override the provider's mechanism."
         ),
     )
 
@@ -372,9 +394,11 @@ class ModelRuleEntry(BaseModel):
     async_mode: AsyncModeConfig | None = Field(
         default=None,
         description=(
-            "Rule-level async/batch routing declaration for matching "
-            "model/provider prefixes. Provider-specific rules outrank "
-            "provider-agnostic rules before prefix specificity is compared."
+            "Rule-level async/batch opt-in or mechanism override for matching "
+            "model/provider prefixes.  Set enabled: true to opt in (mechanism "
+            "inherited from provider); set enabled: false to explicitly opt out. "
+            "Mechanism fields override the provider's mechanism.  Provider-specific "
+            "rules outrank provider-agnostic rules before prefix specificity."
         ),
     )
     extra_body: dict[str, Any] | None = Field(

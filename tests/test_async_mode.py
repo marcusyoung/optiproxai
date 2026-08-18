@@ -115,30 +115,19 @@ class TestAsyncModeDelivery:
         assert headers == {}
 
 
-class TestAsyncModeResolution:
-    """Resolution order: ModelEntry -> ModelRuleEntry -> ProviderConfig -> None."""
+class TestAsyncModeOptInMerge:
+    """Opt-in merge semantics (TASK-10): provider declares mechanism, model/rule opts in."""
 
-    def test_entry_level_wins_over_rule_level(self):
+    def test_enabled_at_model_mechanism_at_provider(self):
+        """Model entry says enabled: true (pure flag); provider declares mechanism."""
         state = _state(
-            [
-                ModelRuleEntry(
-                    prefix="moonshotai/kimi-k3",
-                    provider="doubleword",
-                    async_mode=AsyncModeConfig(
-                        enabled=True,
-                        delivery="header",
-                        field="X-Rule",
-                        value="rule",
-                    ),
-                ),
-            ]
+            provider_async=AsyncModeConfig(
+                delivery="body",
+                field="service_tier",
+                value="flex",
+            ),
         )
-        entry_async = AsyncModeConfig(
-            enabled=True,
-            delivery="body",
-            field="service_tier",
-            value="flex",
-        )
+        entry_async = AsyncModeConfig(enabled=True)
         prepared, headers = proxy_mod._prepare_body_for_candidate(
             _body(),
             "moonshotai/kimi-k3",
@@ -149,37 +138,17 @@ class TestAsyncModeResolution:
         assert prepared["service_tier"] == "flex"
         assert headers == {}
 
-    def test_rule_level_wins_over_provider_level(self):
+    def test_enabled_at_rule_mechanism_at_provider(self):
+        """Rule says enabled: true (pure flag); provider declares mechanism."""
         state = _state(
             [
                 ModelRuleEntry(
                     prefix="moonshotai/kimi-k3",
                     provider="doubleword",
-                    async_mode=AsyncModeConfig(
-                        enabled=True,
-                        delivery="header",
-                        field="X-Rule",
-                        value="rule",
-                    ),
+                    async_mode=AsyncModeConfig(enabled=True),
                 ),
             ],
             provider_async=AsyncModeConfig(
-                enabled=True,
-                delivery="body",
-                field="service_tier",
-                value="flex",
-            ),
-        )
-        prepared, headers = proxy_mod._prepare_body_for_candidate(
-            _body(), "moonshotai/kimi-k3", "doubleword", state
-        )
-        assert headers == {"X-Rule": "rule"}
-        assert "service_tier" not in prepared
-
-    def test_provider_level_applies_when_no_rule(self):
-        state = _state(
-            provider_async=AsyncModeConfig(
-                enabled=True,
                 delivery="body",
                 field="service_tier",
                 value="flex",
@@ -189,6 +158,85 @@ class TestAsyncModeResolution:
             _body(), "moonshotai/kimi-k3", "doubleword", state
         )
         assert prepared["service_tier"] == "flex"
+        assert headers == {}
+
+    def test_model_overrides_provider_mechanism(self):
+        """Model entry overrides provider's delivery mechanism."""
+        state = _state(
+            provider_async=AsyncModeConfig(
+                delivery="body",
+                field="service_tier",
+                value="flex",
+            ),
+        )
+        entry_async = AsyncModeConfig(
+            enabled=True,
+            delivery="header",
+            field="X-Async",
+            value="batch",
+        )
+        prepared, headers = proxy_mod._prepare_body_for_candidate(
+            _body(),
+            "moonshotai/kimi-k3",
+            "doubleword",
+            state,
+            entry_async_mode=entry_async,
+        )
+        assert headers == {"X-Async": "batch"}
+        assert "service_tier" not in prepared
+
+    def test_provider_mechanism_alone_no_ops(self):
+        """Provider declares mechanism but no model/rule opts in -> sync (default)."""
+        state = _state(
+            provider_async=AsyncModeConfig(
+                delivery="body",
+                field="service_tier",
+                value="flex",
+            ),
+        )
+        prepared, headers = proxy_mod._prepare_body_for_candidate(
+            _body(), "moonshotai/kimi-k3", "doubleword", state
+        )
+        assert "service_tier" not in prepared
+        assert headers == {}
+        assert prepared["model"] == "moonshotai/kimi-k3"
+
+    def test_provider_enabled_is_ignored(self):
+        """Provider-level enabled: true is vestigial — no opt-in without model/rule."""
+        state = _state(
+            provider_async=AsyncModeConfig(
+                enabled=True,
+                delivery="body",
+                field="service_tier",
+                value="flex",
+            ),
+        )
+        prepared, headers = proxy_mod._prepare_body_for_candidate(
+            _body(), "moonshotai/kimi-k3", "doubleword", state
+        )
+        assert "service_tier" not in prepared
+        assert headers == {}
+
+    def test_rule_level_disabled_blocks_provider_only_mechanism(self):
+        """Rule enabled: false explicitly opts out (provider mechanism not applied)."""
+        state = _state(
+            [
+                ModelRuleEntry(
+                    prefix="moonshotai/kimi-k3",
+                    provider="doubleword",
+                    async_mode=AsyncModeConfig(enabled=False),
+                ),
+            ],
+            provider_async=AsyncModeConfig(
+                delivery="body",
+                field="service_tier",
+                value="flex",
+            ),
+        )
+        prepared, headers = proxy_mod._prepare_body_for_candidate(
+            _body(), "moonshotai/kimi-k3", "doubleword", state
+        )
+        assert "service_tier" not in prepared
         assert headers == {}
 
     def test_no_op_when_unconfigured(self):
@@ -230,50 +278,40 @@ class TestAsyncModeResolution:
         assert prepared["service_tier"] == "flex"
 
 
-class TestAsyncModeExplicitDisable:
-    """enabled: false at a higher level wins over enabled: true below."""
+class TestAsyncModeEnabledWithoutMechanism:
+    """enabled: true but no mechanism anywhere -> warning + no-op."""
 
-    def test_model_level_disabled_blocks_provider_enabled(self):
-        state = _state(
-            provider_async=AsyncModeConfig(
-                enabled=True,
-                delivery="body",
-                field="service_tier",
-                value="flex",
-            ),
-        )
-        entry_async = AsyncModeConfig(
-            enabled=False,
-            delivery="body",
-            field="service_tier",
-            value="flex",
-        )
-        prepared, headers = proxy_mod._prepare_body_for_candidate(
-            _body(),
-            "moonshotai/kimi-k3",
-            "doubleword",
-            state,
-            entry_async_mode=entry_async,
-        )
-        assert "service_tier" not in prepared
-        assert headers == {}
+    def test_enabled_without_mechanism_warns_and_no_ops(self, caplog):
+        import logging
 
-    def test_rule_level_disabled_blocks_provider_enabled(self):
         state = _state(
             [
                 ModelRuleEntry(
                     prefix="moonshotai/kimi-k3",
                     provider="doubleword",
-                    async_mode=AsyncModeConfig(
-                        enabled=False,
-                        delivery="body",
-                        field="service_tier",
-                        value="flex",
-                    ),
+                    async_mode=AsyncModeConfig(enabled=True),
+                ),
+            ]
+        )
+        with caplog.at_level(logging.WARNING):
+            prepared, headers = proxy_mod._prepare_body_for_candidate(
+                _body(), "moonshotai/kimi-k3", "doubleword", state
+            )
+        assert "service_tier" not in prepared
+        assert headers == {}
+        assert "mechanism incomplete" in caplog.text
+
+    def test_enabled_with_mechanism_at_provider_applies(self):
+        """enabled: true at rule + mechanism at provider -> applies."""
+        state = _state(
+            [
+                ModelRuleEntry(
+                    prefix="moonshotai/kimi-k3",
+                    provider="doubleword",
+                    async_mode=AsyncModeConfig(enabled=True),
                 ),
             ],
             provider_async=AsyncModeConfig(
-                enabled=True,
                 delivery="body",
                 field="service_tier",
                 value="flex",
@@ -282,7 +320,7 @@ class TestAsyncModeExplicitDisable:
         prepared, headers = proxy_mod._prepare_body_for_candidate(
             _body(), "moonshotai/kimi-k3", "doubleword", state
         )
-        assert "service_tier" not in prepared
+        assert prepared["service_tier"] == "flex"
         assert headers == {}
 
 
@@ -428,3 +466,53 @@ class TestAsyncModePropagation:
         assert fb.async_mode.enabled is True
         assert fb.async_mode.delivery == "model_suffix"
         assert fb.async_mode.suffix == "flex"
+
+
+class TestAsyncModeValidator:
+    """AsyncModeConfig validator: pure-flag acceptance + partial-mechanism rejection."""
+
+    def test_pure_enabled_flag_is_valid(self):
+        cfg = AsyncModeConfig(enabled=True)
+        assert cfg.enabled is True
+        assert cfg.delivery == "body"
+        assert cfg.field == ""
+        assert cfg.value == ""
+
+    def test_disabled_with_no_fields_is_valid(self):
+        cfg = AsyncModeConfig()
+        assert cfg.enabled is False
+
+    def test_complete_body_mechanism_is_valid(self):
+        cfg = AsyncModeConfig(
+            enabled=True, delivery="body", field="service_tier", value="flex"
+        )
+        assert cfg.enabled is True
+
+    def test_partial_body_mechanism_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="value is required"):
+            AsyncModeConfig(delivery="body", field="service_tier")  # missing value
+
+    def test_partial_header_mechanism_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="value is required"):
+            AsyncModeConfig(delivery="header", field="X-Async")  # missing value
+
+    def test_partial_model_suffix_mechanism_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="suffix is required"):
+            AsyncModeConfig(delivery="model_suffix")  # missing suffix
+
+    def test_provider_mechanism_only_is_valid(self):
+        """Provider declares mechanism without enabled — valid (enabled is vestigial)."""
+        cfg = AsyncModeConfig(delivery="body", field="service_tier", value="flex")
+        assert cfg.enabled is False  # default
+        assert cfg.delivery == "body"
+
+    def test_complete_model_suffix_mechanism_is_valid(self):
+        cfg = AsyncModeConfig(delivery="model_suffix", suffix="flex")
+        assert cfg.delivery == "model_suffix"
+        assert cfg.suffix == "flex"

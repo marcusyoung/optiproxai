@@ -1113,21 +1113,30 @@ def _resolve_async_mode(
     *,
     entry_async_mode: AsyncModeConfig | None = None,
 ) -> AsyncModeConfig | None:
-    """Resolve async_mode using ModelEntry -> ModelRuleEntry -> ProviderConfig -> None.
+    """Resolve async_mode by field-by-field merge across all levels.
 
-    The entry-level value (supplied by the caller from RoutingDecision/FallbackEntry)
-    wins by presence, not enabled truthiness — this makes an explicit model-level
-    ``enabled: false`` beat a provider-level ``enabled: true`` (AC #10). A resolved
-    config with ``enabled: false`` blocks fall-through to lower-precedence levels.
+    Opt-in model (TASK-10): provider declares the **mechanism**
+    (delivery/field/value/suffix); model/rule declares **intent**
+    (``enabled: true`` opts in, default ``false``).  Provider-level
+    ``enabled`` is ignored (vestigial).
 
-    Rule-level resolution uses the same prefix/provider scoring as
-    ``_get_model_extra_body``.
+    Merge precedence: ModelEntry -> best ModelRuleEntry -> ProviderConfig.
+    Mechanism fields: the highest-precedence level that **explicitly** sets
+    the field wins (using ``model_fields_set`` to distinguish explicit from
+    default).  ``enabled``: resolved from entry -> rule only (provider
+    ignored).
+
+    Returns the merged ``AsyncModeConfig`` when any level declared anything
+    (enabled or mechanism); returns ``None`` when nothing is set anywhere.
+    The caller gates application on ``enabled: true`` AND a complete
+    mechanism; incomplete mechanism at runtime -> warning + no-op.
     """
-    # 1. ModelEntry level (propagated via RoutingDecision/FallbackEntry)
+    # Collect candidate configs by precedence (highest first).
+    levels: list[AsyncModeConfig] = []
     if entry_async_mode is not None:
-        return entry_async_mode
+        levels.append(entry_async_mode)
 
-    # 2. ModelRuleEntry level (prefix/provider scoring)
+    # ModelRuleEntry level (prefix/provider scoring)
     best_rule: AsyncModeConfig | None = None
     best_score: tuple[int, int] = (-1, -1)
     for entry in runtime.config.model_rules:
@@ -1146,15 +1155,62 @@ def _resolve_async_mode(
             best_score = score
             best_rule = entry.async_mode
     if best_rule is not None:
-        return best_rule
+        levels.append(best_rule)
 
-    # 3. ProviderConfig level
+    # ProviderConfig level
     provider_cfg = runtime.config.providers.get(provider_name)
     if provider_cfg is not None and provider_cfg.async_mode is not None:
-        return provider_cfg.async_mode
+        levels.append(provider_cfg.async_mode)
 
-    # 4. No async_mode configured — graceful no-op
-    return None
+    # No async_mode configured at any level.
+    if not levels:
+        return None
+
+    # Identify provider level (last in list) — its enabled is ignored.
+    provider_level = (
+        provider_cfg.async_mode
+        if (provider_cfg is not None and provider_cfg.async_mode is not None)
+        else None
+    )
+
+    # Field-by-field merge: highest-precedence explicit set wins.
+    # levels are highest-first; provider is last.
+    merged_delivery: str = "body"
+    merged_field: str = ""
+    merged_value: str = ""
+    merged_suffix: str = ""
+    merged_enabled = False
+    delivery_done = field_done = value_done = suffix_done = False
+    enabled_done = False
+
+    for cfg in levels:
+        explicit = cfg.model_fields_set
+        is_provider = cfg is provider_level
+
+        if "delivery" in explicit and not delivery_done:
+            merged_delivery = cfg.delivery
+            delivery_done = True
+        if "field" in explicit and not field_done:
+            merged_field = cfg.field
+            field_done = True
+        if "value" in explicit and not value_done:
+            merged_value = cfg.value
+            value_done = True
+        if "suffix" in explicit and not suffix_done:
+            merged_suffix = cfg.suffix
+            suffix_done = True
+        # enabled: entry -> rule only; provider-level enabled is vestigial.
+        if "enabled" in explicit and not enabled_done and not is_provider:
+            merged_enabled = cfg.enabled
+            enabled_done = True
+
+    return AsyncModeConfig.model_construct(
+        enabled=merged_enabled,
+        delivery=merged_delivery,
+        field=merged_field,
+        value=merged_value,
+        suffix=merged_suffix,
+    )
 
 
 def _apply_async_mode(
@@ -1427,13 +1483,33 @@ def _prepare_body_for_candidate(
         model, provider_name, runtime, entry_async_mode=entry_async_mode
     )
     if async_mode is not None and async_mode.enabled:
-        prepared, extra_headers = _apply_async_mode(prepared, extra_headers, async_mode)
-        logger.info(
-            "ASYNC_MODE model=%s provider=%s delivery=%s",
-            prepared.get("model", model),
-            provider_name,
-            async_mode.delivery,
-        )
+        # Runtime completeness check: enabled but no mechanism anywhere.
+        if async_mode.delivery in ("body", "header") and (
+            not async_mode.field or not async_mode.value
+        ):
+            logger.warning(
+                "ASYNC_MODE enabled but mechanism incomplete for delivery=%s "
+                "model=%s provider=%s — no-op",
+                async_mode.delivery,
+                model,
+                provider_name,
+            )
+        elif async_mode.delivery == "model_suffix" and not async_mode.suffix:
+            logger.warning(
+                "ASYNC_MODE enabled but suffix missing model=%s provider=%s — no-op",
+                model,
+                provider_name,
+            )
+        else:
+            prepared, extra_headers = _apply_async_mode(
+                prepared, extra_headers, async_mode
+            )
+            logger.info(
+                "ASYNC_MODE model=%s provider=%s delivery=%s",
+                prepared.get("model", model),
+                provider_name,
+                async_mode.delivery,
+            )
     return prepared, extra_headers
 
 

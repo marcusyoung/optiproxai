@@ -324,36 +324,50 @@ model_rules:
 | `header` | Injects HTTP header `{field: value}` on the upstream request | Provider needing a custom header |
 | `model_suffix` | Appends `:{suffix}` to the model name sent upstream | Provider using `model:flex` naming |
 
-`async_mode` can be set at three levels, resolved in this order:
+### Opt-in model
+
+The **provider** declares the mechanism (delivery/field/value/suffix) — "this provider supports async via body+service_tier:flex". The **model/rule** declares intent (`enabled: true` opts in). Default is `enabled: false` (sync) — no need to opt out of something you never opted into.
+
+Provider-level `enabled` is ignored (vestigial) — the provider declares capability, not intent.
+
+### Resolution
+
+`async_mode` is resolved at three levels, merged field-by-field:
 
 1. **ModelEntry** — per-model override in tier `primary`/`fallback` lists (propagated through the routing decision)
 2. **ModelRuleEntry** — prefix-matched rule in `model_rules` (same scoring as `extra_body`)
-3. **ProviderConfig** — provider-level default
+3. **ProviderConfig** — provider-level mechanism declaration
 
-A higher-precedence level wins by presence, not `enabled` truthiness. Setting `enabled: false` at the model level explicitly opts out even when the provider has `enabled: true`. When no `async_mode` is configured at any level, the request routes sync with no error.
+Mechanism fields (`delivery`/`field`/`value`/`suffix`): the highest-precedence level that explicitly sets the field wins. A model/rule CAN override the provider's mechanism (e.g. a model needing `header` instead of `body`).
+
+`enabled`: resolved from model/rule level only (provider ignored). `enabled: false` explicitly opts out. When no `async_mode` is configured at any level, the request routes sync with no error.
+
+If `enabled: true` but no mechanism resolves at any level, a warning is logged and the request routes sync (no-op).
+
+### Config validation
+
+`{enabled: true}` alone is valid — the mechanism may be inherited from a lower-precedence level. Partial mechanisms (some mechanism fields set but incomplete for the effective delivery) are rejected at config load to catch typos.
 
 ```yaml
 providers:
-  openai:
-    name: openai
-    base_url: "https://api.openai.com/v1"
-    api_key: "${OPENAI_API_KEY}"
+  doubleword:
+    name: doubleword
+    base_url: "https://api.doubleword.ai/v1"
+    api_key: "${DOUBLEWORD_API_KEY}"
     async_mode:
-      enabled: true
+      # Provider declares the mechanism only.
       delivery: body
       field: service_tier
       value: flex
 
-profiles:
-  auto:
-    tiers:
-      MEDIUM:
-        primary:
-          - model: "gpt-4o"
-            # inherits async_mode from provider
-          - model: "gpt-4o-mini"
-            async_mode:
-              enabled: false  # explicitly disable async for this model
+model_rules:
+  - prefix: "moonshotai/kimi-k3"
+    provider: "doubleword"
+    async_mode:
+      enabled: true    # opts in; inherits mechanism from provider
+  - prefix: "tencent/Hy3-FP8"
+    provider: "doubleword"
+    # no async_mode -> sync (default false, no opt-out needed)
 ```
 
 `extra_body` remains as a general-purpose escape hatch for non-async body fields.
