@@ -116,6 +116,27 @@ class RuntimeEmbeddingSettings:
     timeout_seconds: float
 
 
+# Memoized runtime embedding settings keyed by config fingerprint
+# (config path + mtime). Re-parses config.yaml only when the config file
+# changes; the Scorer constructor also clears the cache on config reload.
+_embedding_settings_cache: (
+    tuple[tuple[str, int] | None, RuntimeEmbeddingSettings] | None
+) = None
+
+
+def _config_fingerprint() -> tuple[str, int] | None:
+    """Return (config path, mtime_ns) for the active config file, or None."""
+    try:
+        from optiproxai.config import _find_config_file
+
+        path = _find_config_file()
+        if path is None:
+            return None
+        return str(path), path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
 _DEFAULT_WEIGHTS: dict[str, float] = {
     "tokenCount": 0.15,
     "codePresence": 1.0,
@@ -325,7 +346,8 @@ def _tier_from_axes(
     return max(base_tier, axis_tier, key=lambda tier: list(Tier).index(tier))
 
 
-def _default_model_dir() -> Path:
+def default_model_dir() -> Path:
+    """Return the default directory containing classifier model assets."""
     return Path(__file__).resolve().parents[2] / "models"
 
 
@@ -333,7 +355,7 @@ def _feature_classifier_path(feature_model_dir: Any | None = None) -> Path:
     model_dir = (
         Path(feature_model_dir).expanduser()
         if feature_model_dir
-        else _default_model_dir()
+        else default_model_dir()
     )
     return model_dir / FEATURE_CLASSIFIER_FILENAME
 
@@ -345,7 +367,19 @@ def _as_float_mapping(value: object, *, name: str) -> dict[str, float]:
 
 
 def _resolve_runtime_embedding_settings() -> RuntimeEmbeddingSettings:
-    """Resolve runtime embedding settings from config or environment variables."""
+    """Resolve runtime embedding settings from config or environment variables.
+
+    Results are memoized per config fingerprint (path + mtime); config.yaml is
+    re-parsed only when the config file changes or a new Scorer is constructed
+    (which happens on config reload via a new Router).
+    """
+    global _embedding_settings_cache
+    fingerprint = _config_fingerprint()
+    if _embedding_settings_cache is not None:
+        cached_fingerprint, cached_settings = _embedding_settings_cache
+        if cached_fingerprint == fingerprint:
+            return cached_settings
+
     try:
         from optiproxai.config import load_config
 
@@ -353,31 +387,37 @@ def _resolve_runtime_embedding_settings() -> RuntimeEmbeddingSettings:
         cfg = loaded.embedding
         if cfg is not None:
             if cfg.effective_mode == "disabled":
-                return RuntimeEmbeddingSettings(
+                settings = RuntimeEmbeddingSettings(
                     mode="disabled",
                     model=cfg.effective_model,
                     base_url=None,
                     api_key="",
                     timeout_seconds=cfg.timeout_seconds,
                 )
+                _embedding_settings_cache = (fingerprint, settings)
+                return settings
             if cfg.effective_mode == "local":
-                return RuntimeEmbeddingSettings(
+                settings = RuntimeEmbeddingSettings(
                     mode="local",
                     model=cfg.local_model,
                     base_url=None,
                     api_key="",
                     timeout_seconds=cfg.timeout_seconds,
                 )
+                _embedding_settings_cache = (fingerprint, settings)
+                return settings
             resolved = loaded.embedding_resolved()
             if resolved is not None:
                 base_url, api_key = resolved
-                return RuntimeEmbeddingSettings(
+                settings = RuntimeEmbeddingSettings(
                     mode="api",
                     model=cfg.model,
                     base_url=base_url,
                     api_key=api_key,
                     timeout_seconds=cfg.timeout_seconds,
                 )
+                _embedding_settings_cache = (fingerprint, settings)
+                return settings
     except Exception as exc:
         log.debug("Runtime embedding config resolution failed: %s", exc, exc_info=True)
 
@@ -390,13 +430,15 @@ def _resolve_runtime_embedding_settings() -> RuntimeEmbeddingSettings:
     embedding_model = (
         "openai/text-embedding-3-small" if base_url else "text-embedding-3-small"
     )
-    return RuntimeEmbeddingSettings(
+    settings = RuntimeEmbeddingSettings(
         mode="api",
         model=embedding_model,
         base_url=base_url,
         api_key=api_key,
         timeout_seconds=FEATURE_EMBEDDING_TIMEOUT_SECONDS,
     )
+    _embedding_settings_cache = (fingerprint, settings)
+    return settings
 
 
 def _resolve_runtime_embedding_client() -> tuple[OpenAI, str, float]:
@@ -405,7 +447,11 @@ def _resolve_runtime_embedding_client() -> tuple[OpenAI, str, float]:
     if settings.mode != "api":
         raise RuntimeError(f"embedding mode {settings.mode!r} does not use API client")
     return (
-        OpenAI(api_key=settings.api_key or "dummy", base_url=settings.base_url),
+        OpenAI(
+            api_key=settings.api_key or "dummy",
+            base_url=settings.base_url,
+            timeout=settings.timeout_seconds,
+        ),
         settings.model,
         settings.timeout_seconds,
     )
@@ -439,6 +485,11 @@ class LocalEmbeddingBackend:
         encoded = model.encode([text], normalize_embeddings=False)
         embedding = np.asarray(encoded[0], dtype=np.float32)
         return cast(np.ndarray[Any, np.dtype[np.float32]], embedding)
+
+
+# Reused local embedding backend so the sentence-transformers model loads at most
+# once per process. Cleared when a new Scorer is constructed (config reload).
+_local_embedding_backend: LocalEmbeddingBackend | None = None
 
 
 class DistilledFeatureClassifier:
@@ -630,7 +681,8 @@ class DistilledFeatureClassifier:
             timeout_seconds,
         )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
             if settings.mode == "api":
                 resolved = cast(Any, _resolve_runtime_embedding_client())
                 if len(resolved) == 2:
@@ -645,15 +697,26 @@ class DistilledFeatureClassifier:
                     model=model,
                 )
             elif settings.mode == "local":
-                backend = LocalEmbeddingBackend(settings.model)
-                future = executor.submit(backend.embed, truncated_text)
+                global _local_embedding_backend
+                if (
+                    _local_embedding_backend is None
+                    or _local_embedding_backend.model_name != settings.model
+                ):
+                    _local_embedding_backend = LocalEmbeddingBackend(settings.model)
+                future = executor.submit(_local_embedding_backend.embed, truncated_text)
             else:
                 raise RuntimeError(f"unsupported embedding mode: {settings.mode}")
             try:
                 response = future.result(timeout=timeout_seconds)
             except concurrent.futures.TimeoutError as exc:
                 future.cancel()
+                # Do not wait for the stalled worker: shutdown(wait=False) lets the
+                # thread finish in the background instead of blocking the request
+                # for the full upstream timeout.
                 raise TimeoutError("runtime embedding request timed out") from exc
+        finally:
+            # shutdown is idempotent; wait=False never blocks on a stalled worker.
+            executor.shutdown(wait=False, cancel_futures=True)
 
         if settings.mode == "local":
             embedding = np.asarray(response, dtype=np.float32)
@@ -753,6 +816,13 @@ class Scorer:
         feature_model_dir: Any | None = None,
         enable_routing_log: bool = True,
     ) -> None:
+        global _embedding_settings_cache, _local_embedding_backend
+        # A new Scorer means a new config state (the proxy constructs a new
+        # Router per config reload, which constructs a new Scorer). Clear the
+        # memoized embedding settings and local backend so the next request
+        # re-resolves against the current config.
+        _embedding_settings_cache = None
+        _local_embedding_backend = None
         self.config = config or ScoringConfig()
         self.feature_model_dir = (
             Path(feature_model_dir).expanduser() if feature_model_dir else None

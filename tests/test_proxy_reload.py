@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import secrets
 from pathlib import Path
 import re
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.responses import JSONResponse
@@ -1486,3 +1487,67 @@ class TestInFlightSnapshotBehavior:
 
         finally:
             proxy_mod._activate_state(old_state)
+
+
+class TestPassThroughMissingProvider:
+    def test_passthrough_returns_structured_error_when_provider_missing(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """Missing default_provider returns OpenAI-style JSON error, not raw 500 (AC #6)."""
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            """
+default_provider: missing-provider
+providers:
+  dummy:
+    name: dummy
+    base_url: "http://localhost:9999"
+    api_key: "fake"
+profiles:
+  auto:
+    tiers:
+      SIMPLE: {primary: "auto-simple", fallback: [], provider: default}
+      MEDIUM: {primary: "auto-medium", fallback: [], provider: default}
+      COMPLEX: {primary: "auto-complex", fallback: [], provider: default}
+      REASONING: {primary: "auto-reason", fallback: [], provider: default}
+"""
+        )
+        configure(str(config_path))
+
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "direct-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+            )
+
+        assert resp.status_code == 500
+        payload = resp.json()
+        assert payload["error"]["message"] == (
+            "Default provider 'missing-provider' is not configured"
+        )
+        assert payload["error"]["type"] == "server_error"
+
+
+class TestAdminTokenCompareDigest:
+    def test_admin_token_uses_compare_digest(self, configured_proxy, admin_token):
+        """Admin token comparison must use secrets.compare_digest (AC #7)."""
+        with (
+            patch(
+                "optiproxai.proxy.secrets.compare_digest", wraps=secrets.compare_digest
+            ) as mock_compare,
+            TestClient(app, raise_server_exceptions=False) as client,
+        ):
+            resp = client.post(
+                "/admin/reload-config",
+                headers=_admin_headers(admin_token),
+            )
+
+        assert mock_compare.call_count >= 1
+        assert resp.status_code in (
+            200,
+            400,
+            500,
+        )  # auth passed; reload may fail for other reasons

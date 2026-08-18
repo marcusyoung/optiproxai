@@ -839,3 +839,18 @@ class TestInitCommand:
         data = json.loads(result.output)
         assert "model" in data
         assert "tier" in data
+
+
+class TestDoctorSharedModelDir:
+    def test_doctor_uses_same_model_dir_as_scorer(self, runner, empty_dir) -> None:
+        """Doctor and scorer resolve the models directory via one resolver (AC #9)."""
+        from optiproxai.scorer import default_model_dir
+
+        config_path = empty_dir / "config.yaml"
+        _write_doctor_config(config_path)
+
+        result = runner.invoke(main, ["doctor", "--config", str(config_path)])
+
+        assert result.exit_code == 0
+        # The doctor's default models dir must match the scorer's resolver.
+        assert str(default_model_dir()) in result.output

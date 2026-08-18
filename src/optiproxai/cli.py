@@ -121,7 +121,7 @@ def _load_raw_config_keys(config_path: str | None) -> set[str]:
         return set()
 
     try:
-        with raw_path.open() as f:
+        with raw_path.open(encoding="utf-8") as f:
             loaded = yaml.safe_load(f)
     except (OSError, yaml.YAMLError) as e:
         raise ValueError(f"failed to read raw config keys: {e}") from e
@@ -185,10 +185,11 @@ def build_doctor_results(
 ) -> list[DoctorResult]:
     """Build read-only diagnostics for config and bundled classifier assets."""
     from optiproxai.config import load_config
+    from optiproxai.scorer import default_model_dir
 
     raw_config_keys = _load_raw_config_keys(config_path)
     cfg = load_config(config_path, strict=True)
-    resolved_models_dir = models_dir or Path.cwd() / "models"
+    resolved_models_dir = models_dir or default_model_dir()
 
     results = [
         DoctorResult("ok", "config", "strict config loaded successfully"),
