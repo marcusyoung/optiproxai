@@ -75,6 +75,49 @@ class ContentPartPolicy(BaseModel):
     unknown: Literal["preserve", "text", "drop"] = "preserve"
 
 
+class AsyncModeConfig(BaseModel):
+    """Explicit async/batch request declaration with three delivery modes.
+
+    - ``body``: inject ``{field: value}`` into the request body JSON
+      (e.g. OpenAI ``service_tier: flex``).
+    - ``header``: inject HTTP header ``{field: value}`` on the upstream request.
+    - ``model_suffix``: append ``:{suffix}`` to the model name sent upstream.
+
+    When ``enabled`` is false the config acts as an explicit opt-out: it wins
+    over lower-precedence levels that have async enabled.
+    """
+
+    enabled: bool = False
+    delivery: Literal["body", "header", "model_suffix"] = "body"
+    field: str = ""  # body/header: the field or header name
+    value: str = ""  # body/header: the value to send
+    suffix: str = ""  # model_suffix: the suffix appended after ':'
+
+    @model_validator(mode="after")
+    def _validate_enabled_fields(self) -> "AsyncModeConfig":
+        """Reject enabled configs with empty field/value/suffix for their delivery mode."""
+        if not self.enabled:
+            return self
+        if self.delivery in ("body", "header"):
+            if not self.field:
+                raise ValueError(
+                    f"async_mode.field is required when delivery={self.delivery!r} "
+                    f"and enabled is true"
+                )
+            if not self.value:
+                raise ValueError(
+                    f"async_mode.value is required when delivery={self.delivery!r} "
+                    f"and enabled is true"
+                )
+        elif self.delivery == "model_suffix":
+            if not self.suffix:
+                raise ValueError(
+                    "async_mode.suffix is required when delivery='model_suffix' "
+                    "and enabled is true"
+                )
+        return self
+
+
 class ProviderConfig(BaseModel):
     """A backend LLM provider (OpenRouter, Anthropic, local proxy, etc.)."""
 
@@ -86,6 +129,13 @@ class ProviderConfig(BaseModel):
         "openai", "xai", "anthropic", "dashscope", "gemini", "none"
     ] = "none"
     supports_reasoning_content: bool = False
+    async_mode: AsyncModeConfig | None = Field(
+        default=None,
+        description=(
+            "Provider-level async/batch routing default. ModelEntry and "
+            "ModelRuleEntry async_mode values override this."
+        ),
+    )
 
 
 class ModelEntry(BaseModel):
@@ -100,6 +150,13 @@ class ModelEntry(BaseModel):
         gt=0,
         description="Optional maximum input prompt tokens for routing eligibility.",
     )
+    async_mode: AsyncModeConfig | None = Field(
+        default=None,
+        description=(
+            "Per-model async/batch routing override. Presence wins over "
+            "rule/provider levels; enabled: false explicitly opts out."
+        ),
+    )
 
 
 class ResolvedModelCandidate(BaseModel):
@@ -108,6 +165,7 @@ class ResolvedModelCandidate(BaseModel):
     model: str
     provider: str = ""
     max_input_tokens: int | None = None
+    async_mode: AsyncModeConfig | None = None
 
     def as_tuple(self) -> tuple[str, str]:
         """Return the backward-compatible (model, provider) tuple."""
@@ -166,6 +224,7 @@ class TierModelConfig(BaseModel):
                 model=entry.model,
                 provider=entry.provider,
                 max_input_tokens=entry.max_input_tokens,
+                async_mode=entry.async_mode,
             )
         return ResolvedModelCandidate(model=entry)
 
@@ -310,6 +369,14 @@ class ModelRuleEntry(BaseModel):
     ) = None
     supports_reasoning_content: bool | None = None
     content_part_policy: ContentPartPolicy | None = None
+    async_mode: AsyncModeConfig | None = Field(
+        default=None,
+        description=(
+            "Rule-level async/batch routing declaration for matching "
+            "model/provider prefixes. Provider-specific rules outrank "
+            "provider-agnostic rules before prefix specificity is compared."
+        ),
+    )
     extra_body: dict[str, Any] | None = Field(
         default=None,
         description=(

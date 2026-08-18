@@ -314,6 +314,50 @@ model_rules:
 
 `model_rules` is the primary metadata key. The legacy `model_capabilities` key is accepted only when `model_rules` is unset. The optional `extra_body` field injects extra request-body fields for any candidate matching the rule (e.g. `service_tier: flex` for Doubleword async); it uses the same prefix/provider precedence as `reasoning_style` and is merged last, so its values win over client-provided fields.
 
+## Async / batch routing
+
+`async_mode` is a first-class config model for declaring async/batch routing explicitly, instead of hiding it inside `extra_body`. It supports three delivery modes:
+
+| `delivery` | How it works | Example |
+|---|---|---|
+| `body` | Injects `{field: value}` into the request body JSON | OpenAI `service_tier: flex` |
+| `header` | Injects HTTP header `{field: value}` on the upstream request | Provider needing a custom header |
+| `model_suffix` | Appends `:{suffix}` to the model name sent upstream | Provider using `model:flex` naming |
+
+`async_mode` can be set at three levels, resolved in this order:
+
+1. **ModelEntry** — per-model override in tier `primary`/`fallback` lists (propagated through the routing decision)
+2. **ModelRuleEntry** — prefix-matched rule in `model_rules` (same scoring as `extra_body`)
+3. **ProviderConfig** — provider-level default
+
+A higher-precedence level wins by presence, not `enabled` truthiness. Setting `enabled: false` at the model level explicitly opts out even when the provider has `enabled: true`. When no `async_mode` is configured at any level, the request routes sync with no error.
+
+```yaml
+providers:
+  openai:
+    name: openai
+    base_url: "https://api.openai.com/v1"
+    api_key: "${OPENAI_API_KEY}"
+    async_mode:
+      enabled: true
+      delivery: body
+      field: service_tier
+      value: flex
+
+profiles:
+  auto:
+    tiers:
+      MEDIUM:
+        primary:
+          - model: "gpt-4o"
+            # inherits async_mode from provider
+          - model: "gpt-4o-mini"
+            async_mode:
+              enabled: false  # explicitly disable async for this model
+```
+
+`extra_body` remains as a general-purpose escape hatch for non-async body fields.
+
 ## API endpoints
 
 | Endpoint | Method | Description |

@@ -190,8 +190,9 @@ class TestProxyFallbackBehavior:
             *,
             actual_provider=None,
             request_id=None,
+            extra_headers=None,
         ):
-            _ = profile, request_id
+            _ = profile, request_id, extra_headers
             calls.append((body["model"], actual_provider or "", base_url))
             if len(calls) < 3:
                 return JSONResponse(status_code=502, content={"error": "retry"})
@@ -251,8 +252,9 @@ class TestProxyFallbackBehavior:
             *,
             actual_provider=None,
             request_id=None,
+            extra_headers=None,
         ):
-            _ = api_key, profile, request_id
+            _ = api_key, profile, request_id, extra_headers
             calls.append((body["model"], actual_provider or "", base_url))
             if len(calls) == 1:
                 return JSONResponse(status_code=429, content={"error": "rate_limited"})
@@ -316,8 +318,9 @@ class TestProxyFallbackBehavior:
             *,
             actual_provider=None,
             request_id=None,
+            extra_headers=None,
         ):
-            _ = api_key, profile, request_id
+            _ = api_key, profile, request_id, extra_headers
             calls.append((body["model"], actual_provider or "", base_url))
             return JSONResponse(status_code=502, content={"error": "retry"})
 
@@ -375,6 +378,7 @@ class TestProxyFallbackBehavior:
             *,
             actual_provider=None,
             request_id=None,
+            extra_headers=None,
         ):
             nonlocal call_count
             _ = (
@@ -383,6 +387,7 @@ class TestProxyFallbackBehavior:
                 profile,
                 actual_provider,
                 request_id,
+                extra_headers,
             )
             call_count += 1
             if call_count == 1:

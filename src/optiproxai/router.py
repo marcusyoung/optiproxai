@@ -15,6 +15,7 @@ from optiproxai.classification_context import (
     build_classification_input,
 )
 from optiproxai.config import (
+    AsyncModeConfig,
     OptiproxaiConfig,
     ProviderConfig,
     ResolvedModelCandidate,
@@ -69,6 +70,7 @@ class FallbackEntry(BaseModel):
     base_url: str
     api_key: str = ""
     max_input_tokens: int | None = None
+    async_mode: AsyncModeConfig | None = None
 
 
 class RoutingDecision(BaseModel):
@@ -87,6 +89,7 @@ class RoutingDecision(BaseModel):
     fallbacks: list[FallbackEntry] = Field(default_factory=list)
     required_capabilities: list[str] = Field(default_factory=list)
     reasoning_effort: str | None = None  # tier-level reasoning effort override
+    async_mode: AsyncModeConfig | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +475,7 @@ class Router:
                     base_url=fb_provider_cfg.base_url,
                     api_key=resolve_env(fb_provider_cfg.api_key),
                     max_input_tokens=fallback_candidate.max_input_tokens,
+                    async_mode=fallback_candidate.async_mode,
                 )
             )
 
@@ -507,6 +511,7 @@ class Router:
             fallbacks=fallback_entries,
             required_capabilities=sorted(list(required_capabilities)),
             reasoning_effort=tier_cfg.reasoning_effort,
+            async_mode=primary_candidate.async_mode,
         )
 
     def resolve_model(
@@ -575,6 +580,7 @@ class Router:
                     base_url=fb_provider_cfg.base_url,
                     api_key=resolve_env(fb_provider_cfg.api_key),
                     max_input_tokens=fallback_candidate.max_input_tokens,
+                    async_mode=fallback_candidate.async_mode,
                 )
             )
 
@@ -591,6 +597,7 @@ class Router:
             profile=resolved_profile,
             fallbacks=fallback_entries,
             reasoning_effort=tier_cfg.reasoning_effort,
+            async_mode=primary_candidate.async_mode,
         )
 
     # ------------------------------------------------------------------

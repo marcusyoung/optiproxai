@@ -23,7 +23,12 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from optiproxai.api_keys import has_keys, validate_key
-from optiproxai.config import ContentPartPolicy, OptiproxaiConfig, load_config
+from optiproxai.config import (
+    AsyncModeConfig,
+    ContentPartPolicy,
+    OptiproxaiConfig,
+    load_config,
+)
 from optiproxai.dashboard import (
     dashboard_needs_stderr_backfill,
     get_dashboard_stats,
@@ -599,6 +604,7 @@ async def _proxy_upstream(
     *,
     actual_provider: str | None = None,
     request_id: str | None = None,
+    extra_headers: dict[str, str] | None = None,
 ) -> StreamingResponse | JSONResponse:
     """Forward a chat-completion request to the upstream provider."""
     assert _http is not None
@@ -610,6 +616,16 @@ async def _proxy_upstream(
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    if extra_headers:
+        reserved = {"content-type", "authorization"}
+        for key, value in extra_headers.items():
+            if key.lower() in reserved:
+                logger.warning(
+                    "Skipping reserved header override from async_mode header=%s",
+                    key,
+                )
+                continue
+            headers[key] = value
 
     is_streaming = body.get("stream", False)
     model_name = body.get("model", "unknown")
@@ -897,8 +913,12 @@ async def _try_with_fallbacks(
     runtime = state or _require_runtime_state()
 
     # Try primary
-    primary_body = _prepare_body_for_candidate(
-        body, decision.model, decision.provider, runtime
+    primary_body, primary_headers = _prepare_body_for_candidate(
+        body,
+        decision.model,
+        decision.provider,
+        runtime,
+        entry_async_mode=decision.async_mode,
     )
     result = await _proxy_upstream(
         decision.base_url.rstrip("/"),
@@ -908,6 +928,7 @@ async def _try_with_fallbacks(
         profile=profile,
         actual_provider=decision.provider,
         request_id=request_id,
+        extra_headers=primary_headers,
     )
 
     if not _is_retryable_error(result):
@@ -970,7 +991,13 @@ async def _try_with_fallbacks(
                 fb_normalized_effort,
                 fb.provider,
             )
-        fb_body = _prepare_body_for_candidate(fb_body, fb.model, fb.provider, runtime)
+        fb_body, fb_headers = _prepare_body_for_candidate(
+            fb_body,
+            fb.model,
+            fb.provider,
+            runtime,
+            entry_async_mode=fb.async_mode,
+        )
         result = await _proxy_upstream(
             fb.base_url.rstrip("/"),
             fb.api_key or "",
@@ -979,6 +1006,7 @@ async def _try_with_fallbacks(
             profile=profile,
             actual_provider=fb.provider,
             request_id=request_id,
+            extra_headers=fb_headers,
         )
         if not _is_retryable_error(result):
             _record_successful_candidate(
@@ -1076,6 +1104,78 @@ def _get_model_extra_body(
             best_score = score
             best_extra = entry.extra_body
     return best_extra
+
+
+def _resolve_async_mode(
+    model: str,
+    provider_name: str,
+    runtime: RuntimeState,
+    *,
+    entry_async_mode: AsyncModeConfig | None = None,
+) -> AsyncModeConfig | None:
+    """Resolve async_mode using ModelEntry -> ModelRuleEntry -> ProviderConfig -> None.
+
+    The entry-level value (supplied by the caller from RoutingDecision/FallbackEntry)
+    wins by presence, not enabled truthiness — this makes an explicit model-level
+    ``enabled: false`` beat a provider-level ``enabled: true`` (AC #10). A resolved
+    config with ``enabled: false`` blocks fall-through to lower-precedence levels.
+
+    Rule-level resolution uses the same prefix/provider scoring as
+    ``_get_model_extra_body``.
+    """
+    # 1. ModelEntry level (propagated via RoutingDecision/FallbackEntry)
+    if entry_async_mode is not None:
+        return entry_async_mode
+
+    # 2. ModelRuleEntry level (prefix/provider scoring)
+    best_rule: AsyncModeConfig | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        if entry.async_mode is None:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_rule = entry.async_mode
+    if best_rule is not None:
+        return best_rule
+
+    # 3. ProviderConfig level
+    provider_cfg = runtime.config.providers.get(provider_name)
+    if provider_cfg is not None and provider_cfg.async_mode is not None:
+        return provider_cfg.async_mode
+
+    # 4. No async_mode configured — graceful no-op
+    return None
+
+
+def _apply_async_mode(
+    body: dict[str, Any],
+    headers: dict[str, str],
+    async_mode: AsyncModeConfig,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Apply the resolved async_mode's delivery mechanism.
+
+    Called only when the resolved config has ``enabled: true``. Returns the
+    mutated ``(body, headers)`` tuple. ``model_suffix`` mutates ``body["model"]``
+    in place — the body is the single source of truth for the model name.
+    """
+    if async_mode.delivery == "body":
+        body[async_mode.field] = async_mode.value
+    elif async_mode.delivery == "header":
+        headers[async_mode.field] = async_mode.value
+    elif async_mode.delivery == "model_suffix":
+        original_model = body.get("model", "")
+        body["model"] = f"{original_model}:{async_mode.suffix}"
+    return body, headers
 
 
 def _get_model_content_part_policy(
@@ -1289,8 +1389,23 @@ def _normalize_message_content_for_candidate(
 
 
 def _prepare_body_for_candidate(
-    body: dict[str, Any], model: str, provider_name: str, runtime: RuntimeState
-) -> dict[str, Any]:
+    body: dict[str, Any],
+    model: str,
+    provider_name: str,
+    runtime: RuntimeState,
+    *,
+    entry_async_mode: AsyncModeConfig | None = None,
+) -> tuple[dict[str, Any], dict[str, str]]:
+    """Sanitize, normalize, inject extra_body, then apply async_mode.
+
+    Returns ``(prepared_body, extra_upstream_headers)``. The extra headers dict
+    carries async ``header`` delivery mode values that ``_proxy_upstream`` merges
+    after its own default headers.
+
+    Ordering: sanitize -> normalize -> extra_body merge -> async resolve + apply.
+    Async body injection merges **after** ``extra_body`` so explicit async config
+    wins on conflict (AC #7, #8).
+    """
     prepared = _sanitize_reasoning_content_for_candidate(
         body, model, provider_name, runtime
     )
@@ -1306,7 +1421,20 @@ def _prepare_body_for_candidate(
             provider_name,
             json.dumps(extra_body, sort_keys=True),
         )
-    return prepared
+
+    extra_headers: dict[str, str] = {}
+    async_mode = _resolve_async_mode(
+        model, provider_name, runtime, entry_async_mode=entry_async_mode
+    )
+    if async_mode is not None and async_mode.enabled:
+        prepared, extra_headers = _apply_async_mode(prepared, extra_headers, async_mode)
+        logger.info(
+            "ASYNC_MODE model=%s provider=%s delivery=%s",
+            prepared.get("model", model),
+            provider_name,
+            async_mode.delivery,
+        )
+    return prepared, extra_headers
 
 
 def _has_explicit_reasoning_control(body: dict[str, Any]) -> bool:

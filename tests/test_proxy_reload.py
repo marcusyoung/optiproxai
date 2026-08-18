@@ -735,7 +735,7 @@ class TestModelExtraBody:
             "messages": [{"role": "user", "content": "hello"}],
         }
 
-        prepared = proxy_mod._prepare_body_for_candidate(
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
             body, "moonshotai/kimi-k3", "doubleword", state
         )
 
@@ -758,7 +758,7 @@ class TestModelExtraBody:
             "messages": [{"role": "user", "content": "hello"}],
         }
 
-        prepared = proxy_mod._prepare_body_for_candidate(
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
             body, "moonshotai/kimi-k3", "doubleword", state
         )
 
@@ -778,7 +778,7 @@ class TestModelExtraBody:
             "messages": [{"role": "user", "content": "hello"}],
         }
 
-        prepared = proxy_mod._prepare_body_for_candidate(
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
             body, "zai-org/GLM-5.2-FP8", "doubleword", state
         )
 
@@ -799,7 +799,7 @@ class TestModelExtraBody:
             "messages": [{"role": "user", "content": "hello"}],
         }
 
-        prepared = proxy_mod._prepare_body_for_candidate(
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
             body, "moonshotai/kimi-k3", "sference", state
         )
 
@@ -824,7 +824,7 @@ class TestModelExtraBody:
             "messages": [{"role": "user", "content": "hello"}],
         }
 
-        prepared = proxy_mod._prepare_body_for_candidate(
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
             body, "moonshotai/kimi-k3", "doubleword", state
         )
 
