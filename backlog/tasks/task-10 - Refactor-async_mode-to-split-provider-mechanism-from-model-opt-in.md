@@ -1,10 +1,10 @@
 ---
 id: TASK-10
 title: Refactor async_mode to split provider mechanism from model opt-in
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-08-18 22:03'
-updated_date: '2026-08-18 22:14'
+updated_date: '2026-08-18 22:41'
 labels:
   - refactor
 dependencies:

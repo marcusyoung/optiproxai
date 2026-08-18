@@ -4,13 +4,13 @@ title: 'Per-turn async model preference via /optiproxai:<tier>:async modifier'
 status: To Do
 assignee: []
 created_date: '2026-08-17 17:40'
-updated_date: '2026-08-18 13:13'
+updated_date: '2026-08-18 22:25'
 labels:
   - logic
   - test
   - docs
 dependencies:
-  - TASK-6
+  - TASK-10
 references:
   - src/optiproxai/router.py
   - src/optiproxai/proxy.py
@@ -35,24 +35,30 @@ This feature is a sibling to TASK-1 (per-turn tier override). It extends the sam
 ## Design considerations
 
 - **Parser extension**: The regex changes from `^/optiproxai:(\w+)\s*` to `^/optiproxai:(\w+)(?::(\w+))?\s*`. The helper returns an additional value (e.g. a modifier string or a dataclass) so call sites can act on it. TASK-1.1 ships the helper; this task extends its signature. If TASK-1.1 has already been implemented by the time this task starts, the signature change must be backward-compatible or all call sites updated together.
-- **Async model identification**: Two approaches were discussed:
+
+- **Async model identification (resolved by TASK-10)**: Two approaches were discussed:
   1. Infer from config — any model entry whose `extra_body` contains `service_tier: flex` is treated as async. No schema change, but fragile.
   2. Explicit flag — add an `async: true` (or `mode: async`) field to model entries or provider definitions in the config schema. More work but self-documenting and extensible if other modifiers are added later (e.g. `:vision`, `:cheap`).
-  The plan phase should decide which approach and whether to make the config schema change.
-- **Routing behavior**: When `:async` is set, prefer async-capable models in the selected tier's primary/fallback list. If no async model exists for that tier, warn and fall through to normal routing (same graceful-degradation pattern as invalid tier in TASK-1, per decision record `decisions/invalid-tier-warn-vs-error`).
+
+  **Resolution**: TASK-10 introduces the opt-in model where model/rule-level `async_mode.enabled: true` declares async intent. After TASK-10, the clean way to identify async-capable models is to check whether a model's resolved `async_mode` has `enabled: true` — no `extra_body` sniffing needed, no additional schema field required. Approach 2 (explicit flag) is the natural fit; TASK-10's `async_mode.enabled` IS that flag. The plan phase should use the resolved `async_mode` (post-TASK-10 merge semantics) as the async identification signal.
+
+- **Routing behavior**: When `:async` is set, prefer async-capable models (those with resolved `async_mode.enabled == true`) in the selected tier's primary/fallback list. If no async model exists for that tier, warn and fall through to normal routing (same graceful-degradation pattern as invalid tier in TASK-1, per decision record `decisions/invalid-tier-warn-vs-error`).
+
 - **Scope**: This is a routing-preference signal, not a different response handling path. The proxy still returns a standard OpenAI-compatible streaming or non-streaming response. No protocol change.
 
 ## Dependencies
 
+- TASK-10 must be complete — this task relies on TASK-10's opt-in model where `async_mode.enabled` at the model/rule level identifies async-capable models. TASK-10 itself depends on TASK-6 (the original async_mode implementation), so the chain TASK-2 → TASK-10 → TASK-6 is preserved.
 - TASK-1 must be complete or at least TASK-1.1 must be complete, because this task extends `parse_tier_override` (introduced by TASK-1.1) and shares the same proxy/CLI call sites.
 
 ## References
 
 - `src/optiproxai/router.py` — `parse_tier_override` helper and `Router.route()`
 - `src/optiproxai/proxy.py` — `chat_completions()` and `route_debug()`
-- `src/optiproxai/config.py` — config schema for model entries and `extra_body`
+- `src/optiproxai/config.py` — config schema for model entries and `async_mode` (post-TASK-10 opt-in shape)
 - `src/optiproxai/cli.py` — `route` command
 - Decision records: `decisions/invalid-tier-warn-vs-error`, `decisions/tier-override-token-position`
+- Related task: TASK-10 (async_mode mechanism/opt-in split) — provides the `async_mode.enabled` opt-in flag used for async model identification
 - Config: `C:\Users\myoun\.config\optiproxai\config.yaml` — Doubleword model entries with `service_tier: flex`
 <!-- SECTION:DESCRIPTION:END -->
 
