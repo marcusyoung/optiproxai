@@ -7,7 +7,7 @@ This file is for coding agents working in `optiproxai`.
 - Language: Python 3.13+
 - Package manager and task runner: `uv`
 - Build backend: `uv_build`
-- CLI entrypoint: `optiproxai = "optiproxai.cli:main"`
+- CLI entrypoints: `optiproxai = "optiproxai.cli:main"` and `opx = "optiproxai.cli:main"`
 - App shape: Click CLI + FastAPI proxy + Pydantic config/models
 - Source tree: `src/optiproxai/`
 - Tests: `tests/` with `pytest`
@@ -16,22 +16,45 @@ This file is for coding agents working in `optiproxai`.
 
 ## Repository Layout
 
-- `src/optiproxai/cli.py` - Click commands for `serve`, `route`, and `config`
+- `src/optiproxai/cli.py` - Click commands for `serve`, `route`, `config`, `doctor`, `init`, and `keys`
 - `src/optiproxai/proxy.py` - FastAPI OpenAI-compatible proxy
-- `src/optiproxai/router.py` - routing decisions and provider/profile selection
-- `src/optiproxai/scorer.py` - prompt classification logic and LLM escalation
-- `src/optiproxai/config.py` - YAML config loading and env-var resolution
+- `src/optiproxai/router.py` - routing decisions, tier/profile/provider/model selection, tier override
+- `src/optiproxai/scorer.py` - distilled feature classification and tier scoring
+- `src/optiproxai/classification_context.py` - request-to-classification context helpers
+- `src/optiproxai/config.py` - YAML config loading, env-var resolution, validation
+- `src/optiproxai/api_keys.py` - proxy API key storage and validation
+- `src/optiproxai/fallback_backoff.py` - process-local fallback cooldowns
 - `src/optiproxai/logger.py` - JSONL routing log writer
-- `src/optiproxai/dirs.py` - XDG/platformdirs helpers
-- `tests/test_scorer.py` - scorer behavior coverage
-- `tests/test_llm_classifier.py` - LLM classifier and logging coverage
-- `config.yaml` - example/default local configuration
+- `src/optiproxai/dirs.py` - XDG-compliant directory paths
+- `src/optiproxai/dashboard.py` - dashboard ingestion, stats, and HTML rendering
+- `src/optiproxai/tokens.py` - token estimation (tiktoken with char/4 fallback)
+- `src/optiproxai/training_data.py` - distilled feature dataset data structures/helpers
+- `src/optiproxai/feature_training.py` - multi-output feature classifier training
+- `src/optiproxai/agentic_training.py` - deprecated wrappers for feature classifier training
+- `tests/test_scorer.py` - distilled feature scorer and ambiguous band coverage
+- `tests/test_llm_classifier.py` - routing logger coverage with distilled feature payloads
+- `tests/test_capability_routing.py` - capability detection, filtering, and escalation
+- `tests/test_input_limit_routing.py` - input-limit filtering and tier escalation
+- `tests/test_tier_override.py` - per-turn tier override (parser, router, proxy, CLI)
+- `tests/test_fallback_backoff.py` - fallback cooldown state
+- `tests/test_dashboard.py` - dashboard ingestion, stats, and HTML rendering
+- `tests/test_proxy_reload.py` - config hot reload, routing errors, decorative tool schema
+- `tests/test_api_keys.py` - proxy API key lifecycle
+- `tests/test_api_keys_cli.py` - `keys` CLI commands
+- `tests/test_api_keys_proxy.py` - proxy auth and fallback behavior
+- `tests/test_router_logging.py` - routing log and session-sticky routing
+- `tests/test_config.py` - embedding config validation
+- `tests/test_cli.py` - CLI route masking, config errors, doctor, init, aux LLM config
+- `tests/test_feature_training.py` - feature classifier training pipeline
+- `tests/test_agentic_training_data.py` - dataset extraction and LLM annotation
+- `tests/test_agentic_training_script.py` - training script entry point
+- `config.example.yaml` - example configuration with all features documented
 
 ## Setup Commands
 
 - Install runtime + dev dependencies: `uv sync --dev`
 - Install runtime dependencies only: `uv sync`
-- Run the CLI locally: `uv run OptiProxAI --help`
+- Run the CLI locally: `uv run optiproxai --help`
 - Start the proxy locally: `uv run optiproxai serve`
 - Route a prompt locally: `uv run optiproxai route "hello world"`
 - Show resolved config: `uv run optiproxai config`
@@ -48,8 +71,8 @@ This file is for coding agents working in `optiproxai`.
 ## Single-Test Commands
 
 - Run one test file: `uv run pytest tests/test_scorer.py -q`
-- Run one test class: `uv run pytest tests/test_scorer.py::TestReasoningPrompts -q`
-- Run one test method: `uv run pytest tests/test_scorer.py::TestReasoningPrompts::test_prove_theorem -q`
+- Run one test class: `uv run pytest tests/test_scorer.py::TestAmbiguousBands -q`
+- Run one test method: `uv run pytest tests/test_scorer.py::TestAmbiguousBands::test_prefer_upper_fails_toward_higher_tier -q`
 - Run tests matching an expression: `uv run pytest tests/ -q -k reasoning`
 - Stop after first failure: `uv run pytest tests/ -q -x`
 
