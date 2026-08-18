@@ -127,6 +127,23 @@ model_rules:
       capabilities: [vision, tools, json_mode]
     - prefix: "google/gemini"
       capabilities: [vision, tools, json_mode]
+    # Rule-level async_mode: injects an HTTP header for matching models.
+    #
+    # - prefix: "moonshotai/kimi-k3"
+    #   provider: "doubleword"
+    #   async_mode:
+    #       enabled: true
+    #       delivery: header
+    #       field: X-Async-Batch
+    #       value: "1"
+    # Rule-level async_mode with model_suffix delivery.
+    #
+    # - prefix: "moonshotai/kimi-k3"
+    #   provider: "doubleword"
+    #   async_mode:
+    #       enabled: true
+    #       delivery: model_suffix
+    #       suffix: flex            # sends model as "moonshotai/kimi-k3:flex"
 
 # ---------------------------------------------------------------------------
 # Providers
@@ -144,6 +161,19 @@ providers:
     #     name: local_proxy
     #     base_url: "http://host.docker.internal:8317/v1"
     #     api_key: "${LOCAL_PROXY_API_KEY}"
+
+    # Example: provider with async_mode default (all models inherit unless
+    # overridden at the model or rule level).
+    #
+    # doubleword:
+    #     name: doubleword
+    #     base_url: "https://api.doubleword.ai/v1"
+    #     api_key: "${DOUBLEWORD_API_KEY}"
+    #     async_mode:
+    #         enabled: true
+    #         delivery: body            # body | header | model_suffix
+    #         field: service_tier       # body/header: field or header name
+    #         value: flex                # body/header: value to send
 
 # ---------------------------------------------------------------------------
 # Routing Profiles
@@ -180,6 +210,9 @@ profiles:
                       max_input_tokens: 128000
                     - model: "gpt-4o"
                       max_input_tokens: 128000
+                      # Per-model async_mode override (wins over provider/rule).
+                      # async_mode:
+                      #     enabled: false   # explicitly disable async for this model
                 fallback:
                     - model: "claude-sonnet-4-5-20250929"
                       max_input_tokens: 200000

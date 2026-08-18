@@ -3,10 +3,10 @@ id: TASK-6
 title: >-
   async_mode config model — explicit async/batch routing declaration with three
   delivery modes
-status: To Do
+status: Done
 assignee: []
 created_date: '2026-08-18 13:13'
-updated_date: '2026-08-18 18:59'
+updated_date: '2026-08-18 21:26'
 labels: []
 dependencies: []
 documentation:
@@ -97,23 +97,23 @@ profiles:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 AsyncModeConfig Pydantic model exists with enabled, delivery, field, value, and suffix fields
-- [ ] #2 ProviderConfig has optional async_mode field
-- [ ] #3 ModelEntry has optional async_mode field
-- [ ] #4 ModelRuleEntry has optional async_mode field
-- [ ] #5 _resolve_async_mode function resolves async_mode using resolution order: ModelEntry -> ModelRuleEntry -> ProviderConfig -> None, with same prefix/provider scoring as _get_model_extra_body
-- [ ] #6 _apply_async_mode function applies the three delivery modes: body (inject field into JSON body), header (add HTTP header), model_suffix (append :suffix to model name)
-- [ ] #7 _prepare_body_for_candidate uses _resolve_async_mode and _apply_async_mode instead of extra_body for async-specific fields
-- [ ] #8 extra_body remains functional for non-async body field injection
-- [ ] #9 When no async_mode is configured at any level, request routes sync with no error (graceful no-op)
-- [ ] #10 When async_mode.enabled is false at model level but provider has async_mode.enabled true, the model-level false wins (explicit disable)
-- [ ] #11 config.example.yaml updated with async_mode examples for provider-level and model-level
-- [ ] #12 README.md documents async_mode config model, delivery modes, and resolution order
-- [ ] #13 uv run ruff check src/ passes
-- [ ] #14 uv run ruff format --check src/ tests/ passes
-- [ ] #15 uv run pyright src/ passes
-- [ ] #16 uv run pytest tests/ -q passes
-- [ ] #17 Tests cover: each delivery mode, resolution order (model overrides rule overrides provider), explicit disable (enabled: false wins), no-op when unconfigured, body/header/model_suffix injection correctness
+- [x] #1 AsyncModeConfig Pydantic model exists with enabled, delivery, field, value, and suffix fields
+- [x] #2 ProviderConfig has optional async_mode field
+- [x] #3 ModelEntry has optional async_mode field
+- [x] #4 ModelRuleEntry has optional async_mode field
+- [x] #5 _resolve_async_mode function resolves async_mode using resolution order: ModelEntry -> ModelRuleEntry -> ProviderConfig -> None, with same prefix/provider scoring as _get_model_extra_body
+- [x] #6 _apply_async_mode function applies the three delivery modes: body (inject field into JSON body), header (add HTTP header), model_suffix (append :suffix to model name)
+- [x] #7 _prepare_body_for_candidate uses _resolve_async_mode and _apply_async_mode instead of extra_body for async-specific fields
+- [x] #8 extra_body remains functional for non-async body field injection
+- [x] #9 When no async_mode is configured at any level, request routes sync with no error (graceful no-op)
+- [x] #10 When async_mode.enabled is false at model level but provider has async_mode.enabled true, the model-level false wins (explicit disable)
+- [x] #11 config.example.yaml updated with async_mode examples for provider-level and model-level
+- [x] #12 README.md documents async_mode config model, delivery modes, and resolution order
+- [x] #13 uv run ruff check src/ passes
+- [x] #14 uv run ruff format --check src/ tests/ passes
+- [x] #15 uv run pyright src/ passes
+- [x] #16 uv run pytest tests/ -q passes
+- [x] #17 Tests cover: each delivery mode, resolution order (model overrides rule overrides provider), explicit disable (enabled: false wins), no-op when unconfigured, body/header/model_suffix injection correctness
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -204,3 +204,40 @@ Cover, using the same `RuntimeState` construction pattern as `TestModelExtraBody
 | 6 | Update config.example.yaml and README.md | config.example.yaml, README.md | 1 | docs | Both files document async_mode with delivery modes and resolution order examples |
 | 7 | Run full CI gates | (no file changes) | 1-6 | test | `uv run ruff check src/`, `ruff format --check`, `pyright src/`, `pytest tests/ -q` all pass |
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+## TASK-6 Complete: async_mode config model
+
+### What was built
+
+Added a first-class `AsyncModeConfig` Pydantic model with three delivery modes (`body`, `header`, `model_suffix`) wired through three config levels (`ProviderConfig`, `ModelEntry`, `ModelRuleEntry`) and applied in the proxy's candidate-preparation step.
+
+### Files changed
+
+- `src/optiproxai/config.py` — new `AsyncModeConfig` model; `async_mode` field added to `ProviderConfig`, `ModelEntry`, `ModelRuleEntry`, and `ResolvedModelCandidate`; `_resolve_candidate_entry` propagates `entry.async_mode`
+- `src/optiproxai/router.py` — `async_mode` field on `FallbackEntry` and `RoutingDecision`; propagation in both `route()` and `resolve_model()` for primary and fallbacks
+- `src/optiproxai/proxy.py` — new `_resolve_async_mode()` (resolution: entry > rule > provider > None) and `_apply_async_mode()` (body/header/model_suffix delivery); `_prepare_body_for_candidate` returns `tuple[body, extra_headers]` and applies async after extra_body; `_proxy_upstream` gains optional `extra_headers` param; `_try_with_fallbacks` unpacks and passes headers for both primary and fallback
+- `tests/test_async_mode.py` (new, 430 lines) — 14 tests across 5 classes: delivery modes, resolution order, explicit disable, extra_body coexistence, propagation
+- `tests/test_proxy_reload.py` — `TestModelExtraBody` updated to unpack tuple return
+- `tests/test_api_keys_proxy.py` — 4 mock `fake_proxy_upstream` signatures updated to accept `extra_headers` kwarg
+- `config.example.yaml` — provider-level, rule-level (header + model_suffix), and model-level (`enabled: false`) examples
+- `README.md` — new async/batch routing section with delivery modes table, resolution order, and config example
+
+### Design decisions followed
+
+- **doc-4**: ModelEntry.async_mode propagates via RoutingDecision/FallbackEntry (max_input_tokens precedent)
+- **doc-5**: `_prepare_body_for_candidate` returns `tuple[body, extra_headers]`; model_suffix mutates `body["model"]` in place
+
+### CI gates
+
+- `ruff check src/` — All checks passed (1 pre-existing unused import in test_feature_training.py, not touched)
+- `ruff format --check src/ tests/` — all formatted
+- `pyright src/` — 0 errors, 0 warnings
+- `pytest tests/ -q` — 332 passed in 12.29s
+
+### Deviations from plan
+
+One additional file not in the original plan: `tests/test_api_keys_proxy.py` needed 4 mock `fake_proxy_upstream` signatures updated to accept the new `extra_headers` keyword argument on `_proxy_upstream`. This was an expected consequence of the `_proxy_upstream` signature change documented in the plan (Step 4).
+<!-- SECTION:FINAL_SUMMARY:END -->
