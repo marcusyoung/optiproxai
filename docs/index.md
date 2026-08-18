@@ -3,8 +3,6 @@ layout: default
 title: OptiProxAI
 ---
 
-# OptiProxAI
-
 **An OpenAI-compatible local proxy that routes every LLM request to the right model — automatically.**
 
 OptiProxAI classifies each request by prompt complexity, required capabilities, and your cost/quality profile, then sends it to the most suitable model. One endpoint, one API key, all your providers.
