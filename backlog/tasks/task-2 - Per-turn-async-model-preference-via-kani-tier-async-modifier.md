@@ -4,12 +4,13 @@ title: 'Per-turn async model preference via /optiproxai:<tier>:async modifier'
 status: To Do
 assignee: []
 created_date: '2026-08-17 17:40'
+updated_date: '2026-08-18 13:13'
 labels:
   - logic
   - test
   - docs
 dependencies:
-  - TASK-1
+  - TASK-6
 references:
   - src/optiproxai/router.py
   - src/optiproxai/proxy.py
