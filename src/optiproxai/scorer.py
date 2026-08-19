@@ -437,7 +437,11 @@ def _resolve_runtime_embedding_settings() -> RuntimeEmbeddingSettings:
         api_key=api_key,
         timeout_seconds=FEATURE_EMBEDDING_TIMEOUT_SECONDS,
     )
-    _embedding_settings_cache = (fingerprint, settings)
+    # Do NOT cache the env-var fallback: it is not keyed to the config file,
+    # so caching it against the config fingerprint pins a transient failure
+    # (e.g. config resolution failing once) as the runtime model for the whole
+    # process lifetime. Config-derived results above are cacheable; this
+    # fallback is re-resolved per request so a transient miss self-heals.
     return settings
 
 
