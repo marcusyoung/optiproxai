@@ -25,6 +25,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from optiproxai.api_keys import has_keys, validate_key
 from optiproxai.config import (
     AsyncModeConfig,
+    CacheControlConfig,
     ContentPartPolicy,
     OptiproxaiConfig,
     load_config,
@@ -1234,6 +1235,167 @@ def _apply_async_mode(
     return body, headers
 
 
+def _resolve_cache_control(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> CacheControlConfig | None:
+    """Resolve the effective cache_control policy (decision doc-7).
+
+    Presence-based highest-precedence-wins: best-matching
+    ``ModelRuleEntry.cache_control`` (same prefix/provider scoring as
+    ``_get_model_content_part_policy``) -> ``ProviderConfig.cache_control``
+    -> None.  No field-by-field merge across levels.
+    """
+    best_policy: CacheControlConfig | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        if entry.cache_control is None:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_policy = entry.cache_control
+    if best_policy is not None:
+        return best_policy
+
+    provider_cfg = runtime.config.providers.get(provider_name)
+    if provider_cfg is not None:
+        return provider_cfg.cache_control
+    return None
+
+
+def _count_cache_control_markers(body: dict[str, Any]) -> int:
+    """Count existing cache_control occurrences across messages, tools, and top level."""
+    count = 0
+    messages = body.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            if isinstance(msg.get("cache_control"), dict):
+                count += 1
+            content = msg.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(
+                        part.get("cache_control"), dict
+                    ):
+                        count += 1
+    tools = body.get("tools")
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict) and isinstance(tool.get("cache_control"), dict):
+                count += 1
+    if isinstance(body.get("cache_control"), dict):
+        count += 1
+    return count
+
+
+def _apply_cache_control(
+    body: dict[str, Any], config: CacheControlConfig
+) -> dict[str, Any]:
+    """Inject a cache_control marker into the stable prefix per target.
+
+    Returns a shallow-copied body; never mutates the caller's dict in place.
+    Marker shape follows Doubleword's Anthropic-style prefix caching:
+    ``{"type": "ephemeral", "ttl": <ttl>}``.
+
+    - ``target: "system"``: marker on the last content block of the first
+      system message.  String content is converted to array form.
+    - ``target: "tools"``: marker on the last object of the ``tools`` array.
+
+    Skips (returns unchanged body) when the target container is missing/empty
+    or when the body already has ``max_breakpoints`` or more markers.
+    """
+    if not config.enabled:
+        return body
+    if _count_cache_control_markers(body) >= config.max_breakpoints:
+        logger.debug(
+            "CACHE_CONTROL skip: breakpoint limit reached limit=%d",
+            config.max_breakpoints,
+        )
+        return body
+
+    marker = {"type": "ephemeral", "ttl": config.ttl}
+
+    if config.target == "system":
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return body
+        system_idx = next(
+            (
+                idx
+                for idx, msg in enumerate(messages)
+                if isinstance(msg, dict) and msg.get("role") == "system"
+            ),
+            None,
+        )
+        if system_idx is None:
+            logger.debug("CACHE_CONTROL skip: no system message")
+            return body
+        msg = messages[system_idx]
+        content = msg.get("content")
+        new_messages = list(messages)
+        if isinstance(content, str):
+            new_msg = dict(msg)
+            new_msg["content"] = [
+                {"type": "text", "text": content, "cache_control": marker}
+            ]
+            new_messages[system_idx] = new_msg
+        elif isinstance(content, list) and content:
+            last_part = content[-1]
+            if isinstance(last_part, dict) and isinstance(
+                last_part.get("cache_control"), dict
+            ):
+                logger.debug(
+                    "CACHE_CONTROL skip: client marker already on system block"
+                )
+                return body
+            new_msg = dict(msg)
+            new_content = list(content)
+            if isinstance(last_part, dict):
+                new_content[-1] = {**last_part, "cache_control": marker}
+            else:
+                new_content[-1] = {
+                    "type": "text",
+                    "text": str(last_part),
+                    "cache_control": marker,
+                }
+            new_msg["content"] = new_content
+            new_messages[system_idx] = new_msg
+        else:
+            logger.debug("CACHE_CONTROL skip: system message has no content")
+            return body
+        return {**body, "messages": new_messages}
+
+    # target == "tools"
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        logger.debug("CACHE_CONTROL skip: no tools array")
+        return body
+    last_tool = tools[-1]
+    if isinstance(last_tool, dict) and isinstance(last_tool.get("cache_control"), dict):
+        logger.debug("CACHE_CONTROL skip: client marker already on last tool")
+        return body
+    new_tools = list(tools)
+    if isinstance(last_tool, dict):
+        new_tools[-1] = {**last_tool, "cache_control": marker}
+    else:
+        new_tools[-1] = {
+            "type": "function",
+            "function": last_tool,
+            "cache_control": marker,
+        }
+    return {**body, "tools": new_tools}
+
+
 def _get_model_content_part_policy(
     model: str, provider_name: str, runtime: RuntimeState
 ) -> ContentPartPolicy | None:
@@ -1452,15 +1614,15 @@ def _prepare_body_for_candidate(
     *,
     entry_async_mode: AsyncModeConfig | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """Sanitize, normalize, inject extra_body, then apply async_mode.
+    """Sanitize, normalize, inject extra_body, apply async_mode, then cache_control.
 
     Returns ``(prepared_body, extra_upstream_headers)``. The extra headers dict
     carries async ``header`` delivery mode values that ``_proxy_upstream`` merges
     after its own default headers.
 
-    Ordering: sanitize -> normalize -> extra_body merge -> async resolve + apply.
-    Async body injection merges **after** ``extra_body`` so explicit async config
-    wins on conflict (AC #7, #8).
+    Ordering: sanitize -> normalize -> extra_body merge -> async resolve + apply
+    -> cache_control injection (last).  Cache injection runs last so
+    content_part_policy normalization cannot strip the markers.
     """
     prepared = _sanitize_reasoning_content_for_candidate(
         body, model, provider_name, runtime
@@ -1510,6 +1672,17 @@ def _prepare_body_for_candidate(
                 provider_name,
                 async_mode.delivery,
             )
+
+    cache_control = _resolve_cache_control(model, provider_name, runtime)
+    if cache_control is not None and cache_control.enabled:
+        prepared = _apply_cache_control(prepared, cache_control)
+        logger.info(
+            "CACHE_CONTROL model=%s provider=%s target=%s ttl=%s",
+            model,
+            provider_name,
+            cache_control.target,
+            cache_control.ttl,
+        )
     return prepared, extra_headers
 
 
