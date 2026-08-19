@@ -372,6 +372,39 @@ model_rules:
 
 `extra_body` remains as a general-purpose escape hatch for non-async body fields.
 
+## Prompt caching (`cache_control`)
+
+Some providers require explicit `cache_control` markers in the request body to serve cached prefixes (opt-in caching). Doubleword follows Anthropic's prefix-cache model: a marker caches everything from the start of the request up to and including the marked block, and without a marker even identical prefixes are never read from cache. opencode treats OptiProxAI as a generic OpenAI-compatible endpoint and never sends markers, so optiproxai can inject them instead.
+
+A `cache_control` block on a provider (or on a model rule) enables injection:
+
+```yaml
+providers:
+  doubleword:
+    name: doubleword
+    base_url: "https://api.doubleword.ai/v1"
+    api_key: "${DOUBLEWORD_API_KEY}"
+    cache_control:
+      enabled: true          # default false
+      ttl: "1h"              # "5m" (default) or "1h"
+      target: system         # "system" (default) or "tools"
+      max_breakpoints: 4     # Doubleword's documented ceiling; tunable
+```
+
+| `target` | Marker lands on | Cached prefix |
+|---|---|---|
+| `system` (default) | last block of the first system message (string content is converted to array form) | tools + system prompt — the largest stable prefix, biggest savings |
+| `tools` | last object of the `tools` array | tool definitions only |
+
+Resolution is presence-based highest-precedence-wins (no field-by-field merge): best-matching `ModelRuleEntry.cache_control` → `ProviderConfig.cache_control` → none. A rule with `enabled: false` explicitly opts out even when the provider enables injection.
+
+Injection rules:
+- Runs **after** `content_part_policy` normalization so markers survive reconstruction.
+- Never double-injects: client-provided markers are preserved, and injection is skipped when the landing block already carries a marker.
+- Respects `max_breakpoints`: no marker is added when the body already has that many `cache_control` occurrences.
+- Skips silently when the target container is missing (no system message, or no tools array).
+- Markers on models without cache pricing (e.g. `tencent/Hy3-FP8` on Doubleword) are ignored upstream and billed at standard rates — always safe to include.
+
 ## API endpoints
 
 | Endpoint | Method | Description |

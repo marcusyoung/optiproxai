@@ -156,6 +156,22 @@ model_rules:
     #   provider: "doubleword"
     #   async_mode:
     #     enabled: false          # explicitly sync; no mechanism inherited
+    # Rule-level cache_control: override the provider's marker policy.
+    # Presence-based: a matching rule's block wins without field-by-field merge.
+    #
+    # - prefix: "moonshotai/kimi-k3"
+    #   provider: "doubleword"
+    #   cache_control:
+    #     enabled: true
+    #     ttl: "1h"               # "5m" (default) or "1h"
+    #     target: system          # "system" (default) or "tools"
+    #     max_breakpoints: 4      # Doubleword ceiling; tunable
+    # Rule-level cache_control: explicitly opt out of the provider's policy.
+    #
+    # - prefix: "tencent/Hy3-FP8"
+    #   provider: "doubleword"
+    #   cache_control:
+    #     enabled: false          # no markers even when the provider enables them
 
 # ---------------------------------------------------------------------------
 # Providers
@@ -187,6 +203,14 @@ providers:
     #         delivery: body            # body | header | model_suffix
     #         field: service_tier       # body/header: field or header name
     #         value: flex                # body/header: value to send
+    #     # Provider-level cache_control: inject markers into the stable prefix
+    #     # for opt-in caching providers (Doubleword follows Anthropic's
+    #     # prefix-cache model — no marker, no cache read discount).
+    #     cache_control:
+    #         enabled: true
+    #         ttl: "1h"                 # "5m" (default) or "1h"
+    #         target: system            # "system" (default) or "tools"
+    #         max_breakpoints: 4        # Doubleword ceiling; tunable
 
 # ---------------------------------------------------------------------------
 # Routing Profiles

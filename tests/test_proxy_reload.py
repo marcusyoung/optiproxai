@@ -12,6 +12,7 @@ from fastapi.testclient import TestClient
 
 import optiproxai.proxy as proxy_mod
 from optiproxai.config import (
+    CacheControlConfig,
     ContentPartPolicy,
     OptiproxaiConfig,
     ModelRuleEntry,
@@ -829,6 +830,331 @@ class TestModelExtraBody:
         )
 
         assert prepared["service_tier"] == "flex"
+
+
+class TestCacheControlInjection:
+    """cache_control marker injection into stable prefix (TASK-14)."""
+
+    def _state(
+        self,
+        *,
+        provider_cache_control: CacheControlConfig | None = None,
+        model_rules: list[ModelRuleEntry] | None = None,
+    ) -> RuntimeState:
+        cfg = OptiproxaiConfig(
+            providers={
+                "doubleword": ProviderConfig(
+                    name="doubleword",
+                    base_url="https://api.doubleword.ai/v1",
+                    cache_control=provider_cache_control,
+                ),
+            },
+            model_rules=model_rules or [],
+        )
+        return RuntimeState(
+            config_path=None,
+            config=cfg,
+            router=Router(cfg),
+            fallback_backoff_state=Router(cfg).fallback_backoff_state,
+            config_loaded_at="test",
+            version=1,
+        )
+
+    def _marker(self, ttl: str = "5m") -> dict[str, str]:
+        return {"type": "ephemeral", "ttl": ttl}
+
+    def test_string_system_content_converted_to_array(self):
+        state = self._state(provider_cache_control=CacheControlConfig(enabled=True))
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared["messages"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "you are helpful",
+                "cache_control": self._marker(),
+            }
+        ]
+
+    def test_array_system_content_marker_on_last_block(self):
+        state = self._state(provider_cache_control=CacheControlConfig(enabled=True))
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "part one"},
+                        {"type": "text", "text": "part two"},
+                    ],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        content = prepared["messages"][0]["content"]
+        assert content[0] == {"type": "text", "text": "part one"}
+        assert content[1] == {
+            "type": "text",
+            "text": "part two",
+            "cache_control": self._marker(),
+        }
+
+    def test_tools_target_marker_on_last_tool_object(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True, target="tools")
+        )
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "first"}},
+                {"type": "function", "function": {"name": "second"}},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared["tools"][0] == {
+            "type": "function",
+            "function": {"name": "first"},
+        }
+        assert prepared["tools"][1]["cache_control"] == self._marker()
+
+    def test_no_system_message_skips_injection(self):
+        state = self._state(provider_cache_control=CacheControlConfig(enabled=True))
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared == body
+        assert "cache_control" not in str(prepared)
+
+    def test_no_tools_array_skips_injection_for_tools_target(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True, target="tools")
+        )
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared == body
+
+    def test_client_provided_markers_preserved_no_double_injection(self):
+        state = self._state(provider_cache_control=CacheControlConfig(enabled=True))
+        client_marker = {"type": "ephemeral", "ttl": "1h"}
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "help", "cache_control": client_marker}
+                    ],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared == body
+        system_content = prepared["messages"][0]["content"]
+        assert len(system_content) == 1
+        assert system_content[0]["cache_control"] == client_marker
+
+    def test_client_marker_elsewhere_skips_injection(self):
+        state = self._state(provider_cache_control=CacheControlConfig(enabled=True))
+        client_marker = {"type": "ephemeral", "ttl": "1h"}
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "context",
+                            "cache_control": client_marker,
+                        }
+                    ],
+                },
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared == body
+
+    def test_breakpoint_limit_respected(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True, max_breakpoints=4)
+        )
+        marker = self._marker()
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "a", "cache_control": marker},
+                        {"type": "text", "text": "b", "cache_control": marker},
+                        {"type": "text", "text": "c", "cache_control": marker},
+                        {"type": "text", "text": "d", "cache_control": marker},
+                    ],
+                },
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared == body
+
+    def test_injection_survives_content_part_policy_normalization(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="moonshotai/kimi-k3",
+                    provider="doubleword",
+                    content_part_policy=ContentPartPolicy(
+                        mode="normalize",
+                        text_types=["text"],
+                        unknown="drop",
+                    ),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared["messages"][0]["content"] == [
+            {
+                "type": "text",
+                "text": "you are helpful",
+                "cache_control": self._marker(),
+            }
+        ]
+
+    def test_disabled_config_no_injection(self):
+        state = self._state(provider_cache_control=CacheControlConfig(enabled=False))
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [{"role": "system", "content": "you are helpful"}],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared == body
+
+    def test_rule_cache_control_outranks_provider(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True, ttl="1h"),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="moonshotai/kimi-k3",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(
+                        enabled=True, ttl="5m", target="tools"
+                    ),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [
+                {"type": "function", "function": {"name": "alpha"}},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared["tools"][0]["cache_control"] == self._marker("5m")
+        assert prepared["tools"][0]["cache_control"]["ttl"] == "5m"
+
+    def test_rule_disabled_explicitly_opts_out_of_provider(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="moonshotai/kimi-k3",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(enabled=False),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [{"role": "system", "content": "you are helpful"}],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared == body
+
+    def test_original_body_not_mutated_in_place(self):
+        state = self._state(provider_cache_control=CacheControlConfig(enabled=True))
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [{"role": "system", "content": "you are helpful"}],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared is not body
+        assert body["messages"][0]["content"] == "you are helpful"
+        assert "cache_control" not in str(body)
 
 
 class TestAdminReloadAuth:

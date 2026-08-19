@@ -136,6 +136,38 @@ class AsyncModeConfig(BaseModel):
         return self
 
 
+class CacheControlConfig(BaseModel):
+    """Opt-in prompt-caching marker injection policy.
+
+    Providers that require explicit ``cache_control`` markers (e.g. Doubleword,
+    which follows Anthropic's prefix-cache model) get a marker injected into the
+    stable request prefix so cache discounts apply.  A marker caches everything
+    from the start of the request up to and including the marked block; the user
+    turn stays outside the cache.
+
+    - ``target: system`` — marker on the last content block of the first system
+      message (caches tools + system prompt; largest stable prefix).
+    - ``target: tools`` — marker on the last object of the ``tools`` array
+      (caches tool definitions only).
+
+    Resolution is presence-based highest-precedence-wins (decision doc-7):
+    best-matching ``ModelRuleEntry.cache_control`` -> ``ProviderConfig.cache_control``
+    -> none.  No field-by-field merge.
+    """
+
+    enabled: bool = False
+    ttl: Literal["5m", "1h"] = "5m"
+    target: Literal["system", "tools"] = "system"
+    max_breakpoints: int = Field(
+        default=4,
+        gt=0,
+        description=(
+            "Maximum cache_control markers per request.  Default 4 is "
+            "Doubleword's documented ceiling; tunable per provider."
+        ),
+    )
+
+
 class ProviderConfig(BaseModel):
     """A backend LLM provider (OpenRouter, Anthropic, local proxy, etc.)."""
 
@@ -154,6 +186,13 @@ class ProviderConfig(BaseModel):
             "field/value/suffix).  The provider declares HOW async works; "
             "model/rule-level async_mode.enabled declares WHO opts in.  "
             "Provider-level enabled is ignored (vestigial)."
+        ),
+    )
+    cache_control: CacheControlConfig | None = Field(
+        default=None,
+        description=(
+            "Provider-level opt-in prompt-caching marker injection policy.  "
+            "May be overridden per-model via model_rules[].cache_control."
         ),
     )
 
@@ -407,6 +446,14 @@ class ModelRuleEntry(BaseModel):
             "Optional extra request-body fields injected for any candidate "
             "matching this rule (e.g. {'service_tier': 'flex'}). Merged last, "
             "so these values win over client-provided fields."
+        ),
+    )
+    cache_control: CacheControlConfig | None = Field(
+        default=None,
+        description=(
+            "Rule-level opt-in prompt-caching marker injection override.  "
+            "Presence-based: a matching rule's cache_control wins over the "
+            "provider-level block without field-by-field merge (decision doc-7)."
         ),
     )
 
