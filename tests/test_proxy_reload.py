@@ -985,9 +985,36 @@ class TestCacheControlInjection:
             body, "moonshotai/kimi-k3", "doubleword", state
         )
 
+        assert prepared == body
         system_content = prepared["messages"][0]["content"]
         assert len(system_content) == 1
         assert system_content[0]["cache_control"] == client_marker
+
+    def test_client_marker_elsewhere_skips_injection(self):
+        state = self._state(provider_cache_control=CacheControlConfig(enabled=True))
+        client_marker = {"type": "ephemeral", "ttl": "1h"}
+        body: dict[str, Any] = {
+            "model": "moonshotai/kimi-k3",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "context",
+                            "cache_control": client_marker,
+                        }
+                    ],
+                },
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "moonshotai/kimi-k3", "doubleword", state
+        )
+
+        assert prepared == body
 
     def test_breakpoint_limit_respected(self):
         state = self._state(

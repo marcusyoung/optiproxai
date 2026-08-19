@@ -1303,7 +1303,11 @@ def _apply_cache_control(
 ) -> dict[str, Any]:
     """Inject a cache_control marker into the stable prefix per target.
 
-    Returns a shallow-copied body; never mutates the caller's dict in place.
+    Returns the original *body* unchanged when injection is skipped (disabled
+    config, client already sent markers, target container missing/empty, or
+    breakpoint limit reached).  Returns a shallow-copied body when a marker is
+    injected; never mutates the caller's dict in place.
+
     Marker shape follows Doubleword's Anthropic-style prefix caching:
     ``{"type": "ephemeral", "ttl": <ttl>}``.
 
@@ -1311,10 +1315,15 @@ def _apply_cache_control(
       system message.  String content is converted to array form.
     - ``target: "tools"``: marker on the last object of the ``tools`` array.
 
-    Skips (returns unchanged body) when the target container is missing/empty
-    or when the body already has ``max_breakpoints`` or more markers.
+    Client-provided markers are preserved by skipping injection entirely when
+    any ``cache_control`` marker already exists in the body (same principle as
+    ``_has_explicit_reasoning_control``).  This prevents adding a new breakpoint
+    that would change the client's intended caching boundaries.
     """
     if not config.enabled:
+        return body
+    if _count_cache_control_markers(body) > 0:
+        logger.debug("CACHE_CONTROL skip: client markers already present in body")
         return body
     if _count_cache_control_markers(body) >= config.max_breakpoints:
         logger.debug(
@@ -1351,13 +1360,6 @@ def _apply_cache_control(
             new_messages[system_idx] = new_msg
         elif isinstance(content, list) and content:
             last_part = content[-1]
-            if isinstance(last_part, dict) and isinstance(
-                last_part.get("cache_control"), dict
-            ):
-                logger.debug(
-                    "CACHE_CONTROL skip: client marker already on system block"
-                )
-                return body
             new_msg = dict(msg)
             new_content = list(content)
             if isinstance(last_part, dict):
@@ -1381,9 +1383,6 @@ def _apply_cache_control(
         logger.debug("CACHE_CONTROL skip: no tools array")
         return body
     last_tool = tools[-1]
-    if isinstance(last_tool, dict) and isinstance(last_tool.get("cache_control"), dict):
-        logger.debug("CACHE_CONTROL skip: client marker already on last tool")
-        return body
     new_tools = list(tools)
     if isinstance(last_tool, dict):
         new_tools[-1] = {**last_tool, "cache_control": marker}
