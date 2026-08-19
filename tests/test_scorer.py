@@ -287,6 +287,71 @@ embedding:
         assert first == second == third
         assert mock_load.call_count == 1
 
+    def test_env_fallback_is_not_cached_after_config_failure(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        """A transient config resolution failure must not pin the env fallback.
+
+        Regression for the embedding-settings memoization: the env-var fallback
+        is re-resolved per request, so a one-off config failure self-heals on the
+        next call instead of pinning the fallback model for the process lifetime.
+        """
+        from optiproxai.scorer import _resolve_runtime_embedding_settings
+        import optiproxai.scorer as scorer_mod
+
+        scorer_mod._embedding_settings_cache = None
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        # A valid config path exists and OPTIPROXAI_CONFIG points at it, but
+        # load_config() is patched to raise on the first call (a transient
+        # failure) and succeed on the second, so we exercise: call 1 reaches
+        # the env fallback, call 2 resolves from config.
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            """
+embedding:
+  mode: api
+  model: voyage-4
+  provider: voyage
+providers:
+  voyage:
+    name: voyage
+    base_url: https://api.voyageai.com/v1
+    api_key: sk-voyage
+profiles:
+  auto:
+    tiers:
+      SIMPLE:
+        primary: model-a
+"""
+        )
+        monkeypatch.setenv("OPTIPROXAI_CONFIG", str(config_path))
+
+        real_load_config = __import__(
+            "optiproxai.config", fromlist=["load_config"]
+        ).load_config
+        calls = {"n": 0}
+
+        def flaky_load_config(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient resolution failure")
+            return real_load_config(*args, **kwargs)
+
+        with patch(
+            "optiproxai.config.load_config",
+            wraps=flaky_load_config,
+        ):
+            # First call: config resolution fails -> env fallback.
+            first = _resolve_runtime_embedding_settings()
+            # Second call: config resolution succeeds -> config model.
+            second = _resolve_runtime_embedding_settings()
+
+        assert first.model == "text-embedding-3-small"  # env fallback
+        assert second.model == "voyage-4"  # re-resolved config
+        assert first.mode == "api"
+        assert calls["n"] == 2
+
     def test_local_embedding_backend_reused(self, tmp_path) -> None:
         """A single LocalEmbeddingBackend is reused across calls (AC #4)."""
         _write_bundle(tmp_path)
