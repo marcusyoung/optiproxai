@@ -369,9 +369,13 @@ def _as_float_mapping(value: object, *, name: str) -> dict[str, float]:
 def _resolve_runtime_embedding_settings() -> RuntimeEmbeddingSettings:
     """Resolve runtime embedding settings from config or environment variables.
 
-    Results are memoized per config fingerprint (path + mtime); config.yaml is
-    re-parsed only when the config file changes or a new Scorer is constructed
-    (which happens on config reload via a new Router).
+    Config-derived results are memoized per config fingerprint (path + mtime);
+    config.yaml is re-parsed only when the config file changes or a new Scorer
+    is constructed (which happens on config reload via a new Router).
+
+    The env-var fallback is intentionally NOT memoized: it is re-resolved per
+    request so a transient config-resolution failure self-heals instead of
+    pinning the fallback model for the process lifetime.
     """
     global _embedding_settings_cache
     fingerprint = _config_fingerprint()

@@ -302,10 +302,10 @@ embedding:
         scorer_mod._embedding_settings_cache = None
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
-        # No config file and no OPTIPROXAI_CONFIG -> discovery returns None,
-        # but load_config() in the scorer's try block still resolves via config
-        # discovery. Force it to raise so the env fallback is reached, then
-        # succeed so the config path is taken.
+        # A valid config path exists and OPTIPROXAI_CONFIG points at it, but
+        # load_config() is patched to raise on the first call (a transient
+        # failure) and succeed on the second, so we exercise: call 1 reaches
+        # the env fallback, call 2 resolves from config.
         config_path = tmp_path / "config.yaml"
         config_path.write_text(
             """
