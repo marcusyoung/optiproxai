@@ -618,7 +618,7 @@ uv build
 
 ## Credits
 
-- Based on [kani](https://github.com/tumf/kani) by [tumf](https://github.com/tumf) under the MIT license
+- Originally based on [kani](https://github.com/tumf/kani) by [tumf](https://github.com/tumf) under the MIT license
 - Scoring logic ported from [ClawRouter](https://github.com/BlockRunAI/ClawRouter) under the MIT license
 
 ## License
