@@ -309,10 +309,10 @@ model_rules:
     provider: "doubleword"
     capabilities: [tools, json_mode]
     extra_body:
-      service_tier: flex   # inject extra request-body fields for this model
+      prompt_cache_key: "opx-kimi-k3"   # route requests to the same inference worker
 ```
 
-`model_rules` is the primary metadata key. The legacy `model_capabilities` key is accepted only when `model_rules` is unset. The optional `extra_body` field injects extra request-body fields for any candidate matching the rule (e.g. `service_tier: flex` for Doubleword async); it uses the same prefix/provider precedence as `reasoning_style` and is merged last, so its values win over client-provided fields.
+`model_rules` is the primary metadata key. The legacy `model_capabilities` key is accepted only when `model_rules` is unset. The optional `extra_body` field injects extra request-body fields for any candidate matching the rule (e.g. `prompt_cache_key` to improve cache-hit routing); it uses the same prefix/provider precedence as `reasoning_style` and is merged last, so its values win over client-provided fields. Use the dedicated `async_mode` config for async/batch routing instead of `extra_body`.
 
 ## Async / batch routing
 
