@@ -1,10 +1,10 @@
 ---
 id: TASK-10
 title: Refactor async_mode to split provider mechanism from model opt-in
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-18 22:03'
-updated_date: '2026-08-18 22:41'
+updated_date: '2026-08-18 23:14'
 labels:
   - refactor
 dependencies:
@@ -161,3 +161,22 @@ Ignored (vestigial). Documented in README + config.example.yaml as a breaking ch
 | 4 | Run full CI gates and open PR | (none) | 3 | infra | ruff check, ruff format --check, pyright, pytest, uv build all pass; PR opened to main |
 | 5 | Migrate user config to opt-in shape (post-merge) | C:\Users\myoun\.config\optiproxai\config.yaml | 4 | infra | doubleword provider declares mechanism; 3 rules declare `enabled: true`; Hy3 untouched; `uv run optiproxai config` validates |
 <!-- SECTION:PLAN:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Implemented the async_mode mechanism/opt-in split (PR #5, merged as b2f3541). 
+
+What was built:
+- AsyncModeConfig validator reworked: pure-flag acceptance ({enabled: true} valid) + partial-mechanism rejection via model_fields_set (config.py).
+- _resolve_async_mode rewritten as field-by-field merge: mechanism fields (delivery/field/value/suffix) from highest-precedence explicit set across ModelEntry -> ModelRuleEntry -> ProviderConfig; enabled resolved from model/rule only (provider-level enabled ignored, vestigial). Returns merged AsyncModeConfig or None.
+- Runtime completeness check in _prepare_body_for_candidate: enabled: true without mechanism -> logger.warning + no-op.
+- tests/test_async_mode.py reworked for merge semantics (25 tests: opt-in merge, model-overrides-provider, provider-mechanism-alone no-op, provider-enabled-ignored, enabled-without-mechanism warning, validator pure-flag/partial-mechanism).
+- README.md async section and config.example.yaml rewritten for opt-in shape.
+
+Deviations from plan: none material. Used AsyncModeConfig.model_construct to bypass the validator when assembling the merged config (validator would reject an intentionally-incomplete merged result; completeness is checked at runtime). tests/test_proxy_reload.py required no changes (TestModelExtraBody unaffected).
+
+Test outcome: ruff check clean, ruff format --check clean, pyright 0 errors, pytest 343 passed, uv build success.
+
+Post-merge: migrated user config (~/.config/optiproxai/config.yaml) to opt-in shape - doubleword provider declares mechanism (delivery/field/value), 3 rules (DeepSeek-V4-Pro, GLM-5.2-FP8, kimi-k3) simplified to enabled: true, Hy3 untouched. Validated with `uv run optiproxai config` and a runtime resolution smoke test (3 async models resolve enabled: true + provider mechanism; Hy3 resolves enabled: false).
+<!-- SECTION:FINAL_SUMMARY:END -->
