@@ -3,10 +3,10 @@ id: TASK-14
 title: >-
   Inject cache_control markers into stable prefix for opt-in caching providers
   (Doubleword)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-08-19 14:55'
-updated_date: '2026-08-19 15:25'
+updated_date: '2026-08-19 17:11'
 labels: []
 dependencies: []
 references:
@@ -91,6 +91,24 @@ If `content_part_policy.mode: "normalize"` is set for a model, `_normalize_conte
 - Testing context: 2026-08-19 provider cache tests confirmed Doubleword caches 2005 tokens with marker, 0 without
 <!-- SECTION:DESCRIPTION:END -->
 
+## Acceptance Criteria
+<!-- AC:BEGIN -->
+- [x] #1 `cache_control` config block on ProviderConfig with enabled/ttl/target fields
+- [x] #2 Optional `cache_control` override on ModelRuleEntry (same fields)
+- [x] #3 `cache_control` injected into system message content (last block) or tools array (last object) per config target
+- [x] #4 String system content converted to array form before injection
+- [x] #5 Client-provided `cache_control` markers preserved (no double-injection, body-wide check)
+- [x] #6 Injection happens after content_part_policy normalization so markers survive
+- [x] #7 4-breakpoint limit respected (skip injection when limit already reached)
+- [x] #8 No injection when no system message exists (target: system) or no tools array (target: tools)
+- [x] #9 Config example in config.example.yaml updated with doubleword cache_control example
+- [x] #10 uv run ruff check src/ passes
+- [x] #11 uv run ruff format --check src/ tests/ passes
+- [x] #12 uv run pyright src/ passes
+- [x] #13 uv run pytest tests/ -q passes
+- [x] #14 Tests: injection on string system content, array system content, tools target, no system message, client already has markers, content_part_policy normalize interaction, 4-breakpoint limit
+<!-- AC:END -->
+
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
@@ -142,6 +160,10 @@ providers:
 
 ## Scope
 Single-task scope — no backlog subtasks (SDD Phase 2 skipped per "plan fits in a single task"). The five steps are tracked as todos during implementation.
+
+PR review fix (review #7): skip injection when ANY cache_control marker exists anywhere in the body (body-wide check, not just landing block) — preserves client caching boundaries; matches _has_explicit_reasoning_control pattern.
+
+PR review fix (review #7): _apply_cache_control docstring documents identity semantics — skip paths return the original body unchanged; only the injection path returns a shallow copy.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
@@ -161,4 +183,31 @@ All Doubleword models in `~/.config/optiproxai/config.yaml` and their cache pric
 Provider-level `cache_control` injection (TASK-14 design) fixes all three caching-capable models with one config flag. Hy3 is unaffected: Doubleword docs confirm markers are silently ignored on models without cache pricing, billed at standard rates — always safe to include.
 
 Prices shown are async (flex) where applicable since all three caching models have `async_mode: enabled: true` in config. Realtime prices are higher but discounts are similar (80-90%).
+
+Production validation (2026-08-19, temp test profile + tier_override through the live proxy, then reverted): kimi-k3 flex cache_read=2005, cache_write=0, prompt=2101; kimi-k3 sync cache_read=2005, cache_write=2005; GLM-5.2-FP8 flex cache_read=1687, cache_write=1687. Cache discounts (90%/80%) confirmed live in both flex and sync.
+
+Direct model-name passthrough bypasses _prepare_body_for_candidate (no injection) — correct; real opencode traffic uses the routing path.
+
+Test count: 13 tests in TestCacheControlInjection (string/array system, tools target, no system/no tools, client marker on landing block, client marker elsewhere, breakpoint limit, normalize interaction, disabled, rule>provider precedence, rule opt-out, no in-place mutation). Full suite 357 passed.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+PR #7 (squash merge ce43e24) — inject cache_control markers into the stable prefix for opt-in caching providers.
+
+What changed:
+- Added CacheControlConfig (enabled/ttl/target/max_breakpoints) to ProviderConfig (config.py:191) and optional ModelRuleEntry override (config.py:451). Resolution is presence-based highest-precedence-wins (decision doc-7): best-matching ModelRuleEntry.cache_control → ProviderConfig.cache_control → none. No ModelEntry field, no router.py changes.
+- proxy.py: new _resolve_cache_control, _count_cache_control_markers, _apply_cache_control; wired as the final step of _prepare_body_for_candidate (after sanitize/normalize/extra_body/async_mode) so content_part_policy normalization cannot strip markers.
+- target system: marker on last content block of the first system message; string content converted to [{type:text,text,cache_control}]. target tools: marker on last tool object. Skips when no system message / no tools array. Skips entirely when ANY client cache_control marker exists in the body (body-wide check, preserves client boundaries). Respects max_breakpoints (default 4). Shallow-copies mutated containers only; original body never mutated.
+
+Docs: config.example.yaml cache_control examples (provider + rule) and README "Prompt caching (cache_control)" section.
+
+Tests: 13 tests in TestCacheControlInjection (tests/test_proxy_reload.py) covering string/array system content, tools target, no system/no tools, client marker on landing block, client marker elsewhere, breakpoint limit, normalize interaction, disabled, rule>provider precedence, rule opt-out, no in-place mutation.
+
+Validation: ruff check, ruff format --check, pyright (0 errors), full suite 357 passed.
+
+Production validation: live proxy test with temp profile + tier_override confirmed 2005-token cache reads on kimi-k3 (90% discount) and 1687 on GLM-5.2-FP8 (80% discount) in flex and sync modes. Permanent cache_control block (enabled true / ttl 1h / target system / max_breakpoints 4) left on doubleword provider only; temp config reverted.
+
+Follow-ups: TASK-12 (dashboard cache metrics), TASK-13 (response headers for cache tokens), monitor Doubleword dashboard for production cache discounts.
+<!-- SECTION:FINAL_SUMMARY:END -->
