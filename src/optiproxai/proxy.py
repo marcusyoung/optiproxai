@@ -1852,6 +1852,7 @@ async def chat_completions(request: Request):
                 required_capabilities=required_capabilities,
                 session_key=session_key,
                 tier_override=tier_override,
+                tools=body.get("tools"),
             )
         except CapabilityNotSatisfiedError:
             logger.warning(
@@ -2153,6 +2154,7 @@ async def route_debug(request: Request):
             profile=profile,
             required_capabilities=required_capabilities,
             tier_override=tier_override,
+            tools=body.get("tools"),
         )
     except CapabilityNotSatisfiedError:
         logger.warning(

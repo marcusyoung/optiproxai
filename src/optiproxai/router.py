@@ -215,6 +215,7 @@ class Router:
         required_capabilities: set[str] | None = None,
         session_key: str | None = None,
         tier_override: str | None = None,
+        tools: list[dict[str, Any]] | None = None,
     ) -> RoutingDecision:
         """Route a chat request to the right model+provider.
 
@@ -227,6 +228,8 @@ class Router:
             session_key: Optional session key for session-sticky primary selection.
             tier_override: If set to a valid tier (SIMPLE/MEDIUM/COMPLEX/REASONING,
                    case-insensitive), skips the scorer and pins the tier.
+            tools: Optional OpenAI ``tools`` array (tool schemas) sent upstream;
+                   included in the prompt-size estimate for input-limit filtering.
 
         Returns:
             A RoutingDecision with all the info needed to proxy the request.
@@ -319,7 +322,7 @@ class Router:
 
         # --- Look up model in profile tier config with capability/input-limit filtering ---
         resolved_tier, tier_cfg = self._resolve_tier_config(profile_cfg, tier)
-        prompt_tokens = _estimate_tokens(messages)
+        prompt_tokens = _estimate_tokens(messages, tools=tools)
         log.debug(
             "Estimated prompt tokens for routing profile=%s tier=%s tokens=%d",
             profile,
