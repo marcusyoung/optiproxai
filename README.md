@@ -227,6 +227,50 @@ Profiles are examples. Tune names, strategies, and model mappings for your workl
 | `optiproxai/premium` | Best quality models | Critical tasks |
 | `optiproxai/agentic` | Tool-use optimized | Agent workflows |
 
+### Primary selection: round-robin vs session-sticky
+
+When a tier lists more than one `primary` candidate, OptiProxAI must decide which one to use. Control this per tier with `primary_selection`:
+
+- `round_robin` (default): cycles through the candidates across requests, balancing load.
+- `session_sticky`: deterministically pins a conversation to one candidate so repeated requests in the same session hit the same model/provider — useful for preserving prefix-cache locality.
+
+`session_sticky` needs a stable session key, read from the HTTP header named by `routing.session_header` (default `X-Session-Id`). The proxy computes `hash(session_key) % len(candidates)` to pick the candidate, so the same key always maps to the same one. If the header is absent, the tier falls back to round-robin (no regression). `session_sticky` only takes effect when the tier has more than one primary candidate; with a single candidate that model is always used.
+
+Send the session key from any OpenAI-compatible client by adding the header:
+
+```bash
+curl http://localhost:18420/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "X-Session-Id: my-conversation-123" \
+  -d '{
+    "model": "optiproxai/auto",
+    "messages": [{"role": "user", "content": "explain quicksort"}]
+  }'
+```
+
+Config example:
+
+```yaml
+routing:
+  session_header: X-Session-Id   # header the proxy reads for the session key
+
+profiles:
+  auto:
+    tiers:
+      SIMPLE:
+        primary:
+          - "anthropic/claude-haiku"
+          - "google/gemini-flash"
+        primary_selection: session_sticky
+      MEDIUM:
+        primary: "gpt-4o-mini"
+        primary_selection: round_robin   # default; can be omitted
+      COMPLEX:
+        primary: "gpt-4o"
+      REASONING:
+        primary: "gpt-4o"
+```
+
 ## Minimal configuration
 
 `config.yaml`:
