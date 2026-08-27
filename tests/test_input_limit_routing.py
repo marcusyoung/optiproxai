@@ -173,7 +173,9 @@ class TestInputLimitRouting:
     def test_long_request_skips_too_small_primary(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000)
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000
+        )
         cfg = _config(
             tiers=_all_tiers(
                 "unused",
@@ -195,7 +197,9 @@ class TestInputLimitRouting:
     def test_unknown_max_input_tokens_remains_eligible(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000)
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000
+        )
         cfg = _config(
             tiers=_all_tiers(
                 "unused",
@@ -217,7 +221,9 @@ class TestInputLimitRouting:
     def test_prompt_equal_to_max_input_tokens_remains_eligible(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("optiproxai.router._estimate_tokens", lambda messages, **kwargs: 100)
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 100
+        )
         cfg = _config(
             tiers=_all_tiers(
                 "unused",
@@ -239,7 +245,9 @@ class TestInputLimitRouting:
     def test_fallback_can_satisfy_long_input(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000)
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000
+        )
         cfg = _config(
             tiers=_all_tiers(
                 "unused",
@@ -260,7 +268,9 @@ class TestInputLimitRouting:
     def test_higher_tier_does_not_silently_satisfy_long_input_without_capabilities(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000)
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000
+        )
         cfg = _config(
             tiers={
                 "MEDIUM": TierModelConfig(
@@ -282,7 +292,9 @@ class TestInputLimitRouting:
     def test_higher_tier_can_satisfy_capability_constrained_long_input(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000)
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000
+        )
         cfg = _config(
             tiers={
                 "MEDIUM": TierModelConfig(
@@ -336,7 +348,9 @@ class TestInputLimitRouting:
     def test_cooldown_applies_after_input_limit_filtering(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000)
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000
+        )
         cfg = _config(
             tiers=_all_tiers(
                 "unused",
@@ -363,7 +377,9 @@ class TestInputLimitRouting:
     def test_raises_when_all_known_limit_candidates_are_over_limit(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000)
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000
+        )
         cfg = _config(
             tiers={
                 "MEDIUM": TierModelConfig(
@@ -388,7 +404,9 @@ class TestInputLimitRouting:
     def test_cooldown_ignore_never_reintroduces_over_limit_candidate(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr("optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000)
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 1000
+        )
         cfg = _config(
             tiers=_all_tiers(
                 "unused",
