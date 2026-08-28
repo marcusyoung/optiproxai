@@ -547,6 +547,42 @@ def _collect_models(state: RuntimeState) -> list[dict[str, Any]]:
     return data
 
 
+def _extract_cache_usage(
+    usage: dict[str, Any] | None,
+) -> tuple[int, int, int]:
+    """Extract cache token counts from an upstream usage object.
+
+    Returns ``(cached_tokens, cache_read_input_tokens,
+    cache_creation_input_tokens)`` with tolerance for provider-specific field
+    names:
+
+    - OpenAI-compatible / Requesty / Synthetic / Doubleword:
+      ``cached_tokens`` or nested ``prompt_tokens_details.cached_tokens``.
+    - Anthropic / Doubleword: ``cache_read_input_tokens`` and
+      ``cache_creation_input_tokens`` at the top level.
+
+    Missing or non-numeric values coerce to 0.  Raw values are stored as
+    reported; normalization for double-reported fields happens in the
+    dashboard query layer.
+    """
+    if not usage:
+        return 0, 0, 0
+
+    def _int_or_zero(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    cached = _int_or_zero(
+        usage.get("cached_tokens")
+        or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+    )
+    cache_read = _int_or_zero(usage.get("cache_read_input_tokens"))
+    cache_creation = _int_or_zero(usage.get("cache_creation_input_tokens"))
+    return cached, cache_read, cache_creation
+
+
 def _log_usage(
     model: str,
     provider: str | None,
@@ -563,6 +599,7 @@ def _log_usage(
     prompt = usage.get("prompt_tokens", 0)
     completion = usage.get("completion_tokens", 0)
     total = usage.get("total_tokens", 0) or (prompt + completion)
+    cached, cache_read, cache_creation = _extract_cache_usage(usage)
     # Feed the session-keyed last-context cache with the provider-reported
     # prompt size so route() can gate max_input_tokens against ground truth
     # (decision record doc-8).
@@ -580,6 +617,9 @@ def _log_usage(
             f"total={total}",
         ]
     )
+    if cached or cache_read or cache_creation:
+        parts.append(f"cache_read={max(cached, cache_read)}")
+        parts.append(f"cache_write={cache_creation}")
     if profile:
         parts.append(f"profile={profile}")
     if elapsed_ms is not None:
@@ -598,6 +638,9 @@ def _log_usage(
         prompt_tokens=prompt,
         completion_tokens=completion,
         total_tokens=total,
+        cached_tokens=cached,
+        cache_read_input_tokens=cache_read,
+        cache_creation_input_tokens=cache_creation,
         elapsed_ms=elapsed_ms,
     )
 

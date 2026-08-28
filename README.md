@@ -459,6 +459,31 @@ Injection rules:
 - Skips silently when the target container is missing (no system message, or no tools array).
 - Markers on models without cache pricing (e.g. `tencent/Hy3-FP8` on Doubleword) are ignored upstream and billed at standard rates — always safe to include.
 
+### Cache metrics in the dashboard
+
+OptiProxAI records cache token counts from the upstream `usage` object (tolerating provider-specific field names: Anthropic's `cache_read_input_tokens`/`cache_creation_input_tokens`, OpenAI-compatible nested `prompt_tokens_details.cached_tokens`, Synthetic's top-level `cached_tokens`) and surfaces them in a **Cache Metrics** dashboard section: hit rate as a percentage of input tokens, cache read/write token totals per window (24h/7d/30d), and a per-model table.
+
+> **Limitation:** cache metrics only reflect what providers actually report. A provider that caches silently (no cache fields in its `usage` response) or one where caching is unsupported for a given model is indistinguishable from a provider that never caches — both render as zero. For example, Doubleword ignores `cache_control` markers on models without cache pricing (e.g. `tencent/Hy3-FP8`) and returns no cache fields for them. Treat zero/blank cache columns as "no cache data reported," not proof that no caching occurred.
+
+### Estimating cache savings (`pricing`)
+
+Add optional `pricing` metadata (USD per 1M tokens) to a model entry or a model rule and the dashboard's cache table shows an estimated savings column:
+
+```yaml
+profiles:
+  auto:
+    tiers:
+      COMPLEX:
+        primary:
+          - model: deepseek-v4
+            pricing:
+              input_per_mtok: 2.50        # USD per 1M tokens
+              cache_read_per_mtok: 0.25   # cached prefix read price
+              cache_write_per_mtok: 3.75  # cache write premium (optional)
+```
+
+Savings are estimated as `(input − cache_read) × read_tokens + (input − cache_write) × write_tokens` per 1M tokens. Models without `pricing` metadata render `-` in the savings column. Pricing is display-only metadata; it never affects routing.
+
 ## API endpoints
 
 | Endpoint | Method | Description |
@@ -509,7 +534,7 @@ OptiProxAI ships a live analytics dashboard. Start the proxy, then open:
 http://localhost:18420/dashboard
 ```
 
-The dashboard shows request volume, tier distribution, average scores and confidence, model usage, and daily trends. It supports filtering by routing profile and a light/dark theme toggle.
+The dashboard shows request volume, tier distribution, average scores and confidence, model usage, cache metrics (hit rate, cache read/write tokens, estimated savings), and daily trends. It supports filtering by routing profile and a light/dark theme toggle.
 
 Data is ingested automatically from the JSONL routing and execution logs into a SQLite database at `$XDG_DATA_HOME/optiproxai/dashboard.db` (default `~/.local/share/optiproxai/dashboard.db`). The dashboard backfills recent logs on page load, so it works even if the proxy was restarted.
 

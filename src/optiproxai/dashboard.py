@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from html import escape
 from typing import Any
 
-from optiproxai.config import load_config
+from optiproxai.config import ModelPricingConfig, load_config
 from optiproxai.dirs import data_dir, log_dir
 
 
@@ -77,6 +77,9 @@ def _init_dashboard_db() -> None:
                 prompt_tokens INTEGER DEFAULT 0,
                 completion_tokens INTEGER DEFAULT 0,
                 total_tokens INTEGER DEFAULT 0,
+                cached_tokens INTEGER DEFAULT 0,
+                cache_read_input_tokens INTEGER DEFAULT 0,
+                cache_creation_input_tokens INTEGER DEFAULT 0,
                 elapsed_ms REAL
             )
             """
@@ -87,6 +90,16 @@ def _init_dashboard_db() -> None:
         _ensure_column(conn, "routing_logs", "provider", "TEXT")
         _ensure_column(conn, "routing_logs", "profile", "TEXT")
         _ensure_column(conn, "routing_logs", "signals", "TEXT")
+        _ensure_column(conn, "execution_logs", "cached_tokens", "INTEGER DEFAULT 0")
+        _ensure_column(
+            conn, "execution_logs", "cache_read_input_tokens", "INTEGER DEFAULT 0"
+        )
+        _ensure_column(
+            conn,
+            "execution_logs",
+            "cache_creation_input_tokens",
+            "INTEGER DEFAULT 0",
+        )
 
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_routing_timestamp ON routing_logs(timestamp)"
@@ -296,9 +309,12 @@ def _insert_execution_record(conn: sqlite3.Connection, record: dict[str, Any]) -
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cached_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
             elapsed_ms
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             record["timestamp"],
@@ -313,6 +329,9 @@ def _insert_execution_record(conn: sqlite3.Connection, record: dict[str, Any]) -
             int(record.get("prompt_tokens") or 0),
             int(record.get("completion_tokens") or 0),
             int(record.get("total_tokens") or 0),
+            int(record.get("cached_tokens") or 0),
+            int(record.get("cache_read_input_tokens") or 0),
+            int(record.get("cache_creation_input_tokens") or 0),
             float(record["elapsed_ms"])
             if record.get("elapsed_ms") is not None
             else None,
@@ -378,6 +397,9 @@ def log_execution_event(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     total_tokens: int = 0,
+    cached_tokens: int = 0,
+    cache_read_input_tokens: int = 0,
+    cache_creation_input_tokens: int = 0,
     elapsed_ms: float | None = None,
 ) -> None:
     """Append a structured execution record for dashboard analytics."""
@@ -398,6 +420,9 @@ def log_execution_event(
             "prompt_tokens": int(prompt_tokens or 0),
             "completion_tokens": int(completion_tokens or 0),
             "total_tokens": int(total_tokens or 0),
+            "cached_tokens": int(cached_tokens or 0),
+            "cache_read_input_tokens": int(cache_read_input_tokens or 0),
+            "cache_creation_input_tokens": int(cache_creation_input_tokens or 0),
             "elapsed_ms": elapsed_ms,
         }
         day = _parse_iso(event_timestamp) or datetime.now(timezone.utc)
@@ -496,6 +521,69 @@ def _infer_provider(
                     )
 
     return cfg.default_provider
+
+
+def _resolve_model_pricing(model: str | None) -> ModelPricingConfig | None:
+    """Resolve display-only pricing metadata for a model (decision doc-10).
+
+    Exact model-name match across all profile tiers' ``ModelEntry`` objects
+    first, then longest-prefix match over ``model_rules``.  Returns ``None``
+    when config cannot be loaded or nothing matches.
+    """
+    if not model:
+        return None
+    try:
+        cfg = load_config()
+    except Exception:
+        return None
+
+    for profile_cfg in cfg.profiles.values():
+        for tier_cfg in profile_cfg.tiers.values():
+            for entry in tier_cfg.resolve_primary_candidate_entries():
+                if entry.model == model and entry.pricing is not None:
+                    return entry.pricing
+            for fb_entry in tier_cfg.resolve_fallback_candidate_entries():
+                if fb_entry.model == model and fb_entry.pricing is not None:
+                    return fb_entry.pricing
+
+    rule_candidates = [
+        entry
+        for entry in cfg.model_rules
+        if entry.pricing is not None and model.startswith(entry.prefix)
+        if entry.prefix != "*"
+    ]
+    if rule_candidates:
+        # Longest prefix wins; provider-specific before provider-agnostic on ties.
+        best = max(
+            rule_candidates,
+            key=lambda e: (len(e.prefix), 1 if e.provider else 0),
+        )
+        return best.pricing
+    return None
+
+
+def _estimate_cache_savings(
+    pricing: ModelPricingConfig | None,
+    cache_read_tokens: int,
+    cache_creation_tokens: int,
+) -> float | None:
+    """Estimate USD saved via prompt caching, or None when unpriced (doc-10)."""
+    if pricing is None or pricing.input_per_mtok is None:
+        return None
+    input_price = pricing.input_per_mtok
+    read_price = (
+        pricing.cache_read_per_mtok
+        if pricing.cache_read_per_mtok is not None
+        else input_price
+    )
+    write_price = (
+        pricing.cache_write_per_mtok
+        if pricing.cache_write_per_mtok is not None
+        else input_price
+    )
+    read_savings = (input_price - read_price) * cache_read_tokens / 1e6
+    write_cost = (write_price - input_price) * cache_creation_tokens / 1e6
+    return read_savings - write_cost
 
 
 def ingest_stderr_proxy_logs() -> int:
@@ -797,6 +885,93 @@ def _daily_trends(
     return data
 
 
+# Cache-hit metrics: hit tokens use a double-count guard because some
+# providers (e.g. Doubleword) report both prompt_tokens_details.cached_tokens
+# and cache_read_input_tokens for the same request (decision doc-9).
+_CACHE_HIT_SQL = """
+    CASE
+        WHEN COALESCE(cached_tokens, 0) > 0 THEN COALESCE(cached_tokens, 0)
+        ELSE COALESCE(cache_read_input_tokens, 0)
+    END
+"""
+
+
+def _cache_summary(
+    conn: sqlite3.Connection,
+    hours: int,
+    profiles: list[str] | tuple[str, ...] | None = None,
+) -> dict[str, Any]:
+    """Aggregate cache-hit totals for a time window."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    profile_sql, profile_params = _profile_filter_clause("profile", profiles)
+    row = conn.execute(
+        f"""
+        SELECT
+            COUNT(*) AS requests,
+            COUNT(*) FILTER (WHERE {_CACHE_HIT_SQL} > 0) AS cache_hits,
+            COALESCE(SUM({_CACHE_HIT_SQL}), 0) AS cache_read_tokens,
+            COALESCE(SUM(COALESCE(cache_creation_input_tokens, 0)), 0)
+                AS cache_creation_tokens,
+            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens
+        FROM execution_logs
+        WHERE timestamp > ?
+          {profile_sql}
+        """,
+        (cutoff, *profile_params),
+    ).fetchone()
+    hit_rate = 0.0
+    if row["prompt_tokens"]:
+        hit_rate = row["cache_read_tokens"] / row["prompt_tokens"]
+    return {
+        "hours": hours,
+        "requests": row["requests"] or 0,
+        "cache_hits": row["cache_hits"] or 0,
+        "cache_read_tokens": row["cache_read_tokens"] or 0,
+        "cache_creation_tokens": row["cache_creation_tokens"] or 0,
+        "prompt_tokens": row["prompt_tokens"] or 0,
+        "hit_rate": round(hit_rate, 4),
+    }
+
+
+def _cache_model_rows(
+    conn: sqlite3.Connection,
+    hours: int,
+    limit: int = 12,
+    profiles: list[str] | tuple[str, ...] | None = None,
+) -> list[dict[str, Any]]:
+    """Per model/provider cache read/write totals and hit rates."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    profile_sql, profile_params = _profile_filter_clause("profile", profiles)
+    rows = conn.execute(
+        f"""
+        SELECT
+            model,
+            provider,
+            COUNT(*) AS requests,
+            COUNT(*) FILTER (WHERE {_CACHE_HIT_SQL} > 0) AS cache_hits,
+            COALESCE(SUM({_CACHE_HIT_SQL}), 0) AS cache_read_tokens,
+            COALESCE(SUM(COALESCE(cache_creation_input_tokens, 0)), 0)
+                AS cache_creation_tokens,
+            COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens
+        FROM execution_logs
+        WHERE timestamp > ?
+          AND model IS NOT NULL
+          {profile_sql}
+        GROUP BY model, provider
+        ORDER BY cache_read_tokens DESC, cache_creation_tokens DESC, model ASC
+        LIMIT ?
+        """,
+        (cutoff, *profile_params, limit),
+    ).fetchall()
+    result = [dict(row) for row in rows]
+    for row in result:
+        hit_rate = 0.0
+        if row["prompt_tokens"]:
+            hit_rate = row["cache_read_tokens"] / row["prompt_tokens"]
+        row["hit_rate"] = round(hit_rate, 4)
+    return result
+
+
 def get_dashboard_stats(
     hours: int = 24,
     profiles: list[str] | tuple[str, ...] | None = None,
@@ -881,6 +1056,18 @@ def get_dashboard_stats(
             "30d": _model_usage_rows(conn, 24 * 30, profiles=selected_profiles),
         }
 
+        cache_summary = {
+            "24h": _cache_summary(conn, 24, selected_profiles),
+            "7d": _cache_summary(conn, 24 * 7, selected_profiles),
+            "30d": _cache_summary(conn, 24 * 30, selected_profiles),
+        }
+
+        cache_model_usage = {
+            "24h": _cache_model_rows(conn, 24, profiles=selected_profiles),
+            "7d": _cache_model_rows(conn, 24 * 7, profiles=selected_profiles),
+            "30d": _cache_model_rows(conn, 24 * 30, profiles=selected_profiles),
+        }
+
         daily = _daily_trends(conn, days=30, profiles=selected_profiles)
         last_updated_at = conn.execute(
             f"""
@@ -906,6 +1093,8 @@ def get_dashboard_stats(
             },
             "windows": windows,
             "model_usage": model_usage,
+            "cache_summary": cache_summary,
+            "cache_model_usage": cache_model_usage,
             "daily_trends": daily,
             "last_updated_at": last_updated_at,
         }
@@ -1094,6 +1283,69 @@ def _render_model_usage_table(rows: list[dict[str, Any]]) -> str:
             "Total",
             "Avg latency",
             "AVG TPS",
+        ],
+        table_rows,
+    )
+
+
+def _render_cache_summary_cards(cache_summary: dict[str, dict[str, Any]]) -> str:
+    """Render per-window cache stat cards (24h / 7d / 30d)."""
+    order = [("24h", "Last 24h"), ("7d", "Last 7d"), ("30d", "Last 30d")]
+    cards: list[str] = []
+    for key, label in order:
+        item = cache_summary.get(key) or {}
+        cards.append(
+            f"""
+            <div class="rounded-xl border border-border bg-card p-5 shadow-sm">
+                <div class="text-sm font-medium text-muted-foreground">{escape(label)}</div>
+                <div class="mt-1 text-3xl font-bold tracking-tight text-foreground">{escape(_fmt_percent(item.get("hit_rate", 0.0)))}</div>
+                <div class="text-xs text-muted-foreground mt-0.5">Cache hit rate</div>
+                <div class="grid grid-cols-2 gap-x-4 gap-y-3 mt-4 pt-4 border-t border-border">
+                    <div><span class="text-xs text-muted-foreground block">Cache read</span><span class="text-sm font-semibold text-foreground">{escape(_fmt_int(item.get("cache_read_tokens")))}</span></div>
+                    <div><span class="text-xs text-muted-foreground block">Cache write</span><span class="text-sm font-semibold text-foreground">{escape(_fmt_int(item.get("cache_creation_tokens")))}</span></div>
+                    <div><span class="text-xs text-muted-foreground block">Cache hits</span><span class="text-sm font-semibold text-foreground">{escape(_fmt_int(item.get("cache_hits")))} / {escape(_fmt_int(item.get("requests")))}</span></div>
+                    <div><span class="text-xs text-muted-foreground block">Input tokens</span><span class="text-sm font-semibold text-foreground">{escape(_fmt_int(item.get("prompt_tokens")))}</span></div>
+                </div>
+            </div>
+            """
+        )
+    return "\n".join(cards)
+
+
+def _fmt_savings(value: float | None) -> str:
+    """Format a USD savings estimate; em-dash when pricing is unavailable."""
+    if value is None:
+        return "-"
+    return f"${value:,.4f}"
+
+
+def _render_cache_model_table(rows: list[dict[str, Any]]) -> str:
+    table_rows: list[list[str]] = []
+    for row in rows:
+        pricing = _resolve_model_pricing(row.get("model"))
+        savings = _estimate_cache_savings(
+            pricing,
+            int(row.get("cache_read_tokens") or 0),
+            int(row.get("cache_creation_tokens") or 0),
+        )
+        table_rows.append(
+            [
+                escape(str(row.get("model") or "-")),
+                escape(str(row.get("provider") or "-")),
+                escape(_fmt_int(row.get("cache_read_tokens"))),
+                escape(_fmt_int(row.get("cache_creation_tokens"))),
+                escape(_fmt_percent(row.get("hit_rate", 0.0))),
+                escape(_fmt_savings(savings)),
+            ]
+        )
+    return _render_simple_table(
+        [
+            "Model",
+            "Provider",
+            "Cache read",
+            "Cache write",
+            "Hit rate",
+            "Est. savings",
         ],
         table_rows,
     )
@@ -1384,6 +1636,14 @@ def render_dashboard_html(stats: dict[str, Any]) -> str:
         f'        <div class="rounded-xl border border-border bg-card p-5 shadow-sm"><h3 class="text-base font-semibold text-foreground mb-3">24h</h3>{_render_model_usage_table(stats.get("model_usage", {}).get("24h", []))}</div>',
         f'        <div class="rounded-xl border border-border bg-card p-5 shadow-sm"><h3 class="text-base font-semibold text-foreground mb-3">7d</h3>{_render_model_usage_table(stats.get("model_usage", {}).get("7d", []))}</div>',
         f'        <div class="rounded-xl border border-border bg-card p-5 shadow-sm"><h3 class="text-base font-semibold text-foreground mb-3">30d</h3>{_render_model_usage_table(stats.get("model_usage", {}).get("30d", []))}</div>',
+        "    </div>",
+        # Cache metrics section
+        '    <div class="space-y-4">',
+        '        <h2 class="text-xl font-semibold tracking-tight">Cache Metrics</h2>',
+        '        <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">',
+        _render_cache_summary_cards(stats.get("cache_summary", {})),
+        "        </div>",
+        f'        <div class="rounded-xl border border-border bg-card p-5 shadow-sm"><h3 class="text-base font-semibold text-foreground mb-3">Cache by Model (7d)</h3>{_render_cache_model_table(stats.get("cache_model_usage", {}).get("7d", []))}</div>',
         "    </div>",
         # Daily rollup
         '    <div class="space-y-4">',
