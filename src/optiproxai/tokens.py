@@ -79,9 +79,9 @@ def _estimate_tokens(
     """Estimate token count for a message list using tiktoken when available.
 
     Counts every field the provider receives: ``role``, ``name``,
-    ``tool_call_id``, ``tool_calls`` arguments, and ``content`` for each
-    message, plus the ``tools``/``functions`` schema when supplied. Falls back
-    to ``chars/4`` if tiktoken cannot resolve an encoding.
+    ``tool_call_id``, ``tool_calls`` arguments, ``reasoning_content``, and
+    ``content`` for each message, plus the ``tools``/``functions`` schema when
+    supplied. Falls back to ``chars/4`` if tiktoken cannot resolve an encoding.
 
     Args:
         messages: OpenAI-style message list.
@@ -95,6 +95,8 @@ def _estimate_tokens(
         total += _count_str_tokens(enc, m.get("role"))
         total += _count_str_tokens(enc, m.get("name"))
         total += _count_str_tokens(enc, m.get("tool_call_id"))
+        # reasoning_content payloads are sent to providers that declare support.
+        total += _count_str_tokens(enc, m.get("reasoning_content"))
         # tool_calls (assistant messages) carry structured call args.
         for tc in m.get("tool_calls") or []:
             total += _count_str_tokens(enc, tc.get("id"))

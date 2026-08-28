@@ -22,6 +22,10 @@ from optiproxai.config import (
     resolve_env,
 )
 from optiproxai.fallback_backoff import FallbackBackoffState
+from optiproxai.last_context_cache import LastContextCache
+from optiproxai.last_context_cache import (
+    last_context_cache as _default_last_context_cache,
+)
 from optiproxai.tokens import _estimate_tokens
 
 log = logging.getLogger(__name__)
@@ -90,6 +94,7 @@ class RoutingDecision(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list)
     reasoning_effort: str | None = None  # tier-level reasoning effort override
     async_mode: AsyncModeConfig | None = None
+    session_key: str | None = None  # session the decision was routed for
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +196,7 @@ class Router:
         config: OptiproxaiConfig,
         *,
         fallback_backoff_state: FallbackBackoffState | None = None,
+        last_context_cache: LastContextCache | None = None,
     ) -> None:
         self.config = config
         self._rr_state: dict[tuple[str, str], int] = {}
@@ -198,6 +204,8 @@ class Router:
         self.fallback_backoff_state = fallback_backoff_state or FallbackBackoffState(
             config.smart_proxy.fallback_backoff
         )
+        # Last provider-reported prompt size per session, for input-limit gating.
+        self.last_context_cache = last_context_cache or _default_last_context_cache
         # Persistent scorer so feature_classifier.pkl is loaded at most once per
         # Router lifetime (a new Router is constructed on config reload).
         self._scorer: Any | None = None
@@ -323,6 +331,21 @@ class Router:
         # --- Look up model in profile tier config with capability/input-limit filtering ---
         resolved_tier, tier_cfg = self._resolve_tier_config(profile_cfg, tier)
         prompt_tokens = _estimate_tokens(messages, tools=tools)
+        # Err toward the larger prompt: the last provider-reported size for this
+        # session includes reasoning_content and provider-side template overhead
+        # the live estimate cannot see (decision record doc-8).
+        cached_prompt_tokens = (
+            self.last_context_cache.get(session_key) if session_key else None
+        )
+        if session_key and cached_prompt_tokens is not None:
+            if cached_prompt_tokens > prompt_tokens:
+                log.debug(
+                    "Using cached last-context prompt size session=%s cached=%d live=%d",
+                    session_key[:8] + "...",
+                    cached_prompt_tokens,
+                    prompt_tokens,
+                )
+                prompt_tokens = cached_prompt_tokens
         log.debug(
             "Estimated prompt tokens for routing profile=%s tier=%s tokens=%d",
             profile,
@@ -515,6 +538,7 @@ class Router:
             required_capabilities=sorted(list(required_capabilities)),
             reasoning_effort=tier_cfg.reasoning_effort,
             async_mode=primary_candidate.async_mode,
+            session_key=session_key,
         )
 
     def resolve_model(

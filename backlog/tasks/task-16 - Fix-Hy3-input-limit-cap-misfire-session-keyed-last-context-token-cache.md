@@ -1,10 +1,10 @@
 ---
 id: TASK-16
 title: 'Fix Hy3 input-limit cap misfire: session-keyed last-context token cache'
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-08-27 19:50'
-updated_date: '2026-08-27 19:50'
+updated_date: '2026-08-28 11:43'
 labels:
   - fallback
   - routing
@@ -17,6 +17,10 @@ references:
   - src/optiproxai/tokens.py
   - src/optiproxai/router.py
   - src/optiproxai/proxy.py
+documentation:
+  - >-
+    docs/decisions/doc-8 -
+    Session-keyed-last-context-token-cache-for-input-limit-gating.md
 priority: high
 type: bug
 ordinal: 20000
@@ -54,10 +58,58 @@ NOTE (verified 2026-08-27): the handoff's claim that tests/test_api_keys_proxy.p
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-1. Add session-keyed last-context cache state (dict + Lock, keyed by session ID) next to FallbackBackoffState.
-2. Thread X-Session-Id into _log_usage (via RoutingDecision.session_key or a param through _proxy_upstream) and write real provider prompt into the cache.
-3. In route(), read cache as max(cached_last_prompt, _estimate_tokens(...)); live estimate on first turn / cache miss.
-4. Add reasoning_content to _estimate_tokens or rely on prior-turn cache.
-5. Restart server, send an oversized analysis prompt, confirm cap log + DeepSeek-V4-Pro fallback.
-6. uv run pytest tests/test_input_limit_routing.py tests/test_api_keys_proxy.py -q ; commit.
+# Implementation Plan — TASK-016: Session-keyed last-context token cache
+
+## Problem
+Hy3 `max_input_tokens: 160000` cap misfires: `_estimate_tokens()` undercounts real prompts (notably `reasoning_content`, plus provider-side prompt-template overhead), so 168–190K-token prompts estimate under 160K, route to Hy3, and stall for the 300s read timeout before fallback. Robust fix (held decision): use `max(prior-turn provider prompt, live tiktoken estimate)`, erring toward the 1M DeepSeek-V4-Pro fallback.
+
+## Approach
+Provider-reported `usage.prompt_tokens` is ground truth for what the provider actually received. Cache it per session after each successful upstream call, and in `route()` estimate with `max(cached_last_prompt_tokens, live_estimate)`. First turn / no session header → live estimate only (current behaviour).
+
+### 1. New module `src/optiproxai/last_context_cache.py`
+- `LastContextCache` class mirroring `FallbackBackoffState`: `dict[str, int]` (session key → last provider prompt tokens) + `threading.Lock`.
+- Methods: `record(session_key, prompt_tokens)`, `get(session_key) -> int | None`, `clear()` (test helper).
+- Module-level singleton `last_context_cache` (process-local, like `_encoder_cache` in tokens.py / `_http` in proxy.py). Router accepts an optional `last_context_cache` ctor param defaulting to the singleton — same DI pattern as `fallback_backoff_state` — so tests can inject isolated instances.
+
+### 2. `src/optiproxai/tokens.py` — add `reasoning_content` to `_estimate_tokens`
+- In the per-message loop add `total += _count_str_tokens(enc, m.get("reasoning_content"))` (belt-and-braces for first-turn accuracy; the cache covers prior-turn ground truth).
+
+### 3. `src/optiproxai/router.py`
+- Add `session_key: str | None = None` field to `RoutingDecision`; populate it when constructing the decision in `route()` (session_key is already a `route()` parameter).
+- In `route()`: after `prompt_tokens = _estimate_tokens(messages, tools=tools)`, read `self.last_context_cache.get(session_key)` and use `max(live_estimate, cached)` when both present. Cache miss/None session → live estimate unchanged.
+
+### 4. `src/optiproxai/proxy.py` — feed the cache from the usage log path
+- In `_log_usage(...)`: after computing `prompt` from `usage`, if `decision is not None and decision.session_key`, call `last_context_cache.record(decision.session_key, prompt)`. This covers both streaming (last_usage in `_stream()` finally) and non-streaming call sites, since both already pass `decision=decision`.
+- No signature changes to `_proxy_upstream` or `_log_usage` needed — the session key rides on `RoutingDecision`.
+
+### 5. Tests
+- `tests/test_last_context_cache.py` (new): record/get/clear, overwrite-with-latest, lock-free read semantics, miss returns None.
+- `tests/test_input_limit_routing.py` (extend): cache-fed prompt exceeds cap → cap fires and falls back (`max(cached, live)`); first-turn (cache miss) uses live estimate; live estimate larger than cache wins; cache ignored when `session_key` is None.
+- Keep existing `monkeypatch.setattr("optiproxai.router._estimate_tokens", ...)` pattern working (cache read must compose with it).
+
+### 6. Verification & commit
+- `uv run pytest tests/test_last_context_cache.py tests/test_input_limit_routing.py tests/test_api_keys_proxy.py -q`
+- Full CI bar: ruff check, ruff format --check, pyright, pytest, uv build.
+- Manual: restart server, send oversized analysis prompt with X-Session-Id; confirm log `Skipping input-limit-ineligible candidate model=tencent/hy3 ... max_input_tokens=160000` and DeepSeek-V4-Pro (1M) fallback on turn 2+.
+- Commit working-tree changes on branch `task/TASK-016`.
+
+## Constraints / risks
+- Cache grows one int per session for process lifetime (small; acceptable process-local state, same lifetime model as FallbackBackoffState).
+- Cached value includes provider-side template overhead → errs large, which is the intended bias (1M fallback over 300s stall).
+- Clients not sending `X-Session-Id` get no cache benefit (unchanged behaviour).
+- Stale cache after conversation reset within same session id: cache only ever inflates the estimate; worst case is early escalation to the 1M model, never a misfire stall.
+- Held decisions preserved: analysis stays Hy3 @ 160000 cap; REASONING stays K3; MEDIUM+COMPLEX unified on glm-5.3-flash.
+
+## Task Manifest
+
+| # | Title | Files | Depends On | Labels | Acceptance Criterion |
+|---|---|---|---|---|---|
+| 1 | Create LastContextCache module | src/optiproxai/last_context_cache.py, tests/test_last_context_cache.py | — | logic, test | LastContextCache records/returns latest provider prompt tokens per session key and all its tests pass |
+| 2 | Count reasoning_content in _estimate_tokens | src/optiproxai/tokens.py | — | logic | _estimate_tokens includes reasoning_content fields in its token total |
+| 3 | Read cache in route() and store session_key on RoutingDecision | src/optiproxai/router.py | 1 | logic | route() uses max(cached_last_prompt, live_estimate) when session_key is set, live estimate otherwise |
+| 4 | Feed cache from _log_usage | src/optiproxai/proxy.py | 1, 3 | logic | USAGE logging path records provider prompt_tokens into the cache keyed by decision.session_key |
+| 5 | Add input-limit cache integration tests | tests/test_input_limit_routing.py | 1, 2, 3 | test | Cached oversized prompt skips Hy3-class candidates and selects the larger fallback model; all input-limit tests pass |
+| 6 | Verify, run CI checks, commit | — | 1, 2, 3, 4, 5 | infra | pytest subsets pass, ruff/pyright clean, changes committed |
+
+Fits a single task — no subtasks needed.
 <!-- SECTION:PLAN:END -->

@@ -41,6 +41,7 @@ from optiproxai.dashboard import (
     render_dashboard_html,
 )
 from optiproxai.fallback_backoff import FallbackBackoffState
+from optiproxai.last_context_cache import last_context_cache
 from optiproxai.router import (
     CapabilityNotSatisfiedError,
     FallbackEntry,
@@ -562,6 +563,11 @@ def _log_usage(
     prompt = usage.get("prompt_tokens", 0)
     completion = usage.get("completion_tokens", 0)
     total = usage.get("total_tokens", 0) or (prompt + completion)
+    # Feed the session-keyed last-context cache with the provider-reported
+    # prompt size so route() can gate max_input_tokens against ground truth
+    # (decision record doc-8).
+    if decision is not None and decision.session_key:
+        last_context_cache.record(decision.session_key, prompt)
     parts = []
     if request_id:
         parts.append(f"request_id={request_id}")
