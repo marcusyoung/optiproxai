@@ -227,16 +227,11 @@ Profiles are examples. Tune names, strategies, and model mappings for your workl
 | `optiproxai/premium` | Best quality models | Critical tasks |
 | `optiproxai/agentic` | Tool-use optimized | Agent workflows |
 
-### Primary selection: round-robin vs session-sticky
+### Session key
 
-When a tier lists more than one `primary` candidate, OptiProxAI must decide which one to use. Control this per tier with `primary_selection`:
-
-- `round_robin` (default): cycles through the candidates across requests, balancing load.
-- `session_sticky`: deterministically pins a conversation to one candidate so repeated requests in the same session hit the same model/provider — useful for preserving prefix-cache locality.
-
-`session_sticky` needs a stable session key, read from the HTTP header named by `routing.session_header` (default `X-Session-Id`). The proxy computes `hash(session_key) % len(candidates)` to pick the candidate, so the same key always maps to the same one. If the header is absent, the tier falls back to round-robin (no regression). `session_sticky` only takes effect when the tier has more than one primary candidate; with a single candidate that model is always used.
-
-Send the session key from any OpenAI-compatible client by adding the header:
+Some features key off the conversation the request belongs to. Clients identify
+the conversation with a stable session key sent in the HTTP header named by
+`routing.session_header` (default `X-Session-Id`):
 
 ```bash
 curl http://localhost:18420/v1/chat/completions \
@@ -248,12 +243,27 @@ curl http://localhost:18420/v1/chat/completions \
   }'
 ```
 
-Config example:
-
 ```yaml
 routing:
   session_header: X-Session-Id   # header the proxy reads for the session key
+```
 
+The session key is used by [session-sticky primary selection](#primary-selection-round-robin-vs-session-sticky)
+and [input-limit routing](#input-limit-routing). When the header is absent,
+features that need it degrade gracefully (see the sections below).
+
+### Primary selection: round-robin vs session-sticky
+
+When a tier lists more than one `primary` candidate, OptiProxAI must decide which one to use. Control this per tier with `primary_selection`:
+
+- `round_robin` (default): cycles through the candidates across requests, balancing load.
+- `session_sticky`: deterministically pins a conversation to one candidate so repeated requests in the same session hit the same model/provider — useful for preserving prefix-cache locality.
+
+`session_sticky` requires a [session key](#session-key). The proxy computes `hash(session_key) % len(candidates)` to pick the candidate, so the same key always maps to the same one. If the session header is absent, the tier falls back to round-robin (no regression). `session_sticky` only takes effect when the tier has more than one primary candidate; with a single candidate that model is always used.
+
+Config example:
+
+```yaml
 profiles:
   auto:
     tiers:
@@ -577,7 +587,14 @@ profiles:
         primary: [{model: "gpt-4o-mini", max_input_tokens: 128000}]
 ```
 
-During routing, OptiProxAI estimates the prompt token count (via tiktoken, falling back to chars/4) and filters model candidates in the scored tier whose `max_input_tokens` is lower than the estimate. When a model has no `max_input_tokens` configured, it is always considered eligible.
+During routing, OptiProxAI estimates the prompt token count and filters model candidates in the scored tier whose `max_input_tokens` is lower than the estimate. When a model has no `max_input_tokens` configured, it is always considered eligible.
+
+The estimate is the larger of two values, erring toward escalation rather than a mid-conversation failure:
+
+- **Live estimate**: tiktoken token count of the request (falling back to chars/4), covering `content`, `role`, `name`, `tool_call_id`, `tool_calls`, `reasoning_content`, and the `tools` schema.
+- **Last provider-reported prompt size for the session**: after each successful upstream call, the proxy caches the provider-reported `prompt_tokens` keyed by the [session key](#session-key). Provider-reported counts include overhead the live estimate cannot see (provider-side prompt templates, reasoning payloads), so the router uses `max(cached, live)` to avoid undercounting a continuation of a long conversation. On the first turn of a session — or when the session header is absent — only the live estimate is used.
+
+The cache is process-local and LRU-bounded (10,000 sessions); a stale cached value can only err toward escalating to a larger model, never toward stalling on a model whose limit is already exceeded.
 
 When no candidate in the scored tier can accept the prompt and required capabilities are declared, the router escalates to higher tiers (MEDIUM → COMPLEX → REASONING), applying the same input-limit filter to each tier's candidates. If no tier can accept the prompt, the proxy responds with HTTP 400 and error type `input_limit_not_satisfied`.
 
