@@ -4,7 +4,7 @@ title: 'Fix Hy3 input-limit cap misfire: session-keyed last-context token cache'
 status: In Progress
 assignee: []
 created_date: '2026-08-27 19:50'
-updated_date: '2026-08-28 11:49'
+updated_date: '2026-08-28 12:01'
 labels:
   - fallback
   - routing
@@ -122,4 +122,6 @@ Fits a single task — no subtasks needed.
 CI gate green: ruff check clean, 38 files formatted, pyright 0 errors, full pytest 368 passed, uv build OK. Subset: test_last_context_cache.py (6) + test_input_limit_routing.py (20 incl. 5 new cache tests) + test_api_keys_proxy.py (25) = 51 passed.
 
 NOT done: commit (blocked by user permission rule - changes staged, awaiting approval) and AC #4 manual verification (restart server, oversized analysis prompt with X-Session-Id, confirm cap log + DeepSeek-V4-Pro fallback).
+
+2026-08-28 PR #8 Copilot review fixes applied: (1) merged duplicate last_context_cache imports into one statement; (2) RoutingDecision.session_key now Field(exclude=True) so raw X-Session-Id never echoes via model_dump() (cli route + debug endpoint verified as model_dump call sites); (3)+(4) truthiness checks replaced with `is not None` in route() and _log_usage so empty-but-present headers follow the str|None contract; (5) LastContextCache bounded at 10,000 sessions with true LRU eviction (get() refreshes recency), max_sessions ctor param, ValueError on <1. New tests: eviction at capacity, recency refresh on record, LRU refresh on get, max_sessions validation. CI gate green: 371 passed, pyright 0 errors, format clean. Changes staged, commit still awaiting user approval.
 <!-- SECTION:NOTES:END -->
