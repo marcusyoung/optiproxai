@@ -566,7 +566,7 @@ def _log_usage(
     # Feed the session-keyed last-context cache with the provider-reported
     # prompt size so route() can gate max_input_tokens against ground truth
     # (decision record doc-8).
-    if decision is not None and decision.session_key:
+    if decision is not None and decision.session_key is not None:
         last_context_cache.record(decision.session_key, prompt)
     parts = []
     if request_id:

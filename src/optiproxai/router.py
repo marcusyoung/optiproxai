@@ -22,8 +22,8 @@ from optiproxai.config import (
     resolve_env,
 )
 from optiproxai.fallback_backoff import FallbackBackoffState
-from optiproxai.last_context_cache import LastContextCache
 from optiproxai.last_context_cache import (
+    LastContextCache,
     last_context_cache as _default_last_context_cache,
 )
 from optiproxai.tokens import _estimate_tokens
@@ -94,7 +94,9 @@ class RoutingDecision(BaseModel):
     required_capabilities: list[str] = Field(default_factory=list)
     reasoning_effort: str | None = None  # tier-level reasoning effort override
     async_mode: AsyncModeConfig | None = None
-    session_key: str | None = None  # session the decision was routed for
+    # Session the decision was routed for. Internal only: excluded from
+    # model_dump() so the raw X-Session-Id never echoes to callers or logs.
+    session_key: str | None = Field(default=None, exclude=True)
 
 
 # ---------------------------------------------------------------------------
@@ -335,9 +337,11 @@ class Router:
         # session includes reasoning_content and provider-side template overhead
         # the live estimate cannot see (decision record doc-8).
         cached_prompt_tokens = (
-            self.last_context_cache.get(session_key) if session_key else None
+            self.last_context_cache.get(session_key)
+            if session_key is not None
+            else None
         )
-        if session_key and cached_prompt_tokens is not None:
+        if session_key is not None and cached_prompt_tokens is not None:
             if cached_prompt_tokens > prompt_tokens:
                 log.debug(
                     "Using cached last-context prompt size session=%s cached=%d live=%d",
