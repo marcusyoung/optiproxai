@@ -14,6 +14,7 @@ from optiproxai.config import (
     TierModelConfig,
 )
 from optiproxai.fallback_backoff import FallbackBackoffState
+from optiproxai.last_context_cache import LastContextCache
 from optiproxai.router import InputLimitNotSatisfiedError, Router
 
 
@@ -429,3 +430,152 @@ class TestInputLimitRouting:
 
         assert decision.model == "large-cooled"
         assert decision.model != "small"
+
+
+class TestLastContextCacheRouting:
+    """route() gates input limits against max(cached provider prompt, live estimate)."""
+
+    def test_cached_oversized_prompt_skips_capped_primary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 100
+        )
+        cfg = _config(
+            tiers=_all_tiers(
+                "unused",
+                MEDIUM=TierModelConfig(
+                    primary=[
+                        {"model": "capped", "max_input_tokens": 160000},
+                        {"model": "large", "max_input_tokens": 1000000},
+                    ],
+                ),
+            )
+        )
+        cache = LastContextCache()
+        cache.record("session-1", 185000)
+        router = Router(cfg, last_context_cache=cache)
+        _force_tier(router, "MEDIUM")
+
+        decision = router.route(_messages(), profile="auto", session_key="session-1")
+
+        assert decision.model == "large"
+
+    def test_first_turn_cache_miss_uses_live_estimate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 100
+        )
+        cfg = _config(
+            tiers=_all_tiers(
+                "unused",
+                MEDIUM=TierModelConfig(
+                    primary=[
+                        {"model": "capped", "max_input_tokens": 160000},
+                        {"model": "large", "max_input_tokens": 1000000},
+                    ],
+                ),
+            )
+        )
+        router = Router(cfg, last_context_cache=LastContextCache())
+        _force_tier(router, "MEDIUM")
+
+        decision = router.route(
+            _messages(), profile="auto", session_key="fresh-session"
+        )
+
+        assert decision.model == "capped"
+
+    def test_live_estimate_larger_than_cache_wins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 200000
+        )
+        cfg = _config(
+            tiers=_all_tiers(
+                "unused",
+                MEDIUM=TierModelConfig(
+                    primary=[
+                        {"model": "capped", "max_input_tokens": 160000},
+                        {"model": "large", "max_input_tokens": 1000000},
+                    ],
+                ),
+            )
+        )
+        cache = LastContextCache()
+        cache.record("session-1", 1000)
+        router = Router(cfg, last_context_cache=cache)
+        _force_tier(router, "MEDIUM")
+
+        decision = router.route(_messages(), profile="auto", session_key="session-1")
+
+        assert decision.model == "large"
+
+    def test_no_session_key_ignores_cache(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 100
+        )
+        cfg = _config(
+            tiers=_all_tiers(
+                "unused",
+                MEDIUM=TierModelConfig(
+                    primary=[
+                        {"model": "capped", "max_input_tokens": 160000},
+                        {"model": "large", "max_input_tokens": 1000000},
+                    ],
+                ),
+            )
+        )
+        cache = LastContextCache()
+        cache.record("session-1", 185000)
+        router = Router(cfg, last_context_cache=cache)
+        _force_tier(router, "MEDIUM")
+
+        decision = router.route(_messages(), profile="auto")
+
+        assert decision.model == "capped"
+
+    def test_empty_session_key_uses_cache(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 100
+        )
+        cfg = _config(
+            tiers=_all_tiers(
+                "unused",
+                MEDIUM=TierModelConfig(
+                    primary=[
+                        {"model": "capped", "max_input_tokens": 160000},
+                        {"model": "large", "max_input_tokens": 1000000},
+                    ],
+                ),
+            )
+        )
+        cache = LastContextCache()
+        cache.record("", 185000)
+        router = Router(cfg, last_context_cache=cache)
+        _force_tier(router, "MEDIUM")
+
+        decision = router.route(_messages(), profile="auto", session_key="")
+
+        assert decision.model == "large"
+
+    def test_decision_carries_session_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 100
+        )
+        cfg = _config(tiers=_all_tiers("unused"))
+        router = Router(cfg, last_context_cache=LastContextCache())
+        _force_tier(router, "MEDIUM")
+
+        decision = router.route(_messages(), profile="auto", session_key="session-1")
+
+        assert decision.session_key == "session-1"
+        assert "session_key" not in decision.model_dump()
