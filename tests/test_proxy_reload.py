@@ -18,6 +18,7 @@ from optiproxai.config import (
     ModelRuleEntry,
     ProviderConfig,
 )
+from optiproxai.last_context_cache import LastContextCache
 from optiproxai.proxy import RuntimeState, app, configure
 from optiproxai.router import Router, RoutingDecision
 from optiproxai.scorer import ClassificationResult, Tier
@@ -697,6 +698,29 @@ class TestReasoningContentCompatibility:
         )
 
         assert with_metadata.tier == without_metadata.tier
+
+
+class TestUsageLogging:
+    def test_log_usage_records_empty_session_key(self, monkeypatch: pytest.MonkeyPatch):
+        cache = LastContextCache()
+        monkeypatch.setattr(proxy_mod, "last_context_cache", cache)
+
+        proxy_mod._log_usage(
+            model="test-model",
+            provider="dummy",
+            usage={"prompt_tokens": 123, "completion_tokens": 4, "total_tokens": 127},
+            decision=RoutingDecision(
+                model="test-model",
+                provider="dummy",
+                base_url="http://dummy.example",
+                tier="MEDIUM",
+                score=0.5,
+                confidence=1.0,
+                session_key="",
+            ),
+        )
+
+        assert cache.get("") == 123
 
 
 class TestModelExtraBody:

@@ -539,6 +539,32 @@ class TestLastContextCacheRouting:
 
         assert decision.model == "capped"
 
+    def test_empty_session_key_uses_cache(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "optiproxai.router._estimate_tokens", lambda messages, **kwargs: 100
+        )
+        cfg = _config(
+            tiers=_all_tiers(
+                "unused",
+                MEDIUM=TierModelConfig(
+                    primary=[
+                        {"model": "capped", "max_input_tokens": 160000},
+                        {"model": "large", "max_input_tokens": 1000000},
+                    ],
+                ),
+            )
+        )
+        cache = LastContextCache()
+        cache.record("", 185000)
+        router = Router(cfg, last_context_cache=cache)
+        _force_tier(router, "MEDIUM")
+
+        decision = router.route(_messages(), profile="auto", session_key="")
+
+        assert decision.model == "large"
+
     def test_decision_carries_session_key(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -552,3 +578,4 @@ class TestLastContextCacheRouting:
         decision = router.route(_messages(), profile="auto", session_key="session-1")
 
         assert decision.session_key == "session-1"
+        assert "session_key" not in decision.model_dump()
