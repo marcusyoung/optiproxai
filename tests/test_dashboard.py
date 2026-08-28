@@ -459,6 +459,18 @@ class TestCacheUsageExtraction:
         assert _extract_cache_usage({"cached_tokens": "oops"}) == (0, 0, 0)
         assert _extract_cache_usage({"prompt_tokens_details": None}) == (0, 0, 0)
 
+    def test_explicit_zero_top_level_wins_over_nested(self):
+        from optiproxai.proxy import _extract_cache_usage
+
+        # A legitimate cached_tokens: 0 must not fall through to the
+        # nested prompt_tokens_details value (PR #9 review).
+        assert _extract_cache_usage(
+            {
+                "cached_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 4096},
+            }
+        ) == (0, 0, 0)
+
     def test_doubleword_double_report_kept_raw(self):
         from optiproxai.proxy import _extract_cache_usage
 

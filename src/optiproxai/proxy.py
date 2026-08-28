@@ -575,8 +575,9 @@ def _extract_cache_usage(
             return 0
 
     cached = _int_or_zero(
-        usage.get("cached_tokens")
-        or (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
+        usage["cached_tokens"]
+        if "cached_tokens" in usage
+        else (usage.get("prompt_tokens_details") or {}).get("cached_tokens")
     )
     cache_read = _int_or_zero(usage.get("cache_read_input_tokens"))
     cache_creation = _int_or_zero(usage.get("cache_creation_input_tokens"))

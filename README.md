@@ -482,7 +482,7 @@ profiles:
               cache_write_per_mtok: 3.75  # cache write premium (optional)
 ```
 
-Savings are estimated as `(input − cache_read) × read_tokens + (input − cache_write) × write_tokens` per 1M tokens. Models without `pricing` metadata render `-` in the savings column. Pricing is display-only metadata; it never affects routing.
+Savings are estimated as `((input − cache_read) × read_tokens + (input − cache_write) × write_tokens) / 1,000,000` USD, where token counts are raw and prices are USD per 1M tokens. Models without `pricing` metadata render `-` in the savings column. Pricing is display-only metadata; it never affects routing.
 
 ## API endpoints
 

@@ -908,7 +908,8 @@ def _cache_summary(
         f"""
         SELECT
             COUNT(*) AS requests,
-            COUNT(*) FILTER (WHERE {_CACHE_HIT_SQL} > 0) AS cache_hits,
+            COALESCE(SUM(CASE WHEN {_CACHE_HIT_SQL} > 0 THEN 1 ELSE 0 END), 0)
+                AS cache_hits,
             COALESCE(SUM({_CACHE_HIT_SQL}), 0) AS cache_read_tokens,
             COALESCE(SUM(COALESCE(cache_creation_input_tokens, 0)), 0)
                 AS cache_creation_tokens,
@@ -948,7 +949,8 @@ def _cache_model_rows(
             model,
             provider,
             COUNT(*) AS requests,
-            COUNT(*) FILTER (WHERE {_CACHE_HIT_SQL} > 0) AS cache_hits,
+            COALESCE(SUM(CASE WHEN {_CACHE_HIT_SQL} > 0 THEN 1 ELSE 0 END), 0)
+                AS cache_hits,
             COALESCE(SUM({_CACHE_HIT_SQL}), 0) AS cache_read_tokens,
             COALESCE(SUM(COALESCE(cache_creation_input_tokens, 0)), 0)
                 AS cache_creation_tokens,

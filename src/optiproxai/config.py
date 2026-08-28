@@ -176,6 +176,8 @@ class ModelPricingConfig(BaseModel):
     display-only metadata (decision doc-10) — routing behavior is unaffected.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     input_per_mtok: float | None = Field(default=None, ge=0)
     cache_read_per_mtok: float | None = Field(default=None, ge=0)
     cache_write_per_mtok: float | None = Field(default=None, ge=0)
