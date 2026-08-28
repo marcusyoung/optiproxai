@@ -172,6 +172,15 @@ model_rules:
     #   provider: "doubleword"
     #   cache_control:
     #     enabled: false          # no markers even when the provider enables them
+    # Rule-level pricing: per-model display metadata for the dashboard's
+    # estimated cache-savings column (USD per 1M tokens; all fields optional).
+    #
+    # - prefix: "moonshotai/kimi-k3"
+    #   provider: "doubleword"
+    #   pricing:
+    #     input_per_mtok: 0.60
+    #     cache_read_per_mtok: 0.06
+    #     cache_write_per_mtok: 0.90
 
 # ---------------------------------------------------------------------------
 # Providers
@@ -255,6 +264,13 @@ profiles:
                 fallback:
                     - model: "claude-sonnet-4-5-20250929"
                       max_input_tokens: 200000
+                      # Per-model pricing: display-only metadata for the
+                      # dashboard's estimated cache-savings column
+                      # (USD per 1M tokens; all fields optional).
+                      # pricing:
+                      #     input_per_mtok: 3.00
+                      #     cache_read_per_mtok: 0.30
+                      #     cache_write_per_mtok: 3.75
             COMPLEX:
                 primary: "gpt-4o"
                 fallback:

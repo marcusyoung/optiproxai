@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
@@ -416,3 +417,396 @@ def test_render_model_usage_table_shows_avg_tps_column():
     assert "AVG TPS" in html
     assert ">750.0<" in html
     assert ">-<" in html
+
+
+class TestCacheUsageExtraction:
+    """Provider field-name tolerance of proxy._extract_cache_usage."""
+
+    def test_anthropic_shape(self):
+        from optiproxai.proxy import _extract_cache_usage
+
+        usage = {
+            "prompt_tokens": 1000,
+            "cache_read_input_tokens": 800,
+            "cache_creation_input_tokens": 200,
+        }
+        assert _extract_cache_usage(usage) == (0, 800, 200)
+
+    def test_openai_nested_shape(self):
+        from optiproxai.proxy import _extract_cache_usage
+
+        usage = {
+            "prompt_tokens": 4000,
+            "prompt_tokens_details": {"cached_tokens": 2048},
+        }
+        assert _extract_cache_usage(usage) == (2048, 0, 0)
+
+    def test_synthetic_top_level_shape(self):
+        from optiproxai.proxy import _extract_cache_usage
+
+        assert _extract_cache_usage({"cached_tokens": 512}) == (512, 0, 0)
+
+    def test_ollamacloud_no_cache_data(self):
+        from optiproxai.proxy import _extract_cache_usage
+
+        assert _extract_cache_usage({"prompt_tokens": 100}) == (0, 0, 0)
+
+    def test_none_and_junk_coerce_to_zero(self):
+        from optiproxai.proxy import _extract_cache_usage
+
+        assert _extract_cache_usage(None) == (0, 0, 0)
+        assert _extract_cache_usage({}) == (0, 0, 0)
+        assert _extract_cache_usage({"cached_tokens": "oops"}) == (0, 0, 0)
+        assert _extract_cache_usage({"prompt_tokens_details": None}) == (0, 0, 0)
+
+    def test_explicit_zero_top_level_wins_over_nested(self):
+        from optiproxai.proxy import _extract_cache_usage
+
+        # A legitimate cached_tokens: 0 must not fall through to the
+        # nested prompt_tokens_details value (PR #9 review).
+        assert _extract_cache_usage(
+            {
+                "cached_tokens": 0,
+                "prompt_tokens_details": {"cached_tokens": 4096},
+            }
+        ) == (0, 0, 0)
+
+    def test_doubleword_double_report_kept_raw(self):
+        from optiproxai.proxy import _extract_cache_usage
+
+        usage = {
+            "cached_tokens": 2048,
+            "cache_read_input_tokens": 2048,
+            "cache_creation_input_tokens": 0,
+        }
+        assert _extract_cache_usage(usage) == (2048, 2048, 0)
+
+
+class TestCachePersistence:
+    """execution_logs cache columns, insert, and JSONL round-trip."""
+
+    def test_insert_and_read_cache_columns(self, configured_dashboard):
+        now = datetime.now(timezone.utc)
+        with sqlite3.connect(configured_dashboard) as conn:
+            dashboard._insert_execution_record(
+                conn,
+                {
+                    "timestamp": now.isoformat(),
+                    "model": "m1",
+                    "provider": "p1",
+                    "profile": "auto",
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 10,
+                    "total_tokens": 1010,
+                    "cached_tokens": 0,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 200,
+                },
+            )
+            conn.commit()
+            row = conn.execute(
+                "SELECT cached_tokens, cache_read_input_tokens, "
+                "cache_creation_input_tokens FROM execution_logs"
+            ).fetchone()
+
+        assert row == (0, 800, 200)
+
+    def test_old_jsonl_without_cache_fields_ingests_as_zero(
+        self, configured_dashboard, tmp_path
+    ):
+        now = datetime.now(timezone.utc)
+        log_file = tmp_path / "log" / f"execution-{now.strftime('%Y-%m-%d')}.jsonl"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        log_file.write_text(
+            json.dumps(
+                {
+                    "timestamp": now.isoformat(),
+                    "model": "legacy",
+                    "provider": "p1",
+                    "profile": "auto",
+                    "prompt_tokens": 50,
+                    "completion_tokens": 5,
+                    "total_tokens": 55,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        inserted = dashboard.ingest_execution_logs(days=1)
+
+        assert inserted == 1
+        with sqlite3.connect(configured_dashboard) as conn:
+            row = conn.execute(
+                "SELECT cached_tokens, cache_read_input_tokens, "
+                "cache_creation_input_tokens FROM execution_logs"
+            ).fetchone()
+
+        assert row == (0, 0, 0)
+
+    def test_log_execution_event_persists_cache_fields(self, configured_dashboard):
+        dashboard.log_execution_event(
+            request_id="req-cache",
+            model="m1",
+            provider="p1",
+            profile="auto",
+            prompt_tokens=1000,
+            completion_tokens=10,
+            total_tokens=1010,
+            cached_tokens=0,
+            cache_read_input_tokens=700,
+            cache_creation_input_tokens=300,
+        )
+
+        with sqlite3.connect(configured_dashboard) as conn:
+            row = conn.execute(
+                "SELECT cached_tokens, cache_read_input_tokens, "
+                "cache_creation_input_tokens FROM execution_logs"
+            ).fetchone()
+
+        assert row == (0, 700, 300)
+
+
+class TestCacheQueries:
+    """_cache_summary and _cache_model_rows math incl. double-count guard."""
+
+    def _seed(self, db_path, rows):
+        now = datetime.now(timezone.utc)
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            for offset, row in enumerate(rows):
+                record = {
+                    "timestamp": (now - timedelta(minutes=offset + 1)).isoformat(),
+                    "model": row.get("model", "m1"),
+                    "provider": row.get("provider", "p1"),
+                    "profile": row.get("profile", "auto"),
+                    "prompt_tokens": row.get("prompt_tokens", 0),
+                    "completion_tokens": 0,
+                    "total_tokens": row.get("prompt_tokens", 0),
+                    "cached_tokens": row.get("cached_tokens", 0),
+                    "cache_read_input_tokens": row.get("cache_read_input_tokens", 0),
+                    "cache_creation_input_tokens": row.get(
+                        "cache_creation_input_tokens", 0
+                    ),
+                }
+                dashboard._insert_execution_record(conn, record)
+            conn.commit()
+
+    def test_summary_hit_rate_and_double_report_guard(self, configured_dashboard):
+        self._seed(
+            configured_dashboard,
+            [
+                # Anthropic shape
+                {
+                    "model": "claude",
+                    "prompt_tokens": 1000,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 200,
+                },
+                # Doubleword double-report: counted once, not twice
+                {
+                    "model": "deepseek",
+                    "prompt_tokens": 4000,
+                    "cached_tokens": 2048,
+                    "cache_read_input_tokens": 2048,
+                },
+                # No cache activity
+                {"model": "llama", "prompt_tokens": 100},
+            ],
+        )
+
+        with sqlite3.connect(configured_dashboard) as conn:
+            conn.row_factory = sqlite3.Row
+            summary = dashboard._cache_summary(conn, 24)
+
+        assert summary["requests"] == 3
+        assert summary["cache_hits"] == 2
+        # 800 + 2048 (guard counts the double-report row once)
+        assert summary["cache_read_tokens"] == 2848
+        assert summary["cache_creation_tokens"] == 200
+        assert summary["prompt_tokens"] == 5100
+        assert summary["hit_rate"] == round(2848 / 5100, 4)
+
+    def test_summary_zero_prompt_tokens_no_division_error(self, configured_dashboard):
+        self._seed(configured_dashboard, [{"model": "m1", "prompt_tokens": 0}])
+
+        with sqlite3.connect(configured_dashboard) as conn:
+            conn.row_factory = sqlite3.Row
+            summary = dashboard._cache_summary(conn, 24)
+
+        assert summary["hit_rate"] == 0.0
+
+    def test_model_rows_grouping_and_profile_filter(self, configured_dashboard):
+        self._seed(
+            configured_dashboard,
+            [
+                {
+                    "model": "m1",
+                    "provider": "p1",
+                    "profile": "auto",
+                    "prompt_tokens": 1000,
+                    "cache_read_input_tokens": 800,
+                },
+                {
+                    "model": "m2",
+                    "provider": "p2",
+                    "profile": "eco",
+                    "prompt_tokens": 100,
+                    "cached_tokens": 50,
+                },
+            ],
+        )
+
+        with sqlite3.connect(configured_dashboard) as conn:
+            conn.row_factory = sqlite3.Row
+            all_rows = dashboard._cache_model_rows(conn, 24)
+            auto_rows = dashboard._cache_model_rows(conn, 24, profiles=["auto"])
+
+        assert {row["model"] for row in all_rows} == {"m1", "m2"}
+        assert [row["model"] for row in auto_rows] == ["m1"]
+        assert auto_rows[0]["hit_rate"] == 0.8
+        assert auto_rows[0]["cache_read_tokens"] == 800
+
+    def test_stats_expose_cache_keys(self, seeded_dashboard):
+        stats = dashboard.get_dashboard_stats(hours=24)
+
+        assert set(stats["cache_summary"].keys()) == {"24h", "7d", "30d"}
+        assert set(stats["cache_model_usage"].keys()) == {"24h", "7d", "30d"}
+        assert stats["cache_summary"]["24h"]["requests"] == 3
+
+
+class TestCachePricingAndRender:
+    """Pricing resolution, savings estimate, and rendered HTML output."""
+
+    @pytest.fixture
+    def priced_dashboard(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("OPTIPROXAI_DATA_DIR", str(tmp_path / "data"))
+        monkeypatch.setenv("OPTIPROXAI_LOG_DIR", str(tmp_path / "log"))
+        config = tmp_path / "config.yaml"
+        config.write_text(
+            """
+host: "0.0.0.0"
+port: 18420
+default_provider: dummy
+default_profile: auto
+providers:
+  dummy:
+    name: dummy
+    base_url: "http://localhost:9999"
+    api_key: "fake"
+model_rules:
+  - prefix: "rule-model"
+    pricing:
+      input_per_mtok: 1.00
+      cache_read_per_mtok: 0.10
+      cache_write_per_mtok: 2.00
+profiles:
+  auto:
+    tiers:
+      MEDIUM:
+        primary:
+          - model: "entry-model"
+            pricing:
+              input_per_mtok: 3.00
+              cache_read_per_mtok: 0.30
+"""
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(dashboard, "_DASHBOARD_DB_PATH", tmp_path / "dashboard.db")
+        configure(str(config))
+        dashboard._init_dashboard_db()
+        return tmp_path / "dashboard.db"
+
+    def test_pricing_resolution_entry_and_rule(self, priced_dashboard):
+        entry_pricing = dashboard._resolve_model_pricing("entry-model")
+        rule_pricing = dashboard._resolve_model_pricing("rule-model-x")
+
+        assert entry_pricing is not None
+        assert entry_pricing.input_per_mtok == 3.00
+        assert rule_pricing is not None
+        assert rule_pricing.cache_read_per_mtok == 0.10
+
+    def test_pricing_resolution_unknown_model(self, priced_dashboard):
+        assert dashboard._resolve_model_pricing("unknown-model") is None
+        assert dashboard._resolve_model_pricing(None) is None
+
+    def test_savings_estimate_math(self):
+        from optiproxai.config import ModelPricingConfig
+
+        pricing = ModelPricingConfig(
+            input_per_mtok=3.0,
+            cache_read_per_mtok=0.3,
+            cache_write_per_mtok=3.75,
+        )
+        # read: (3.0 - 0.3) * 1_000_000 / 1e6 = 2.70
+        # write: (3.75 - 3.0) * 400_000 / 1e6 = 0.30
+        savings = dashboard._estimate_cache_savings(pricing, 1_000_000, 400_000)
+        assert savings == pytest.approx(2.40)
+
+    def test_savings_estimate_unpriced_returns_none(self):
+        assert dashboard._estimate_cache_savings(None, 1000, 0) is None
+
+        from optiproxai.config import ModelPricingConfig
+
+        assert (
+            dashboard._estimate_cache_savings(ModelPricingConfig(), 1000, 100) is None
+        )
+
+    def test_rendered_html_contains_cache_section(self, priced_dashboard):
+        now = datetime.now(timezone.utc)
+        with sqlite3.connect(priced_dashboard) as conn:
+            conn.row_factory = sqlite3.Row
+            dashboard._insert_execution_record(
+                conn,
+                {
+                    "timestamp": now.isoformat(),
+                    "model": "entry-model",
+                    "provider": "dummy",
+                    "profile": "auto",
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 10,
+                    "total_tokens": 1010,
+                    "cached_tokens": 0,
+                    "cache_read_input_tokens": 800,
+                    "cache_creation_input_tokens": 200,
+                },
+            )
+            conn.commit()
+
+        stats = dashboard.get_dashboard_stats(hours=24)
+        html = dashboard.render_dashboard_html(stats)
+
+        assert "Cache Metrics" in html
+        assert "Cache hit rate" in html
+        assert "Cache by Model (7d)" in html
+        assert "Est. savings" in html
+        # 800 / 1000 = 80%
+        assert "80%" in html
+        # Savings: (3.0 - 0.3) * 800/1e6 - 0 = 0.00216 -> $0.0022
+        assert "$0.0022" in html
+
+    def test_rendered_html_savings_dash_without_pricing(self, configured_dashboard):
+        now = datetime.now(timezone.utc)
+        with sqlite3.connect(configured_dashboard) as conn:
+            conn.row_factory = sqlite3.Row
+            dashboard._insert_execution_record(
+                conn,
+                {
+                    "timestamp": now.isoformat(),
+                    "model": "auto-simple",
+                    "provider": "dummy",
+                    "profile": "auto",
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 10,
+                    "total_tokens": 1010,
+                    "cache_read_input_tokens": 500,
+                },
+            )
+            conn.commit()
+
+        stats = dashboard.get_dashboard_stats(hours=24)
+        html = dashboard.render_dashboard_html(stats)
+
+        assert "Cache Metrics" in html
+        # Unpriced model renders em-dash savings
+        assert "$" not in html.split("Est. savings")[1].split("</table>")[0]

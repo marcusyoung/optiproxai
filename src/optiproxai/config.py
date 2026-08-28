@@ -168,6 +168,21 @@ class CacheControlConfig(BaseModel):
     )
 
 
+class ModelPricingConfig(BaseModel):
+    """Optional per-model pricing metadata for dashboard cost estimates.
+
+    All values are USD per 1M tokens.  Any field may be omitted; the
+    dashboard's savings estimate only uses the components present.  This is
+    display-only metadata (decision doc-10) — routing behavior is unaffected.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_per_mtok: float | None = Field(default=None, ge=0)
+    cache_read_per_mtok: float | None = Field(default=None, ge=0)
+    cache_write_per_mtok: float | None = Field(default=None, ge=0)
+
+
 class ProviderConfig(BaseModel):
     """A backend LLM provider (OpenRouter, Anthropic, local proxy, etc.)."""
 
@@ -218,6 +233,13 @@ class ModelEntry(BaseModel):
             "value/suffix) override the provider's mechanism."
         ),
     )
+    pricing: ModelPricingConfig | None = Field(
+        default=None,
+        description=(
+            "Optional per-model pricing metadata (USD per 1M tokens) used by "
+            "the dashboard to estimate prompt-cache savings.  Display-only."
+        ),
+    )
 
 
 class ResolvedModelCandidate(BaseModel):
@@ -227,6 +249,7 @@ class ResolvedModelCandidate(BaseModel):
     provider: str = ""
     max_input_tokens: int | None = None
     async_mode: AsyncModeConfig | None = None
+    pricing: ModelPricingConfig | None = None
 
     def as_tuple(self) -> tuple[str, str]:
         """Return the backward-compatible (model, provider) tuple."""
@@ -286,6 +309,7 @@ class TierModelConfig(BaseModel):
                 provider=entry.provider,
                 max_input_tokens=entry.max_input_tokens,
                 async_mode=entry.async_mode,
+                pricing=entry.pricing,
             )
         return ResolvedModelCandidate(model=entry)
 
@@ -454,6 +478,14 @@ class ModelRuleEntry(BaseModel):
             "Rule-level opt-in prompt-caching marker injection override.  "
             "Presence-based: a matching rule's cache_control wins over the "
             "provider-level block without field-by-field merge (decision doc-7)."
+        ),
+    )
+    pricing: ModelPricingConfig | None = Field(
+        default=None,
+        description=(
+            "Optional per-model pricing metadata (USD per 1M tokens) matched "
+            "by rule prefix and used by the dashboard to estimate prompt-cache "
+            "savings.  Display-only."
         ),
     )
 
