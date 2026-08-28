@@ -4,7 +4,7 @@ title: 'Fix Hy3 input-limit cap misfire: session-keyed last-context token cache'
 status: In Progress
 assignee: []
 created_date: '2026-08-27 19:50'
-updated_date: '2026-08-28 11:43'
+updated_date: '2026-08-28 11:49'
 labels:
   - fallback
   - routing
@@ -48,11 +48,11 @@ NOTE (verified 2026-08-27): the handoff's claim that tests/test_api_keys_proxy.p
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Session-keyed last-context cache implemented (dict + Lock keyed by session ID) mirroring FallbackBackoffState.
-- [ ] #2 route() estimates prompt size as max(last-turn provider prompt from cache, live _estimate_tokens()); first turn uses live estimate only.
-- [ ] #3 X-Session-Id threaded to the usage-logging site so the cache is fed from the real provider prompt.
+- [x] #1 Session-keyed last-context cache implemented (dict + Lock keyed by session ID) mirroring FallbackBackoffState.
+- [x] #2 route() estimates prompt size as max(last-turn provider prompt from cache, live _estimate_tokens()); first turn uses live estimate only.
+- [x] #3 X-Session-Id threaded to the usage-logging site so the cache is fed from the real provider prompt.
 - [ ] #4 Cap fires for oversized analysis prompts: log shows 'Skipping input-limit-ineligible candidate model=tencent/hy3 ... max_input_tokens=160000' and falls back to DeepSeek-V4-Pro (1M).
-- [ ] #5 tests/test_input_limit_routing.py and tests/test_api_keys_proxy.py pass (api_keys_proxy currently 25 passed / 0 failed).
+- [x] #5 tests/test_input_limit_routing.py and tests/test_api_keys_proxy.py pass (api_keys_proxy currently 25 passed / 0 failed).
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -113,3 +113,13 @@ Provider-reported `usage.prompt_tokens` is ground truth for what the provider ac
 
 Fits a single task — no subtasks needed.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-08-28 implemented on branch task/TASK-016: last_context_cache.py (dict+Lock keyed by session, singleton last_context_cache); RoutingDecision.session_key added and populated in route(); route() uses max(cached, live_estimate) when session_key present; _log_usage feeds cache from provider usage.prompt_tokens (covers streaming + non-streaming since both pass decision); _estimate_tokens now counts reasoning_content.
+
+CI gate green: ruff check clean, 38 files formatted, pyright 0 errors, full pytest 368 passed, uv build OK. Subset: test_last_context_cache.py (6) + test_input_limit_routing.py (20 incl. 5 new cache tests) + test_api_keys_proxy.py (25) = 51 passed.
+
+NOT done: commit (blocked by user permission rule - changes staged, awaiting approval) and AC #4 manual verification (restart server, oversized analysis prompt with X-Session-Id, confirm cap log + DeepSeek-V4-Pro fallback).
+<!-- SECTION:NOTES:END -->
