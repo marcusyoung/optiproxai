@@ -1467,6 +1467,33 @@ class TestCacheControlInjection:
         assert "cache_control" not in str(body)
         assert body["tools"] == [{"type": "function", "function": {"name": "alpha"}}]
 
+    def test_empty_targets_list_disables_injection(self):
+        # Explicit empty targets wins over the single-target fallback (doc-11):
+        # no breakpoints at all, even though target would have injected one.
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True, target="system"),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="deepseek-ai/DeepSeek-V4-Pro",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(enabled=True, targets=[]),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        assert prepared == body
+
 
 class TestAdminReloadAuth:
     def test_reload_rejected_without_token(self, configured_proxy):

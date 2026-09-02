@@ -1453,12 +1453,13 @@ def _inject_target_marker(
 def _effective_cache_targets(config: CacheControlConfig) -> list[str]:
     """Return the effective breakpoint targets in canonical request order.
 
-    ``targets`` (list form) wins when set (doc-11); otherwise the single
-    ``target`` is used.  Duplicates are dropped preserving first occurrence.
+    ``targets`` wins when set, including an explicitly empty list (no
+    breakpoints — no injection); otherwise the single ``target`` is used
+    (doc-11).  Duplicates are dropped preserving first occurrence.
     Canonical order: tools -> system -> last_message (request serialization
     order, matching how Anthropic-style prefix caching bills).
     """
-    if config.targets:
+    if config.targets is not None:
         effective = list(dict.fromkeys(config.targets))
     else:
         effective = [config.target]
@@ -1472,9 +1473,9 @@ def _apply_cache_control(
     """Inject cache_control markers into the stable prefix per target(s).
 
     Returns the original *body* unchanged when injection is skipped (disabled
-    config, client already sent markers, breakpoint limit already reached, or
-    no target's container exists).  Returns a shallow-copied body when at
-    least one marker is injected; never mutates the caller's dict in place.
+    config, client already sent markers, empty effective target list, or no
+    target's container exists).  Returns a shallow-copied body when at least
+    one marker is injected; never mutates the caller's dict in place.
 
     Marker shape follows Doubleword's Anthropic-style prefix caching:
     ``{"type": "ephemeral", "ttl": <ttl>}``.
