@@ -753,7 +753,7 @@ class Router:
                     candidate.provider,
                     tier_provider,
                 )
-                log.info(
+                log.warning(
                     "Skipping input-limit-ineligible candidate model=%s provider=%s prompt_tokens=%d max_input_tokens=%d",
                     candidate.model,
                     resolved_provider,
@@ -784,8 +784,7 @@ class Router:
                 candidate.model,
                 resolved_provider,
             ):
-                logger = log
-                logger.info(
+                log.warning(
                     "Skipping cooled candidate during routing model=%s provider=%s",
                     candidate.model,
                     resolved_provider,
