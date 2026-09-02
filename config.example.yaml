@@ -164,7 +164,20 @@ model_rules:
     #   cache_control:
     #     enabled: true
     #     ttl: "1h"               # "5m" (default) or "1h"
-    #     target: system          # "system" (default) or "tools"
+    #     target: system          # "system" (default), "tools", or "last_message"
+    #     max_breakpoints: 4      # Doubleword ceiling; tunable
+    # Rule-level cache_control with multiple breakpoints: cache tools + system
+    # prompt + the multi-turn conversation prefix (up to max_breakpoints
+    # markers).  Applied in canonical request order: tools -> system ->
+    # last_message.  Best for long coding sessions where the conversation
+    # dominates input cost.
+    #
+    # - prefix: "deepseek-ai/DeepSeek-V4-Pro"
+    #   provider: "doubleword"
+    #   cache_control:
+    #     enabled: true
+    #     ttl: "1h"
+    #     targets: [tools, system, last_message]
     #     max_breakpoints: 4      # Doubleword ceiling; tunable
     # Rule-level cache_control: explicitly opt out of the provider's policy.
     #
@@ -218,7 +231,7 @@ providers:
     #     cache_control:
     #         enabled: true
     #         ttl: "1h"                 # "5m" (default) or "1h"
-    #         target: system            # "system" (default) or "tools"
+    #         target: system            # "system" (default), "tools", or "last_message"
     #         max_breakpoints: 4        # Doubleword ceiling; tunable
 
 # ---------------------------------------------------------------------------
