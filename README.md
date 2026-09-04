@@ -345,7 +345,7 @@ optiproxai detects required capabilities from the request and routes to a model 
 
 | Capability | Trigger |
 |------------|---------|
-| `vision` | `image_url` content block in messages |
+| `vision` | `image_url` content block in messages (see image-history stripping below) |
 | `tools` | `tools` or `functions` field by default; configurable |
 | `json_mode` | `response_format.type` is `json_object` or `json_schema` |
 
@@ -367,6 +367,34 @@ model_rules:
 ```
 
 `model_rules` is the primary metadata key. The legacy `model_capabilities` key is accepted only when `model_rules` is unset. The optional `extra_body` field injects extra request-body fields for any candidate matching the rule (e.g. `prompt_cache_key` to improve cache-hit routing); it uses the same prefix/provider precedence as `reasoning_style` and is merged last, so its values win over client-provided fields. Use the dedicated `async_mode` config for async/batch routing instead of `extra_body`.
+
+### Image-history stripping (opt-in)
+
+Vision capability is detected from the whole message history, so a single image anywhere in a session pins all subsequent turns to vision-capable models. In long mixed image+text conversations that means paying vision-model prices (and hitting their context ceilings) even after the images have scrolled out of relevance.
+
+The opt-in `image_history_stripping` policy ages images out in two phases:
+
+1. **In TTL** — for `image_ttl_turns` user turns after an image is sent (including the send turn), `vision` stays required and the session routes to vision-capable models with the full body. No stripping happens in this phase. Aging counts **user messages only** — assistant/tool turns in between do not advance it.
+2. **Aged out** — once every image is older than the TTL, `vision` is no longer required; non-vision candidates (often cheaper with larger context) become eligible, and the per-candidate sanitizer replaces aged image parts with placeholder text so non-vision candidates never receive image parts. Vision-capable candidates always receive the full body.
+
+```yaml
+smart_proxy:
+  image_history_stripping:
+    enabled: true                   # default false; absent block = off
+    image_ttl_turns: 3              # user turns an image stays vision-relevant (>= 1)
+    placeholder: "[image omitted]"  # empty string "" drops the part silently
+```
+
+Semantics:
+- The **latest user message is never touched** — its images always require `vision` regardless of TTL.
+- Default `image_ttl_turns: 3` keeps an image vision-relevant for the send turn plus two follow-up exchanges — enough for a "paste screenshot, ask a few questions" arc — then hands the session back to non-vision models.
+- Candidates declare `vision` via `model_rules`; models with no matching rule are treated as non-vision (fail-closed). Fallback candidates are covered by the same per-candidate logic.
+- Stripping runs before `content_part_policy` normalization and `cache_control` injection, so placeholders survive reconstruction and cache markers land on the final body. The placeholder is deterministic, so the stripped prefix is byte-stable turn-over-turn: the provider prefix cache breaks once on the turn images age out, then resumes normally.
+- Each stripping is logged: `IMAGE_HISTORY_STRIPPED model=... provider=... stripped_messages=N stripped_parts=M`.
+
+Caveats to weigh before opting in:
+- **Quality**: turns referencing aged-out images ("compare with the chart above") degrade to placeholder-based reasoning — silent quality loss. Opt-in containment is the point; raise `image_ttl_turns` for long image discussions.
+- **One-turn escalation**: the session's last-context token estimate (doc-8) keeps the inflated image-inclusive value for one turn after stripping, which may force one input-limit escalation; it self-heals on the next provider-reported prompt size.
 
 ## Async / batch routing
 

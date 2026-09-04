@@ -1495,6 +1495,398 @@ class TestCacheControlInjection:
         assert prepared == body
 
 
+class TestImageHistoryStripping:
+    """Opt-in image-history stripping for non-vision candidates (TASK-17)."""
+
+    def _config(
+        self,
+        *,
+        image_history_stripping: Any,
+        model_rules: list[ModelRuleEntry] | None = None,
+    ) -> RuntimeState:
+        cfg = OptiproxaiConfig(
+            providers={
+                "dummy": ProviderConfig(
+                    name="dummy",
+                    base_url="http://dummy.example",
+                ),
+            },
+            model_rules=model_rules or [],
+        )
+        cfg.smart_proxy.image_history_stripping = image_history_stripping
+        return RuntimeState(
+            config_path=None,
+            config=cfg,
+            router=Router(cfg),
+            fallback_backoff_state=Router(cfg).fallback_backoff_state,
+            config_loaded_at="test",
+            version=1,
+        )
+
+    @staticmethod
+    def _body() -> dict[str, Any]:
+        return {
+            "model": "cx/vision-pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "turn 1"},
+                        {"type": "image_url", "image_url": {"url": "img-1"}},
+                    ],
+                },
+                {"role": "assistant", "content": "ok"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "turn 2"},
+                        {"type": "image_url", "image_url": {"url": "img-2"}},
+                    ],
+                },
+                {"role": "assistant", "content": "ok 2"},
+                {"role": "user", "content": "latest question"},
+            ],
+        }
+
+    # --- capability detection TTL semantics ---
+
+    def test_detection_history_only_images_require_vision_by_default(self):
+        body = self._body()
+        caps = proxy_mod._detect_required_capabilities(body)
+        assert "vision" in caps
+
+    def test_detection_fresh_history_image_still_requires_vision(self):
+        # _body(): user turns — turn1(0, img), turn2(1, img), latest(2).
+        # Default ttl=3: latest_turn(2) - image_turn(0) = 2 <= 3 -> fresh.
+        body = self._body()
+        caps = proxy_mod._detect_required_capabilities(
+            body, image_stripping_enabled=True
+        )
+        assert "vision" in caps
+
+    def test_detection_aged_history_image_softened(self):
+        # Default ttl=3: image 4+ user turns old does not require vision.
+        body = self._body()
+        # Append three more user turns after the latest message so the
+        # turn-1 image is 5 user turns behind the latest (5 > ttl 3) and the
+        # turn-2 image is 4 behind (4 > 3): both aged.
+        extra: list[dict[str, Any]] = []
+        for n in range(3):
+            extra.append({"role": "user", "content": f"follow-up {n}"})
+            extra.append({"role": "assistant", "content": f"answer {n}"})
+        body["messages"] = body["messages"] + extra
+        caps = proxy_mod._detect_required_capabilities(
+            body, image_stripping_enabled=True
+        )
+        assert "vision" not in caps
+        # And with the policy disabled it is still required.
+        caps_off = proxy_mod._detect_required_capabilities(body)
+        assert "vision" in caps_off
+
+    def test_detection_ttl_counts_user_turns_not_messages(self):
+        # Interleaved assistant/tool turns must NOT advance aging: an image
+        # sent 3 user turns ago stays fresh under ttl=3 even with 6 assistant
+        # messages in between.
+        body = self._body()
+        filler: list[dict[str, Any]] = []
+        for n in range(4):
+            filler.append({"role": "assistant", "content": f"reasoning {n}"})
+        body["messages"] = body["messages"][:5] + filler + [body["messages"][5]]
+        # turn1 image is 2 user turns old (turn1=0, turn2=1, latest=2).
+        caps = proxy_mod._detect_required_capabilities(
+            body, image_stripping_enabled=True, image_ttl_turns=2
+        )
+        assert "vision" in caps
+
+    def test_detection_ttl_respected_explicit_value(self):
+        # ttl=1: image is aged once two user turns have passed it.
+        body = self._body()
+        # turn1 image: latest_turn(2) - image_turn(0) = 2 > 1 -> aged.
+        caps = proxy_mod._detect_required_capabilities(
+            body, image_stripping_enabled=True, image_ttl_turns=1
+        )
+        assert "vision" in caps  # turn2 image still fresh (1 <= 1)
+
+    def test_detection_latest_user_message_image_always_hard(self):
+        body = self._body()
+        # Move an image into the latest user message.
+        body["messages"][-1] = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "latest question"},
+                {"type": "image_url", "image_url": {"url": "img-latest"}},
+            ],
+        }
+        caps = proxy_mod._detect_required_capabilities(
+            body, image_stripping_enabled=True, image_ttl_turns=1
+        )
+        assert "vision" in caps
+
+    # --- per-candidate stripping ---
+
+    def test_strip_policy_disabled_leaves_body_unchanged(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(enabled=False)
+        )
+        body = self._body()
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        assert prepared == body
+
+    def test_strip_policy_none_leaves_body_unchanged(self):
+        state = self._config(image_history_stripping=None)
+        body = self._body()
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        assert prepared == body
+
+    def test_strip_non_vision_candidate_replaces_aged_images(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        # ttl=1: turn1 image (2 user turns back) aged -> stripped; turn2
+        # image (1 turn back) within TTL -> retained.
+        # No model rule declares vision for cx/vision-pro -> fail-closed.
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(
+                enabled=True, image_ttl_turns=1
+            )
+        )
+        body = self._body()
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+
+        assert prepared is not body
+        # Latest user message untouched.
+        assert prepared["messages"][-1] == body["messages"][-1]
+        # Aged image (turn 1) stripped with placeholder.
+        assert prepared["messages"][1]["content"] == [
+            {"type": "text", "text": "turn 1"},
+            {"type": "text", "text": "[image omitted]"},
+        ]
+        # In-TTL image (turn 2) retained: the sanitizer only ages images
+        # beyond the TTL, guaranteeing recent image context survives for
+        # candidates that tolerate it (fail-closed undeclared models).
+        assert prepared["messages"][3]["content"] == [
+            {"type": "text", "text": "turn 2"},
+            {"type": "image_url", "image_url": {"url": "img-2"}},
+        ]
+
+    def test_strip_non_vision_candidate_zero_images_when_all_aged(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        # ttl=1 with 3+ extra user turns: both history images aged -> stripped.
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(
+                enabled=True, image_ttl_turns=1
+            )
+        )
+        body = self._body()
+        extra: list[dict[str, Any]] = []
+        for n in range(3):
+            extra.append({"role": "user", "content": f"follow-up {n}"})
+            extra.append({"role": "assistant", "content": f"answer {n}"})
+        body["messages"] = body["messages"] + extra
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        # Zero image parts anywhere in the non-vision body.
+        for msg in prepared["messages"]:
+            if isinstance(msg.get("content"), list):
+                for part in msg["content"]:
+                    assert part.get("type") != "image_url"
+        assert prepared["messages"][1]["content"] == [
+            {"type": "text", "text": "turn 1"},
+            {"type": "text", "text": "[image omitted]"},
+        ]
+        assert prepared["messages"][3]["content"] == [
+            {"type": "text", "text": "turn 2"},
+            {"type": "text", "text": "[image omitted]"},
+        ]
+
+    def test_strip_vision_capable_candidate_unchanged(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="cx/vision-pro",
+                    provider="dummy",
+                    capabilities=["vision"],
+                ),
+            ],
+        )
+        body = self._body()
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        assert prepared == body
+
+    def test_strip_fail_closed_for_undeclared_model(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        # A model with NO matching rule is treated as non-vision (fail-closed).
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="other-model",
+                    provider="dummy",
+                    capabilities=["vision"],
+                ),
+            ],
+        )
+        body = self._body()
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        # turn1 image aged (2 user turns back > ttl 3? no: 2 <= 3 -> fresh);
+        # force aging with ttl=1 instead.
+        state2 = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(
+                enabled=True, image_ttl_turns=1
+            ),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="other-model",
+                    provider="dummy",
+                    capabilities=["vision"],
+                ),
+            ],
+        )
+        prepared2, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state2
+        )
+        assert prepared2["messages"][1]["content"] == [
+            {"type": "text", "text": "turn 1"},
+            {"type": "text", "text": "[image omitted]"},
+        ]
+
+    def test_no_aged_images_leaves_body_unchanged(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        # All images within TTL: nothing to strip, body unchanged.
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(enabled=True)
+        )
+        body = self._body()
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        assert prepared is body
+
+    def test_empty_placeholder_drops_part(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(
+                enabled=True, image_ttl_turns=1, placeholder=""
+            )
+        )
+        body = self._body()
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        assert prepared["messages"][1]["content"] == [
+            {"type": "text", "text": "turn 1"}
+        ]
+
+    def test_provider_specific_rule_outranks_generic(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        # A provider-specific rule declaring vision beats a longer generic
+        # prefix without vision: candidate is vision-capable, not stripped.
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="cx/vision-pro",
+                    capabilities=[],
+                ),
+                ModelRuleEntry(
+                    prefix="cx/vision-pro",
+                    provider="dummy",
+                    capabilities=["vision"],
+                ),
+            ],
+        )
+        body = self._body()
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        assert prepared == body
+
+    # --- ordering and logging ---
+
+    def test_placeholder_survives_content_part_normalization(self):
+        from optiproxai.config import ContentPartPolicy, ImageHistoryStrippingConfig
+
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(
+                enabled=True, image_ttl_turns=1
+            ),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="cx/vision-pro",
+                    provider="dummy",
+                    content_part_policy=ContentPartPolicy(
+                        mode="normalize",
+                        allowed_types=["text", "image_url"],
+                    ),
+                ),
+            ],
+        )
+        body = self._body()
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        assert prepared["messages"][1]["content"] == [
+            {"type": "text", "text": "turn 1"},
+            {"type": "text", "text": "[image omitted]"},
+        ]
+
+    def test_image_history_stripped_log_emitted(self, caplog):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(
+                enabled=True, image_ttl_turns=1
+            )
+        )
+        body = self._body()
+        with caplog.at_level("INFO", logger="optiproxai.proxy"):
+            proxy_mod._prepare_body_for_candidate(body, "cx/vision-pro", "dummy", state)
+        assert any(
+            "IMAGE_HISTORY_STRIPPED" in r.message and "stripped_parts=1" in r.message
+            for r in caplog.records
+        )
+
+    # --- config validation ---
+
+    def test_config_rejects_zero_image_ttl_turns(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            ImageHistoryStrippingConfig(enabled=True, image_ttl_turns=0)
+
+    def test_config_default_is_disabled(self):
+        from optiproxai.config import ImageHistoryStrippingConfig, SmartProxyConfig
+
+        sp = SmartProxyConfig()
+        assert sp.image_history_stripping is None
+        default = ImageHistoryStrippingConfig()
+        assert default.enabled is False
+        assert default.image_ttl_turns == 3
+        assert default.placeholder == "[image omitted]"
+
+
 class TestAdminReloadAuth:
     def test_reload_rejected_without_token(self, configured_proxy):
         with TestClient(app, raise_server_exceptions=False) as client:

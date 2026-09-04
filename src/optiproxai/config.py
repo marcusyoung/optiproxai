@@ -432,6 +432,51 @@ class RoutingConfig(BaseModel):
     session_header: str = "X-Session-Id"
 
 
+class ImageHistoryStrippingConfig(BaseModel):
+    """Opt-in policy aging images out of older conversation turns.
+
+    Vision capability is detected from the whole message history, so a single
+    image anywhere in a session pins all subsequent turns to vision-capable
+    models.  When this policy is enabled, an image stays vision-relevant for
+    ``image_ttl_turns`` user turns after it is sent (the session routes to
+    vision-capable models with the full body); once aged out, the image parts
+    are stripped from history for non-vision candidates and ``vision`` stops
+    being required, so sessions route back to cheaper/larger non-vision
+    models (decision doc-13).  Disabled by default: absent or ``enabled:
+    false`` preserves current behavior bit-for-bit.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Opt-in master switch. When false (or the block is absent), "
+            "behavior is identical to pre-TASK-17: any image in history "
+            "requires vision and nothing is ever stripped."
+        ),
+    )
+    image_ttl_turns: int = Field(
+        default=3,
+        gt=0,
+        description=(
+            "User turns an image stays vision-relevant, counted from the "
+            "turn it was sent (send turn + this many - 1 follow-ups). "
+            "Aging counts user-role messages only; assistant/tool turns in "
+            "between do not advance it. While any image is within TTL, "
+            "vision is required; once all images are aged out, non-vision "
+            "candidates become eligible and receive image-free bodies. The "
+            "latest user message is always vision-relevant regardless of "
+            "this value."
+        ),
+    )
+    placeholder: str = Field(
+        default="[image omitted]",
+        description=(
+            "Text sent to the model in place of a stripped image part. An "
+            "empty string drops the part silently instead."
+        ),
+    )
+
+
 class SmartProxyConfig(BaseModel):
     """Smart-proxy feature configuration."""
 
@@ -449,6 +494,15 @@ class SmartProxyConfig(BaseModel):
             "Policy for forwarding decorative top-level tool schemas upstream. "
             "'preserve' keeps OpenAI-compatible payloads unchanged; 'strip' removes "
             "top-level tool schema fields only when tool use is declared but not required."
+        ),
+    )
+    image_history_stripping: ImageHistoryStrippingConfig | None = Field(
+        default=None,
+        description=(
+            "Opt-in image-history aging policy (TASK-17). None or "
+            "enabled: false = off. When enabled, images stay vision-relevant "
+            "for image_ttl_turns user turns, then are stripped for non-vision "
+            "candidates so sessions route back to non-vision models."
         ),
     )
     fallback_backoff: FallbackBackoffConfig = Field(
