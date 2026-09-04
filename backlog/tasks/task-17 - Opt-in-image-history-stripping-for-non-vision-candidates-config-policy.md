@@ -4,6 +4,7 @@ title: Opt-in image-history stripping for non-vision candidates (config policy)
 status: To Do
 assignee: []
 created_date: '2026-08-28 15:24'
+updated_date: '2026-09-04 12:18'
 labels:
   - enhancement
   - routing
@@ -11,7 +12,7 @@ labels:
   - vision
   - content-policy
 dependencies: []
-priority: medium
+priority: high
 ordinal: 21000
 ---
 
@@ -32,3 +33,9 @@ Design points to settle during planning:
 
 Fits existing machinery: proxy already rewrites message content per candidate (_sanitize_reasoning_content_for_candidate, _normalize_message_content_for_candidate, content_part_policy) — a new image-history sanitizer mirrors that pattern. Also mirrors tools_capability_detection's declared-vs-required philosophy.
 <!-- SECTION:DESCRIPTION:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+2026-09-04: Cost justification recorded from the kimi-k3@doubleword cache incident (see handoff b4f8c1cd / TASK-21 session). During a 22-call REASONING-tier session on kimi-k3 (doubleword flex, 1h-TTL cache_control from TASK-21), images present in the conversation history were suspected of breaking byte-prefix matching for cache reads: cache_read_input_tokens stayed pinned at 19,791 (tools+system prefix only) while cache_creation_input_tokens rewrote the entire 163-179K conversation every turn at the 2x 1h-TTL write rate. Session totals: ~3.45M tokens written at $4.30/M vs ~376K read at $0.22/M — ~$6.70 overhead (~$0.33/call) versus uncached rates. Control session on deepseek-v4@doubleword with the same targets config read 87-96K per call, confirming the provider serves multi-breakpoint reads when the prefix byte-matches. Image-bearing history is the leading suspect for the kimi read-pinning (escalated to Doubleword 2026-09-04). Stripping images from degraded history would both enable non-vision routing savings (original motivation) and restore byte-stable prefixes so provider caches can actually serve reads — strengthening the priority to high.
+<!-- SECTION:PLAN:END -->
