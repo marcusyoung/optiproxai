@@ -81,6 +81,29 @@ routing:
 # smart_proxy:
 #   tools_capability_detection: declared       # declared | active
 #   decorative_tool_schema_handling: preserve  # preserve | strip
+#
+# Opt-in image-history stripping (TASK-17). Vision capability is detected from
+# the whole message history, so one image pins a session to vision models.
+# When enabled, an image stays vision-relevant for image_ttl_turns USER turns
+# after it was sent (send turn + follow-up user messages; assistant/tool
+# turns in between do not count) — the session routes to vision-capable
+# models with the full body. Once aged out, `vision` stops being required
+# and non-vision candidates receive image parts replaced by the placeholder
+# text, so non-vision candidates never receive image parts. Candidates whose
+# model_rules rule declares `vision` always receive the body unchanged;
+# models with no matching rule are treated as non-vision (fail-closed).
+#
+#   image_history_stripping:
+#     enabled: true                 # default false; absent block = off
+#     image_ttl_turns: 3            # user turns an image stays vision-relevant (>= 1)
+#     placeholder: "[image omitted]"  # empty string "" drops the part silently
+#
+# Quality caveat: turns referencing aged-out images ("compare with the chart
+# above") degrade to placeholder-based reasoning — that is the point of
+# opting in. Also note: the last-context token estimate stays inflated for
+# one turn after stripping (doc-14), which may force one input-limit
+# escalation, and the provider prefix cache re-writes once on the aging turn
+# (the placeholder is deterministic, so byte-stability resumes next turn).
 
 # ---------------------------------------------------------------------------
 # Runtime embeddings for the distilled feature classifier

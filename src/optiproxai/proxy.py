@@ -430,10 +430,62 @@ def _decorative_tool_schema_adaptation_payload(
     }
 
 
+def _message_has_image(msg: Any) -> bool:
+    """Return True when a message carries an ``image_url`` content block."""
+    if not isinstance(msg, dict):
+        return False
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") == "image_url"
+        for block in content
+    )
+
+
+def _user_turn_ordinal(messages: list[Any], index: int) -> int | None:
+    """Return the 0-based user-turn ordinal of the message at ``index``.
+
+    Counts user-role messages up to and including ``index``.  Returns None
+    when the message at ``index`` is not a user message.  Used for
+    turn-based image aging (TASK-17): two images are one user turn apart iff
+    exactly one user message lies strictly between them.
+    """
+    if not (
+        isinstance(messages[index], dict) and messages[index].get("role") == "user"
+    ):
+        return None
+    return (
+        sum(
+            1
+            for m in messages[: index + 1]
+            if isinstance(m, dict) and m.get("role") == "user"
+        )
+        - 1
+    )
+
+
 def _detect_required_capabilities(
-    body: dict[str, Any], tools_policy: str = "declared"
+    body: dict[str, Any],
+    tools_policy: str = "declared",
+    *,
+    image_stripping_enabled: bool = False,
+    image_ttl_turns: int = 3,
 ) -> set[str]:
     """Detect required capabilities from request body.
+
+    Args:
+        body: OpenAI-compatible request body.
+        tools_policy: Tools capability detection policy.
+        image_stripping_enabled: When True (image_history_stripping policy
+            enabled), an image only requires the ``vision`` capability while
+            it is within ``image_ttl_turns`` user turns of the latest user
+            message (or it is in the latest user message itself).  Aged-out
+            images do not require ``vision``, so the session can route to
+            non-vision candidates, and the per-candidate sanitizer strips
+            those images for them (decision doc-13).
+        image_ttl_turns: User turns an image stays vision-relevant.  Ignored
+            unless ``image_stripping_enabled`` is True.
 
     Returns:
         Set of required capabilities: 'vision', 'tools', 'json_mode'.
@@ -443,14 +495,41 @@ def _detect_required_capabilities(
     # Check for vision capability
     messages = body.get("messages", [])
     if isinstance(messages, list):
-        for msg in messages:
-            if isinstance(msg, dict) and "content" in msg:
-                content = msg["content"]
-                if isinstance(content, list):
-                    for block in content:
-                        if isinstance(block, dict) and block.get("type") == "image_url":
-                            required.add("vision")
-                            break
+        # User-turn ordinal of the latest user message; its images are a hard
+        # requirement regardless of TTL.
+        latest_user_idx = max(
+            (
+                i
+                for i, m in enumerate(messages)
+                if isinstance(m, dict) and m.get("role") == "user"
+            ),
+            default=-1,
+        )
+        latest_user_turn = (
+            _user_turn_ordinal(messages, latest_user_idx)
+            if latest_user_idx >= 0
+            else None
+        )
+        for i, msg in enumerate(messages):
+            if not _message_has_image(msg):
+                continue
+            if image_stripping_enabled and i != latest_user_idx:
+                # Aged out: older than TTL user turns.  TTL 3 means the send
+                # turn + two follow-up user turns keep the image
+                # vision-relevant, counting user messages only (assistant/
+                # tool turns in between do not advance aging).
+                image_turn = _user_turn_ordinal(messages, i)
+                if image_turn is None or latest_user_turn is None:
+                    # Fail-closed: cannot order this image relative to user
+                    # turns (non-user message, or no user turn exists), so
+                    # keep it vision-relevant rather than risk routing an
+                    # image-bearing body to non-vision candidates.
+                    required.add("vision")
+                    break
+                if latest_user_turn - image_turn > image_ttl_turns:
+                    continue
+            required.add("vision")
+            break
 
     tools_decision = _decide_tools_capability(body, tools_policy)
     if tools_decision.required:
@@ -1605,6 +1684,135 @@ def _supports_reasoning_content(
     return bool(provider_cfg.supports_reasoning_content)
 
 
+def _get_model_vision_capability(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> bool:
+    """Return whether a candidate declares the ``vision`` capability.
+
+    Prefix/provider matched over model_rules using the same best-score
+    pattern as ``_get_model_content_part_policy``.  Fail-closed: a model with
+    no matching rule is treated as NOT vision-capable, so image-history
+    stripping applies to it (decision doc-13).
+    """
+    best_has_vision: bool | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_has_vision = "vision" in entry.capabilities
+    return best_has_vision is True
+
+
+def _strip_image_history_for_candidate(
+    body: dict[str, Any], model: str, provider_name: str, runtime: RuntimeState
+) -> dict[str, Any]:
+    """Strip aged-out image parts from history for non-vision candidates (TASK-17).
+
+    Applies only when the opt-in ``image_history_stripping`` policy is enabled
+    AND the candidate does not declare the ``vision`` capability.  Aged-out
+    means the image's user turn is more than ``image_ttl_turns`` user turns
+    before the latest user message (counting user-role messages only).
+    The latest user message is never touched.  In-TTL images are retained:
+    routing is the actual guard that keeps non-vision candidates out of such
+    requests (any in-TTL image requires ``vision``); this function is the
+    safety net that removes AGED-OUT image parts — and, fail-closed, image
+    parts whose turn ordinal cannot be computed (non-user messages such as
+    tool outputs, or bodies with no user turn at all) — so a non-vision
+    candidate never receives a stale or unorderable image.  Images from
+    non-user messages are stripped whenever present: detection treats them
+    as vision-relevant, but if a non-vision body is ever prepared containing
+    one, stripping removes it.
+
+    Each aged ``image_url`` part is replaced by the configured placeholder
+    text (or dropped when the placeholder is empty).  Runs before
+    content-part normalization and cache_control injection so placeholders
+    survive reconstruction and markers land on the final body.
+    """
+    policy = runtime.config.smart_proxy.image_history_stripping
+    if policy is None or not policy.enabled:
+        return body
+    if _get_model_vision_capability(model, provider_name, runtime):
+        return body
+
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    latest_user_idx = max(
+        (
+            i
+            for i, m in enumerate(messages)
+            if isinstance(m, dict) and m.get("role") == "user"
+        ),
+        default=-1,
+    )
+    latest_user_turn = (
+        _user_turn_ordinal(messages, latest_user_idx) if latest_user_idx >= 0 else None
+    )
+
+    # Aged-out image-bearing message indexes (history, beyond TTL user turns).
+    # Images whose turn ordinal cannot be computed (non-user messages such as
+    # tool outputs, or bodies with no user turn at all) are fail-closed strip-
+    # eligible: detection keeps them vision-relevant, but if this body ever
+    # reaches a non-vision candidate, they must not survive the sanitizer.
+    image_indexes: list[int] = []
+    for i, m in enumerate(messages):
+        if i == latest_user_idx or not _message_has_image(m):
+            continue
+        image_turn = _user_turn_ordinal(messages, i)
+        if image_turn is None or latest_user_turn is None:
+            image_indexes.append(i)
+            continue
+        if latest_user_turn - image_turn > policy.image_ttl_turns:
+            image_indexes.append(i)
+    if not image_indexes:
+        return body
+
+    stripped_body = dict(body)
+    stripped_messages = list(messages)
+    stripped_parts = 0
+    for idx in image_indexes:
+        msg = messages[idx]
+        if not isinstance(msg, dict) or not isinstance(msg.get("content"), list):
+            continue
+        next_content: list[Any] = []
+        changed = False
+        for part in msg["content"]:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                changed = True
+                stripped_parts += 1
+                if policy.placeholder:
+                    next_content.append({"type": "text", "text": policy.placeholder})
+                continue
+            next_content.append(part)
+        if changed:
+            next_msg = dict(msg)
+            next_msg["content"] = next_content or ""
+            stripped_messages[idx] = next_msg
+
+    if not stripped_parts:
+        return body
+
+    stripped_body["messages"] = stripped_messages
+    logger.info(
+        "IMAGE_HISTORY_STRIPPED model=%s provider=%s stripped_messages=%d stripped_parts=%d",
+        model,
+        provider_name,
+        len(image_indexes),
+        stripped_parts,
+    )
+    return stripped_body
+
+
 def _sanitize_reasoning_content_for_candidate(
     body: dict[str, Any], model: str, provider_name: str, runtime: RuntimeState
 ) -> dict[str, Any]:
@@ -1751,18 +1959,22 @@ def _prepare_body_for_candidate(
     *,
     entry_async_mode: AsyncModeConfig | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """Sanitize, normalize, inject extra_body, apply async_mode, then cache_control.
+    """Sanitize, strip history images, normalize, inject extra_body, apply async_mode, then cache_control.
 
     Returns ``(prepared_body, extra_upstream_headers)``. The extra headers dict
     carries async ``header`` delivery mode values that ``_proxy_upstream`` merges
     after its own default headers.
 
-    Ordering: sanitize -> normalize -> extra_body merge -> async resolve + apply
+    Ordering: sanitize -> image-history strip (TASK-17, non-vision candidates
+    only) -> normalize -> extra_body merge -> async resolve + apply
     -> cache_control injection (last).  Cache injection runs last so
     content_part_policy normalization cannot strip the markers.
     """
     prepared = _sanitize_reasoning_content_for_candidate(
         body, model, provider_name, runtime
+    )
+    prepared = _strip_image_history_for_candidate(
+        prepared, model, provider_name, runtime
     )
     prepared = _normalize_message_content_for_candidate(
         prepared, model, provider_name, runtime
@@ -1954,6 +2166,15 @@ async def chat_completions(request: Request):
         required_capabilities = _detect_required_capabilities(
             body,
             state.config.smart_proxy.tools_capability_detection,
+            image_stripping_enabled=bool(
+                state.config.smart_proxy.image_history_stripping
+                and state.config.smart_proxy.image_history_stripping.enabled
+            ),
+            image_ttl_turns=(
+                state.config.smart_proxy.image_history_stripping.image_ttl_turns
+                if state.config.smart_proxy.image_history_stripping
+                else 3
+            ),
         )
         logger.info(
             "TOOLS_CAPABILITY policy=%s declared=%s required=%s trigger=%s request_id=%s profile=%s state_version=%d",
@@ -2284,6 +2505,15 @@ async def route_debug(request: Request):
     required_capabilities = _detect_required_capabilities(
         body,
         state.config.smart_proxy.tools_capability_detection,
+        image_stripping_enabled=bool(
+            state.config.smart_proxy.image_history_stripping
+            and state.config.smart_proxy.image_history_stripping.enabled
+        ),
+        image_ttl_turns=(
+            state.config.smart_proxy.image_history_stripping.image_ttl_turns
+            if state.config.smart_proxy.image_history_stripping
+            else 3
+        ),
     )
 
     try:
