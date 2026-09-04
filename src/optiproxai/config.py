@@ -140,15 +140,22 @@ class CacheControlConfig(BaseModel):
     """Opt-in prompt-caching marker injection policy.
 
     Providers that require explicit ``cache_control`` markers (e.g. Doubleword,
-    which follows Anthropic's prefix-cache model) get a marker injected into the
+    which follows Anthropic's prefix-cache model) get markers injected into the
     stable request prefix so cache discounts apply.  A marker caches everything
-    from the start of the request up to and including the marked block; the user
-    turn stays outside the cache.
+    from the start of the request up to and including the marked block.
 
     - ``target: system`` — marker on the last content block of the first system
-      message (caches tools + system prompt; largest stable prefix).
+      message (caches tools + system prompt).
     - ``target: tools`` — marker on the last object of the ``tools`` array
       (caches tool definitions only).
+    - ``target: last_message`` — marker on the last content block of the final
+      message (caches the multi-turn conversation prefix; TASK-21).
+
+    ``targets`` optionally overrides ``target`` with a list of breakpoints
+    applied in canonical request order (tools -> system -> last_message),
+    e.g. ``targets: [tools, system, last_message]``.  When ``targets`` is
+    unset, the effective target list is ``[target]`` (single-target
+    behavior).  When both are set, ``targets`` wins (doc-11).
 
     Resolution is presence-based highest-precedence-wins (decision doc-7):
     best-matching ``ModelRuleEntry.cache_control`` -> ``ProviderConfig.cache_control``
@@ -157,7 +164,15 @@ class CacheControlConfig(BaseModel):
 
     enabled: bool = False
     ttl: Literal["5m", "1h"] = "5m"
-    target: Literal["system", "tools"] = "system"
+    target: Literal["system", "tools", "last_message"] = "system"
+    targets: list[Literal["system", "tools", "last_message"]] | None = Field(
+        default=None,
+        description=(
+            "Multiple breakpoint targets applied in canonical request order "
+            "(tools -> system -> last_message).  Overrides ``target`` when "
+            "set; unset means the single ``target`` behavior."
+        ),
+    )
     max_breakpoints: int = Field(
         default=4,
         gt=0,

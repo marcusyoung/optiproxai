@@ -441,22 +441,42 @@ providers:
     cache_control:
       enabled: true          # default false
       ttl: "1h"              # "5m" (default) or "1h"
-      target: system         # "system" (default) or "tools"
+      target: system         # "system" (default), "tools", or "last_message"
       max_breakpoints: 4     # Doubleword's documented ceiling; tunable
 ```
 
 | `target` | Marker lands on | Cached prefix |
 |---|---|---|
-| `system` (default) | last block of the first system message (string content is converted to array form) | tools + system prompt — the largest stable prefix, biggest savings |
+| `system` (default) | last block of the first system message (string content is converted to array form) | tools + system prompt |
 | `tools` | last object of the `tools` array | tool definitions only |
+| `last_message` | last block of the final message | the entire multi-turn conversation prefix |
+
+### Multi-turn conversations (`targets`)
+
+`target: system` only caches tools + the system prompt. In real coding sessions the multi-turn conversation is the bulk of every request (~100k+ tokens), and it is itself prefix-stable: each turn appends to the previous conversation, so marking the final message caches everything up to it on the next turn. Only the new tail re-bills at full input price.
+
+Use the `targets` list to place multiple breakpoints in one request. Markers apply in canonical request order (tools → system → last_message) and `max_breakpoints` caps the total:
+
+```yaml
+model_rules:
+  - prefix: "deepseek-ai/DeepSeek-V4-Pro"
+    provider: "doubleword"
+    cache_control:
+      enabled: true
+      ttl: "1h"
+      targets: [tools, system, last_message]  # up to max_breakpoints markers
+      max_breakpoints: 4
+```
+
+When `targets` is unset, behavior is exactly the single `target` form. When both are set, `targets` wins.
 
 Resolution is presence-based highest-precedence-wins (no field-by-field merge): best-matching `ModelRuleEntry.cache_control` → `ProviderConfig.cache_control` → none. A rule with `enabled: false` explicitly opts out even when the provider enables injection.
 
 Injection rules:
 - Runs **after** `content_part_policy` normalization so markers survive reconstruction.
-- Never double-injects: client-provided markers are preserved, and injection is skipped when the landing block already carries a marker.
-- Respects `max_breakpoints`: no marker is added when the body already has that many `cache_control` occurrences.
-- Skips silently when the target container is missing (no system message, or no tools array).
+- Never double-injects: client-provided markers are preserved, and injection is skipped entirely when the body already carries any marker.
+- Respects `max_breakpoints`: markers beyond the budget are skipped (with `targets`, the earlier canonical-order targets win).
+- Skips silently when a target's container is missing (no system message, no tools array, or no messages for `last_message`).
 - Markers on models without cache pricing (e.g. `tencent/Hy3-FP8` on Doubleword) are ignored upstream and billed at standard rates — always safe to include.
 
 ### Cache metrics in the dashboard

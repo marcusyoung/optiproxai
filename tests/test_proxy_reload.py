@@ -1180,6 +1180,320 @@ class TestCacheControlInjection:
         assert body["messages"][0]["content"] == "you are helpful"
         assert "cache_control" not in str(body)
 
+    # --- TASK-21: conversation (last_message) target and multi-target breakpoints ---
+
+    def test_last_message_string_content_converted_to_array(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(
+                enabled=True, target="last_message"
+            )
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi there"},
+                {"role": "user", "content": "continue"},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        last = prepared["messages"][-1]
+        assert last["role"] == "user"
+        assert last["content"] == [
+            {"type": "text", "text": "continue", "cache_control": self._marker()}
+        ]
+        # System message untouched by the last_message target.
+        assert prepared["messages"][0]["content"] == "you are helpful"
+
+    def test_last_message_array_content_marker_on_last_block(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(
+                enabled=True, target="last_message"
+            )
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "part one"},
+                        {"type": "text", "text": "part two"},
+                    ],
+                },
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        content = prepared["messages"][-1]["content"]
+        assert content[0] == {"type": "text", "text": "part one"}
+        assert content[1] == {
+            "type": "text",
+            "text": "part two",
+            "cache_control": self._marker(),
+        }
+
+    def test_multi_target_tools_system_last_message_three_markers(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="deepseek-ai/DeepSeek-V4-Pro",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(
+                        enabled=True,
+                        ttl="1h",
+                        targets=["tools", "system", "last_message"],
+                    ),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "alpha"}},
+                {"type": "function", "function": {"name": "beta"}},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        # tools target: marker on last tool object
+        assert prepared["tools"][-1]["cache_control"] == self._marker("1h")
+        # system target: marker on last block of first system message
+        assert prepared["messages"][0]["content"][-1]["cache_control"] == self._marker(
+            "1h"
+        )
+        # last_message target: marker on last content block of final message
+        assert prepared["messages"][-1]["content"][-1]["cache_control"] == self._marker(
+            "1h"
+        )
+        assert proxy_mod._count_cache_control_markers(prepared) == 3
+
+    def test_multi_target_max_breakpoints_truncation(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="deepseek-ai/DeepSeek-V4-Pro",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(
+                        enabled=True,
+                        targets=["tools", "system", "last_message"],
+                        max_breakpoints=2,
+                    ),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "alpha"}},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        # Canonical order tools -> system -> last_message; budget 2 stops after system.
+        assert prepared["tools"][-1].get("cache_control") == self._marker()
+        assert prepared["messages"][0]["content"][-1].get("cache_control") == (
+            self._marker()
+        )
+        # Budget exhausted: final message untouched (string content stays string).
+        assert prepared["messages"][-1]["content"] == "hello"
+        assert proxy_mod._count_cache_control_markers(prepared) == 2
+
+    def test_client_marker_suppresses_multi_target_injection(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="deepseek-ai/DeepSeek-V4-Pro",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(
+                        enabled=True, targets=["tools", "system", "last_message"]
+                    ),
+                ),
+            ],
+        )
+        marker = self._marker()
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "client marker",
+                            "cache_control": marker,
+                        }
+                    ],
+                },
+            ],
+            "tools": [{"type": "function", "function": {"name": "alpha"}}],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        assert prepared == body
+
+    def test_last_message_skips_when_no_messages(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(
+                enabled=True, target="last_message"
+            )
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "tools": [{"type": "function", "function": {"name": "alpha"}}],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        assert prepared == body
+
+    def test_rule_targets_outrank_provider_single_target(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True, target="system"),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="deepseek-ai/DeepSeek-V4-Pro",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(
+                        enabled=True, targets=["tools", "system", "last_message"]
+                    ),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "alpha"}}],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        assert proxy_mod._count_cache_control_markers(prepared) == 3
+
+    def test_targets_duplicates_deduped(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="deepseek-ai/DeepSeek-V4-Pro",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(
+                        enabled=True, targets=["system", "system", "last_message"]
+                    ),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        # Duplicate "system" collapses to one marker; "last_message" applies too.
+        assert proxy_mod._count_cache_control_markers(prepared) == 2
+
+    def test_multi_target_no_mutation_of_original_body(self):
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="deepseek-ai/DeepSeek-V4-Pro",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(
+                        enabled=True, targets=["tools", "system", "last_message"]
+                    ),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+            "tools": [{"type": "function", "function": {"name": "alpha"}}],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        assert prepared is not body
+        assert body["messages"][0]["content"] == "you are helpful"
+        assert body["messages"][-1]["content"] == "hello"
+        assert "cache_control" not in str(body)
+        assert body["tools"] == [{"type": "function", "function": {"name": "alpha"}}]
+
+    def test_empty_targets_list_disables_injection(self):
+        # Explicit empty targets wins over the single-target fallback (doc-11):
+        # no breakpoints at all, even though target would have injected one.
+        state = self._state(
+            provider_cache_control=CacheControlConfig(enabled=True, target="system"),
+            model_rules=[
+                ModelRuleEntry(
+                    prefix="deepseek-ai/DeepSeek-V4-Pro",
+                    provider="doubleword",
+                    cache_control=CacheControlConfig(enabled=True, targets=[]),
+                ),
+            ],
+        )
+        body: dict[str, Any] = {
+            "model": "deepseek-ai/DeepSeek-V4-Pro",
+            "messages": [
+                {"role": "system", "content": "you are helpful"},
+                {"role": "user", "content": "hello"},
+            ],
+        }
+
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "deepseek-ai/DeepSeek-V4-Pro", "doubleword", state
+        )
+
+        assert prepared == body
+
 
 class TestAdminReloadAuth:
     def test_reload_rejected_without_token(self, configured_proxy):

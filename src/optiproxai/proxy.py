@@ -1348,46 +1348,66 @@ def _count_cache_control_markers(body: dict[str, Any]) -> int:
     return count
 
 
-def _apply_cache_control(
-    body: dict[str, Any], config: CacheControlConfig
-) -> dict[str, Any]:
-    """Inject a cache_control marker into the stable prefix per target.
+def _mark_content_last_block(
+    content: str | list[Any] | None, marker: dict[str, str]
+) -> tuple[Any, bool] | None:
+    """Return (new_content, converted_to_array) with a marker on the last block.
 
-    Returns the original *body* unchanged when injection is skipped (disabled
-    config, client already sent markers, target container missing/empty, or
-    breakpoint limit reached).  Returns a shallow-copied body when a marker is
-    injected; never mutates the caller's dict in place.
-
-    Marker shape follows Doubleword's Anthropic-style prefix caching:
-    ``{"type": "ephemeral", "ttl": <ttl>}``.
-
-    - ``target: "system"``: marker on the last content block of the first
-      system message.  String content is converted to array form.
-    - ``target: "tools"``: marker on the last object of the ``tools`` array.
-
-    Client-provided markers are preserved by skipping injection entirely when
-    any ``cache_control`` marker already exists in the body (same principle as
-    ``_has_explicit_reasoning_control``).  This prevents adding a new breakpoint
-    that would change the client's intended caching boundaries.
+    Returns None when there is no content to mark (missing or empty).  String
+    content is converted to array form; the caller replaces the message's
+    content with the returned value.
     """
-    if not config.enabled:
-        return body
-    if _count_cache_control_markers(body) > 0:
-        logger.debug("CACHE_CONTROL skip: client markers already present in body")
-        return body
-    if _count_cache_control_markers(body) >= config.max_breakpoints:
-        logger.debug(
-            "CACHE_CONTROL skip: breakpoint limit reached limit=%d",
-            config.max_breakpoints,
-        )
-        return body
+    if isinstance(content, str):
+        return ([{"type": "text", "text": content, "cache_control": marker}], True)
+    if isinstance(content, list) and content:
+        last_part = content[-1]
+        new_content = list(content)
+        if isinstance(last_part, dict):
+            new_content[-1] = {**last_part, "cache_control": marker}
+        else:
+            new_content[-1] = {
+                "type": "text",
+                "text": str(last_part),
+                "cache_control": marker,
+            }
+        return (new_content, False)
+    return None
 
-    marker = {"type": "ephemeral", "ttl": config.ttl}
 
-    if config.target == "system":
-        messages = body.get("messages")
-        if not isinstance(messages, list):
-            return body
+def _inject_target_marker(
+    body: dict[str, Any],
+    target: str,
+    marker: dict[str, str],
+    messages: list[Any] | None,
+) -> tuple[list[Any] | None, list[Any] | None]:
+    """Return (new_tools_or_None, new_messages_or_None) after one target injection.
+
+    ``new_tools`` is a new list when the target is "tools", else None (body's
+    tools untouched).  ``new_messages`` is a new list when the target is
+    "system" or "last_message", else None.  Both None means the target was
+    skipped (container missing/empty).
+    """
+    if target == "tools":
+        tools = body.get("tools")
+        if not isinstance(tools, list) or not tools:
+            logger.debug("CACHE_CONTROL skip: no tools array")
+            return None, None
+        last_tool = tools[-1]
+        new_tools = list(tools)
+        if isinstance(last_tool, dict):
+            new_tools[-1] = {**last_tool, "cache_control": marker}
+        else:
+            new_tools[-1] = {
+                "type": "function",
+                "function": last_tool,
+                "cache_control": marker,
+            }
+        return new_tools, None
+
+    if messages is None:
+        return None, None
+
+    if target == "system":
         system_idx = next(
             (
                 idx
@@ -1398,51 +1418,119 @@ def _apply_cache_control(
         )
         if system_idx is None:
             logger.debug("CACHE_CONTROL skip: no system message")
-            return body
-        msg = messages[system_idx]
-        content = msg.get("content")
-        new_messages = list(messages)
-        if isinstance(content, str):
-            new_msg = dict(msg)
-            new_msg["content"] = [
-                {"type": "text", "text": content, "cache_control": marker}
-            ]
-            new_messages[system_idx] = new_msg
-        elif isinstance(content, list) and content:
-            last_part = content[-1]
-            new_msg = dict(msg)
-            new_content = list(content)
-            if isinstance(last_part, dict):
-                new_content[-1] = {**last_part, "cache_control": marker}
-            else:
-                new_content[-1] = {
-                    "type": "text",
-                    "text": str(last_part),
-                    "cache_control": marker,
-                }
-            new_msg["content"] = new_content
-            new_messages[system_idx] = new_msg
-        else:
+            return None, None
+        result = _mark_content_last_block(messages[system_idx].get("content"), marker)
+        if result is None:
             logger.debug("CACHE_CONTROL skip: system message has no content")
-            return body
-        return {**body, "messages": new_messages}
+            return None, None
+        new_content, _ = result
+        new_messages = list(messages)
+        new_msg = dict(messages[system_idx])
+        new_msg["content"] = new_content
+        new_messages[system_idx] = new_msg
+        return None, new_messages
 
-    # target == "tools"
-    tools = body.get("tools")
-    if not isinstance(tools, list) or not tools:
-        logger.debug("CACHE_CONTROL skip: no tools array")
-        return body
-    last_tool = tools[-1]
-    new_tools = list(tools)
-    if isinstance(last_tool, dict):
-        new_tools[-1] = {**last_tool, "cache_control": marker}
+    # target == "last_message": mark the final message's last content block.
+    if not messages:
+        logger.debug("CACHE_CONTROL skip: no messages for last_message target")
+        return None, None
+    last_idx = len(messages) - 1
+    last_msg = messages[last_idx]
+    if not isinstance(last_msg, dict):
+        return None, None
+    result = _mark_content_last_block(last_msg.get("content"), marker)
+    if result is None:
+        logger.debug("CACHE_CONTROL skip: last message has no content")
+        return None, None
+    new_content, _ = result
+    new_messages = list(messages)
+    new_msg = dict(last_msg)
+    new_msg["content"] = new_content
+    new_messages[last_idx] = new_msg
+    return None, new_messages
+
+
+def _effective_cache_targets(config: CacheControlConfig) -> list[str]:
+    """Return the effective breakpoint targets in canonical request order.
+
+    ``targets`` wins when set, including an explicitly empty list (no
+    breakpoints — no injection); otherwise the single ``target`` is used
+    (doc-11).  Duplicates are dropped preserving first occurrence.
+    Canonical order: tools -> system -> last_message (request serialization
+    order, matching how Anthropic-style prefix caching bills).
+    """
+    if config.targets is not None:
+        effective = list(dict.fromkeys(config.targets))
     else:
-        new_tools[-1] = {
-            "type": "function",
-            "function": last_tool,
-            "cache_control": marker,
-        }
-    return {**body, "tools": new_tools}
+        effective = [config.target]
+    order = {"tools": 0, "system": 1, "last_message": 2}
+    return sorted(effective, key=lambda t: order.get(t, 99))
+
+
+def _apply_cache_control(
+    body: dict[str, Any], config: CacheControlConfig
+) -> dict[str, Any]:
+    """Inject cache_control markers into the stable prefix per target(s).
+
+    Returns the original *body* unchanged when injection is skipped (disabled
+    config, client already sent markers, empty effective target list, or no
+    target's container exists).  Returns a shallow-copied body when at least
+    one marker is injected; never mutates the caller's dict in place.
+
+    Marker shape follows Doubleword's Anthropic-style prefix caching:
+    ``{"type": "ephemeral", "ttl": <ttl>}``.
+
+    Effective targets (doc-11): the ``targets`` list when set, else
+    ``[target]``.  Targets apply in canonical request order:
+
+    - ``"tools"``: marker on the last object of the ``tools`` array.
+    - ``"system"``: marker on the last content block of the first system
+      message.  String content is converted to array form.
+    - ``"last_message"``: marker on the last content block of the final
+      message (caches the multi-turn conversation prefix; TASK-21).
+
+    ``max_breakpoints`` is enforced per injected marker: targets beyond the
+    remaining budget are skipped.  Client-provided markers are preserved by
+    skipping injection entirely when any ``cache_control`` marker already
+    exists in the body (same principle as ``_has_explicit_reasoning_control``).
+    """
+    if not config.enabled:
+        return body
+    if _count_cache_control_markers(body) > 0:
+        logger.debug("CACHE_CONTROL skip: client markers already present in body")
+        return body
+
+    marker: dict[str, str] = {"type": "ephemeral", "ttl": config.ttl}
+    budget = config.max_breakpoints
+    tools: list[Any] | None = None
+    messages: list[Any] | None = (
+        body.get("messages") if isinstance(body.get("messages"), list) else None
+    )
+    injected = 0
+
+    for target in _effective_cache_targets(config):
+        if injected >= budget:
+            logger.debug(
+                "CACHE_CONTROL stop: breakpoint limit reached limit=%d", budget
+            )
+            break
+        new_tools, new_messages = _inject_target_marker(body, target, marker, messages)
+        if new_tools is None and new_messages is None:
+            continue
+        injected += 1
+        if new_tools is not None:
+            tools = new_tools
+        if new_messages is not None:
+            messages = new_messages
+
+    if injected == 0:
+        return body
+    new_body = dict(body)
+    if tools is not None:
+        new_body["tools"] = tools
+    if messages is not None:
+        new_body["messages"] = messages
+    return new_body
 
 
 def _get_model_content_part_policy(
@@ -1726,10 +1814,10 @@ def _prepare_body_for_candidate(
     if cache_control is not None and cache_control.enabled:
         prepared = _apply_cache_control(prepared, cache_control)
         logger.info(
-            "CACHE_CONTROL model=%s provider=%s target=%s ttl=%s",
+            "CACHE_CONTROL model=%s provider=%s targets=%s ttl=%s",
             model,
             provider_name,
-            cache_control.target,
+            ",".join(_effective_cache_targets(cache_control)),
             cache_control.ttl,
         )
     return prepared, extra_headers
