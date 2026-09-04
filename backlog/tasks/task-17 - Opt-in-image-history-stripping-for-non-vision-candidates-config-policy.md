@@ -4,7 +4,7 @@ title: Opt-in image-history stripping for non-vision candidates (config policy)
 status: Done
 assignee: []
 created_date: '2026-08-28 15:24'
-updated_date: '2026-09-04 13:45'
+updated_date: '2026-09-04 14:01'
 labels:
   - enhancement
   - routing
@@ -65,92 +65,48 @@ Fits existing machinery: proxy already rewrites message content per candidate (_
 ## Implementation Plan
 
 <!-- SECTION:PLAN:BEGIN -->
-# TASK-17 Implementation Plan — Opt-in image-history stripping for non-vision candidates
+# TASK-17 Implementation Plan — Opt-in image-history stripping for non-vision candidates (REVISED: turn-based TTL)
 
-## Approach
+NOTE: This plan supersedes the original approved plan (message-count window) — corrected during branch review to turn-based TTL semantics. Implemented and verified 2026-09-04; see final summary + notes.
+
+## Approach (as implemented)
 
 Two coupled changes (decision doc-13):
 
-1. **Vision-scope softening** in `_detect_required_capabilities` (proxy.py ~433): images in the latest user message are a hard `vision` requirement; images only in older history are soft when the policy is enabled — `vision` is then not added to `required_capabilities`, so the router's existing capability filter stops pinning the session to vision models. Policy disabled (default) = bit-identical current behavior.
-2. **Per-candidate stripping** in the `_prepare_body_for_candidate` chain (proxy.py ~1746): new `_strip_image_history_for_candidate` runs after reasoning-content sanitize, before content-part normalization and cache_control injection. Applies iff policy enabled AND candidate lacks `vision` capability. Fallbacks covered automatically (per-candidate dispatch at ~967 and ~1045).
+1. **TTL-scoped vision requirement** in `_detect_required_capabilities`: `vision` is required iff the latest user message has an image OR any image-bearing message is within `image_ttl_turns` user turns of the latest user message (user-turn ordinals count user-role messages only; assistant/tool turns don't advance aging). Fail-closed: images whose ordinal cannot be computed (non-user messages, or bodies with no user message) always require `vision`.
+2. **Per-candidate stripping** in `_prepare_body_for_candidate` (`_strip_image_history_for_candidate`, after reasoning-content sanitize, before content-part normalization and cache_control injection): for candidates lacking `vision` (best-score match over model_rules, fail-closed: no rule = non-vision), every AGED-OUT history image part — and every unorderable image part — is replaced with the deterministic placeholder (empty = drop). In-TTL images are retained: routing itself keeps non-vision candidates out of such requests. Non-vision candidates never receive image parts through this path.
 
-Last-context cache interaction (decision doc-14): keep the inflated cached estimate on stripped turns; no cache invalidation. One escalated turn, self-healing on the next provider-reported prompt_tokens.
+Last-context cache interaction (decision doc-14): keep inflated cached estimate on stripped turns; no invalidation; one escalated turn, self-heals next turn.
 
-## User-facing config options
+Cache interaction: placeholder is deterministic → stripped prefix byte-stable after one transition write on the aging turn.
 
-All under `smart_proxy:` in the user config file:
+## User-facing config
 
 ```yaml
 smart_proxy:
   image_history_stripping:
-    enabled: true                # default false — opt-in; false/absent = current behavior
-    keep_recent_images: 1        # keep the N most recent image-bearing user messages
-                                 # in history; strip image parts from older ones (gt=0)
-    placeholder: "[image omitted]"  # text replacing a stripped image part;
-                                    # empty string "" drops the part silently
+    enabled: true                   # default false; absent block = off (bit-identical pre-feature behavior)
+    image_ttl_turns: 3              # user turns an image stays vision-relevant (gt=0); send turn + 2 follow-ups
+    placeholder: "[image omitted]"  # empty string "" drops the part silently
 ```
 
-- `enabled: false` or the key omitted entirely → no detection softening, no stripping (bit-identical to current behavior).
-- `keep_recent_images` — how many of the most recent image-bearing user messages survive in history. The latest user message is always protected regardless of this value.
-- `placeholder` — text sent to the model in place of a stripped image. Empty string = silently remove the part.
-- No per-provider or per-model config: stripping is driven purely by the candidate's declared `vision` capability in `model_rules` (fail-closed: models with no matching rule are treated as non-vision and get stripped bodies), so no new rule fields.
+## Files modified
 
-## Files to modify
+- src/optiproxai/config.py — ImageHistoryStrippingConfig on SmartProxyConfig
+- src/optiproxai/proxy.py — _user_turn_ordinal, _detect_required_capabilities TTL+fail-closed, _get_model_vision_capability, _strip_image_history_for_candidate, prep-chain wiring, both detection call sites
+- tests/test_proxy_reload.py — TestImageHistoryStripping (19 tests)
+- README.md, config.example.yaml — documented
 
-- `src/optiproxai/config.py` — new `ImageHistoryStrippingConfig` BaseModel (enabled: bool = False; keep_recent_images: int = Field(default=1, gt=0); placeholder: str = "[image omitted]"); field `image_history_stripping: ImageHistoryStrippingConfig | None = None` on `SmartProxyConfig` (None = off, preserves config compat; presence = opt-in). Update `config.example.yaml`.
-- `src/optiproxai/proxy.py`:
-  - `_detect_required_capabilities(body, tools_policy, *, image_stripping_enabled: bool = False)` — new keyword-only param (default False keeps all existing callers/tests green); move image detection into a helper that classifies each `image_url` block as latest-user-message vs history. Call site at ~1954 passes `image_stripping_enabled=bool(state.config.smart_proxy.image_history_stripping and ...enabled)`.
-  - New `_get_model_vision_capability(model, provider_name, runtime) -> bool` — prefix/provider matched over model_rules (same best-score pattern as `_get_model_content_part_policy`); returns True when a matching rule declares `vision` in capabilities. Fail-closed: no matching rule → False (non-vision, strippable), per user decision 2026-09-04.
-  - New `_strip_image_history_for_candidate(body, model, provider_name, runtime) -> dict` — walks messages EXCLUDING the latest user message; tracks image-bearing user message indexes from the end; keeps the most recent `keep_recent_images`; replaces older `image_url` parts with `{"type": "text", "text": placeholder}` (empty placeholder → drop part); logs `IMAGE_HISTORY_STRIPPED` INFO.
-  - `_prepare_body_for_candidate` — insert strip step between `_sanitize_reasoning_content_for_candidate` and `_normalize_message_content_for_candidate`.
-- `tests/test_proxy_reload.py` — new `TestImageHistoryStripping` class (see tests below).
-- `README.md` — Capability-aware routing section: new "Image-history stripping" subsection documenting config, semantics, quality caveat, one-turn escalation consequence; references doc-12/13/14.
-- `config.example.yaml` — documented example block under `smart_proxy:`.
+## Session-sticky / tier changes
 
-## Sub-steps (ordered)
+Session-sticky selection is a stateless per-request hash over the current filtered candidate list; tier changes re-run selection correctly. No handling needed.
 
-1. Config model + validation + example yaml (no behavior change without enablement).
-2. `_detect_required_capabilities` softening + call-site update.
-3. `_get_model_vision_capability` helper (fail-closed default).
-4. `_strip_image_history_for_candidate` sanitizer + `_prepare_body_for_candidate` wiring.
-5. Tests.
-6. README docs.
+## Validation notes
 
-## Session-sticky behavior across tier changes (verified in router.py, answered for user)
-
-Session-sticky selection is a deterministic hash of the session key over the *current* filtered candidate list (router.py `_select_primary_candidate`, ~826-860) — there is no persisted session→model state. On a tier change (scorer moves the session to another tier, or input-limit escalation kicks in), selection simply re-runs over the new tier's candidate list:
-
-- Same vision model present in both tiers (common here: syn:large:vision appears in multiple tiers): the hash may land on it again — accepted by user ("if that was the selected tier model then no problem").
-- Different candidate sets: a new model is selected; if it lacks `vision`, stripping applies and the request works correctly.
-
-No additional handling needed; behavior is correct by construction. doc-13 known limitation updated accordingly.
-
-## Constraints / risks
-
-- Ordering matters: strip BEFORE normalization so `content_part_policy` cannot resurrect/duplicate placeholder text, and before cache_control so markers land on the final body (README 476 invariant preserved).
-- Fallback bodies are deep-copied from the ORIGINAL body (`fallback_body_base`), so stripping must be idempotent and re-applied per candidate — it is, being in `_prepare_body_for_candidate`.
-- Byte-stability: stripping happens every turn for non-vision candidates while images remain beyond the window, so the stripped prefix IS stable turn-over-turn (placeholder text is deterministic) — provider caches see a stable byte prefix after the first stripped turn.
-- Session-sticky primary may keep the session on the vision model after images age out (doc-13 known limitation, accepted for v1 by user).
-- Non-goal: no changes to router.py, scorer.py, dashboard, or CLI.
-
-## Tests (TestImageHistoryStripping)
-
-- detection: images only in history + policy enabled → no `vision` in required; latest-message image → `vision` required regardless; policy disabled → current behavior.
-- strip: non-vision candidate gets placeholder for images beyond window; latest user message never touched; `keep_recent_images=2` keeps two most recent image-bearing messages; empty placeholder drops parts; model with no matching rule is treated as non-vision (fail-closed).
-- per-candidate: vision-capable candidate body unchanged for same request; non-vision fallback of vision primary gets stripped body.
-- ordering: placeholder text survives content_part_policy normalization; cache_control injection unaffected (existing TestCacheControlInjection suite must stay green).
-- logging: IMAGE_HISTORY_STRIPPED emitted with counts.
-- config: gt=0 validation on keep_recent_images; disabled-by-default no-op.
-
-## Task Manifest
-
-| # | Title | Files | Depends On | Labels | Acceptance Criterion |
-|---|---|---|---|---|---|
-| 1 | Add ImageHistoryStrippingConfig model and config plumbing | src/optiproxai/config.py, config.example.yaml | — | logic, config | OptiproxaiConfig accepts smart_proxy.image_history_stripping with enabled/keep_recent_images(gt=0)/placeholder defaults and validation rejects keep_recent_images=0 |
-| 2 | Soften vision detection for history-only images | src/optiproxai/proxy.py | 1 | logic | With policy enabled, history-only images do not add vision to required capabilities; latest-message images always do; disabled policy is bit-identical to current behavior |
-| 3 | Add per-candidate image-history sanitizer in prep chain | src/optiproxai/proxy.py | 1 | logic | Non-vision candidates receive history-stripped bodies (placeholder applied, latest user message untouched, keep_recent_images window honored, fail-closed for undeclared models); vision-capable candidates unchanged; runs before normalization and cache_control |
-| 4 | Add TestImageHistoryStripping suite | tests/test_proxy_reload.py | 2, 3 | test | All new tests pass and full existing suite (incl. TestCacheControlInjection) stays green |
-| 5 | Document image-history stripping | README.md | 1, 2, 3 | docs, style | README Capability-aware routing section documents config options, semantics, quality caveat, and one-turn escalation consequence; ruff and pyright clean |
+- Disabled policy = bit-identical current behavior.
+- Strip before normalization so placeholders survive content_part_policy; markers injected last.
+- Fallbacks: non-vision fallbacks only eligible once vision not required; bodies guaranteed image-free through sanitizer.
+- Non-goal: no changes to router.py, scorer.py, dashboard, or CLI (router union-vs-best-score divergence filed as TASK-22).
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes

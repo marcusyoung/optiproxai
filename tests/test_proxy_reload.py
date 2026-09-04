@@ -1623,6 +1623,45 @@ class TestImageHistoryStripping:
         )
         assert "vision" in caps
 
+    def test_detection_non_user_image_message_fail_closed(self):
+        # An image_url in a NON-user message (e.g. a tool output) has no user
+        # turn ordinal; fail-closed keeps vision required.
+        body = self._body()
+        body["messages"] = [
+            {"role": "system", "content": "you are helpful"},
+            {
+                "role": "tool",
+                "content": [
+                    {"type": "text", "text": "screenshot result"},
+                    {"type": "image_url", "image_url": {"url": "img-tool"}},
+                ],
+            },
+            {"role": "user", "content": "what do you see?"},
+        ]
+        caps = proxy_mod._detect_required_capabilities(
+            body, image_stripping_enabled=True
+        )
+        assert "vision" in caps
+
+    def test_detection_no_user_message_fail_closed(self):
+        # A body with no user message at all: ordinal uncomputable ->
+        # fail-closed requires vision.
+        body = self._body()
+        body["messages"] = [
+            {"role": "system", "content": "you are helpful"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "here is the chart"},
+                    {"type": "image_url", "image_url": {"url": "img-asst"}},
+                ],
+            },
+        ]
+        caps = proxy_mod._detect_required_capabilities(
+            body, image_stripping_enabled=True
+        )
+        assert "vision" in caps
+
     # --- per-candidate stripping ---
 
     def test_strip_policy_disabled_leaves_body_unchanged(self):
@@ -1708,6 +1747,35 @@ class TestImageHistoryStripping:
             {"type": "text", "text": "turn 2"},
             {"type": "text", "text": "[image omitted]"},
         ]
+
+    def test_strip_non_user_image_message_always_stripped_for_non_vision(self):
+        from optiproxai.config import ImageHistoryStrippingConfig
+
+        # A tool-output image part has no user turn ordinal; the sanitizer
+        # strips it for non-vision candidates even with a generous TTL.
+        state = self._config(
+            image_history_stripping=ImageHistoryStrippingConfig(enabled=True)
+        )
+        body = self._body()
+        body["messages"] = [
+            {"role": "system", "content": "you are helpful"},
+            {
+                "role": "tool",
+                "content": [
+                    {"type": "text", "text": "screenshot result"},
+                    {"type": "image_url", "image_url": {"url": "img-tool"}},
+                ],
+            },
+            {"role": "user", "content": "what do you see?"},
+        ]
+        prepared, _ = proxy_mod._prepare_body_for_candidate(
+            body, "cx/vision-pro", "dummy", state
+        )
+        assert prepared["messages"][1]["content"] == [
+            {"type": "text", "text": "screenshot result"},
+            {"type": "text", "text": "[image omitted]"},
+        ]
+        assert prepared["messages"][2] == body["messages"][2]
 
     def test_strip_vision_capable_candidate_unchanged(self):
         from optiproxai.config import ImageHistoryStrippingConfig

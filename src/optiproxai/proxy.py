@@ -520,7 +520,12 @@ def _detect_required_capabilities(
                 # tool turns in between do not advance aging).
                 image_turn = _user_turn_ordinal(messages, i)
                 if image_turn is None or latest_user_turn is None:
-                    continue
+                    # Fail-closed: cannot order this image relative to user
+                    # turns (non-user message, or no user turn exists), so
+                    # keep it vision-relevant rather than risk routing an
+                    # image-bearing body to non-vision candidates.
+                    required.add("vision")
+                    break
                 if latest_user_turn - image_turn > image_ttl_turns:
                     continue
             required.add("vision")
@@ -1714,24 +1719,19 @@ def _strip_image_history_for_candidate(
 
     Applies only when the opt-in ``image_history_stripping`` policy is enabled
     AND the candidate does not declare the ``vision`` capability.  Aged-out
-    means older than ``image_ttl_turns`` user turns before the latest user
-    message; images within TTL are still vision-relevant, so non-vision
-    candidates are not selected for such requests anyway.  The latest user
-    message is never touched.  Non-vision candidates therefore never receive
-    image parts.  Each aged ``image_url`` part is replaced by the configured
-    placeholder text (or dropped when the placeholder is empty).  Runs before
-    content-part normalization and cache_control injection so placeholders
-    survive reconstruction and markers land on the final body.
-    """
-    """Strip aged-out image parts from history for non-vision candidates (TASK-17).
-
-    Applies only when the opt-in ``image_history_stripping`` policy is enabled
-    AND the candidate does not declare the ``vision`` capability.  Aged-out
     means the image's user turn is more than ``image_ttl_turns`` user turns
-    before the latest user message (counting user-role messages only);
-    images within TTL are still vision-relevant, so non-vision candidates are
-    not selected for such requests anyway.  The latest user message is never
-    touched.  Non-vision candidates therefore never receive image parts.
+    before the latest user message (counting user-role messages only).
+    The latest user message is never touched.  In-TTL images are retained:
+    routing is the actual guard that keeps non-vision candidates out of such
+    requests (any in-TTL image requires ``vision``); this function is the
+    safety net that removes AGED-OUT image parts — and, fail-closed, image
+    parts whose turn ordinal cannot be computed (non-user messages such as
+    tool outputs, or bodies with no user turn at all) — so a non-vision
+    candidate never receives a stale or unorderable image.  Images from
+    non-user messages are stripped whenever present: detection treats them
+    as vision-relevant, but if a non-vision body is ever prepared containing
+    one, stripping removes it.
+
     Each aged ``image_url`` part is replaced by the configured placeholder
     text (or dropped when the placeholder is empty).  Runs before
     content-part normalization and cache_control injection so placeholders
@@ -1760,12 +1760,17 @@ def _strip_image_history_for_candidate(
     )
 
     # Aged-out image-bearing message indexes (history, beyond TTL user turns).
+    # Images whose turn ordinal cannot be computed (non-user messages such as
+    # tool outputs, or bodies with no user turn at all) are fail-closed strip-
+    # eligible: detection keeps them vision-relevant, but if this body ever
+    # reaches a non-vision candidate, they must not survive the sanitizer.
     image_indexes: list[int] = []
     for i, m in enumerate(messages):
         if i == latest_user_idx or not _message_has_image(m):
             continue
         image_turn = _user_turn_ordinal(messages, i)
         if image_turn is None or latest_user_turn is None:
+            image_indexes.append(i)
             continue
         if latest_user_turn - image_turn > policy.image_ttl_turns:
             image_indexes.append(i)
