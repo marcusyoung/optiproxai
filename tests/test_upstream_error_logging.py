@@ -46,7 +46,7 @@ def _upstream_response(
 
 
 class TestLogUpstreamErrorHelper:
-    def test_writes_jsonl_event_with_all_fields(self, tmp_path) -> None:
+    def test_writes_jsonl_event_with_all_fields(self) -> None:
         proxy._log_upstream_error(
             model_name="syn:large:vision",
             actual_provider="synthetic",
@@ -153,7 +153,7 @@ class TestLogUpstreamErrorHelper:
         assert "provider=synthetic" in message
         assert "model=syn:large:vision" in message
 
-    def test_persists_to_dashboard_db(self, tmp_path) -> None:
+    def test_persists_to_dashboard_db(self) -> None:
         proxy._log_upstream_error(
             model_name="m",
             actual_provider="p",
