@@ -8,6 +8,12 @@ import tiktoken
 
 _CHARS_PER_TOKEN = 4  # fallback when tiktoken is unavailable
 
+# Flat token cost charged per ``image_url`` content part. Real provider-side
+# image cost is small and resolution-based (doc-12 bake-off: ~2058 tokens for a
+# ~1.3 MB image); tokenizing the base64 data URI as text inflates the estimate
+# by orders of magnitude, so images are counted as a fixed constant instead.
+_IMAGE_PART_TOKEN_ESTIMATE = 2048
+
 # Module-level cache: model name (or "") → tiktoken Encoding | None
 _encoder_cache: dict[str, tiktoken.Encoding | None] = {}
 
@@ -71,6 +77,32 @@ def _estimate_tools_tokens(
     return total
 
 
+def _count_content_tokens(
+    enc: tiktoken.Encoding | None,
+    content: Any,
+) -> int:
+    """Token cost of a message ``content`` field, image-aware.
+
+    ``content`` may be a string, ``None``, or a list of content parts. An
+    ``image_url`` part is charged a fixed ``_IMAGE_PART_TOKEN_ESTIMATE`` instead
+    of tokenizing its (potentially megabyte-scale) data URI as text; all other
+    parts are counted as before via ``_count_str_tokens``.
+    """
+    if isinstance(content, list):
+        total = 0
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                total += _IMAGE_PART_TOKEN_ESTIMATE
+            elif isinstance(part, dict):
+                # Count a text part's textual payload; fall back to str() for
+                # unknown part shapes (same as the pre-image handling).
+                total += _count_str_tokens(enc, part.get("text", part))
+            else:
+                total += _count_str_tokens(enc, part)
+        return total
+    return _count_str_tokens(enc, content)
+
+
 def _estimate_tokens(
     messages: list[dict[str, Any]],
     model: str | None = None,
@@ -91,7 +123,7 @@ def _estimate_tokens(
     enc = _get_encoder(model)
     total = 0
     for m in messages:
-        total += _count_str_tokens(enc, m.get("content", ""))
+        total += _count_content_tokens(enc, m.get("content", ""))
         total += _count_str_tokens(enc, m.get("role"))
         total += _count_str_tokens(enc, m.get("name"))
         total += _count_str_tokens(enc, m.get("tool_call_id"))
