@@ -379,7 +379,7 @@ class TestRouterLogging:
 
 
 def _promotion_config() -> OptiproxaiConfig:
-    """Config with multiple fallbacks and an explicit primary_selection policy."""
+    """Config with multiple fallbacks; callers set primary_selection as needed."""
     return OptiproxaiConfig(
         providers={
             "openrouter": ProviderConfig(
@@ -462,11 +462,32 @@ class TestPromotedFallbackConfigOrder:
     def test_round_robin_promotion_respects_config_order(self) -> None:
         """Rotation state does not reorder a promoted fallback list."""
         config = _promotion_config()
+        backoff_state = FallbackBackoffState(config.smart_proxy.fallback_backoff)
+        # Cool down both primaries so the fallback list is promoted to primary.
+        backoff_state.record_retryable_failure("model-a", "openrouter")
+        backoff_state.record_retryable_failure("model-b", "openrouter")
+        router = Router(config, fallback_backoff_state=backoff_state)
 
-        decision = self._route_promoted(config)
+        with patch.object(
+            Router,
+            "_classify",
+            return_value={
+                "tier": "SIMPLE",
+                "score": 0.1,
+                "confidence": 0.9,
+                "signals": ["method"],
+                "signal_details": {"method": {"raw": "distilled-features"}},
+                "agentic_score": 0.0,
+            },
+        ):
+            # First route advances the router's round-robin state to index 1;
+            # the second promotion must still select config order (index 0).
+            first = router.route([{"role": "user", "content": "hi"}], profile="auto")
+            second = router.route([{"role": "user", "content": "hi"}], profile="auto")
 
-        assert decision.model == "model-first"
-        assert [f.model for f in decision.fallbacks] == [
+        assert first.model == "model-first"
+        assert second.model == "model-first"
+        assert [f.model for f in second.fallbacks] == [
             "model-second",
             "model-third",
         ]
