@@ -91,7 +91,9 @@ def _init_dashboard_db() -> None:
         _ensure_column(conn, "routing_logs", "profile", "TEXT")
         _ensure_column(conn, "routing_logs", "signals", "TEXT")
         _ensure_column(conn, "execution_logs", "cached_tokens", "INTEGER DEFAULT 0")
-        _ensure_column(conn, "execution_logs", "cached_tokens", "INTEGER DEFAULT 0")
+        _ensure_column(
+            conn, "execution_logs", "cache_read_input_tokens", "INTEGER DEFAULT 0"
+        )
         _ensure_column(conn, "execution_logs", "event_type", "TEXT")
         _ensure_column(conn, "execution_logs", "status_code", "INTEGER")
         _ensure_column(conn, "execution_logs", "error_type", "TEXT")

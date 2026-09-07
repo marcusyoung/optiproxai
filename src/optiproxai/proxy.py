@@ -732,17 +732,13 @@ def _log_upstream_error(
     actual_provider: str | None,
     status_code: int,
     raw_body: str,
-    headers: Any,
+    headers: httpx.Headers | None,
     elapsed_ms: float | None = None,
     request_id: str | None = None,
     profile: str | None = None,
 ) -> None:
     """Persist a non-200 upstream response to the execution log (TASK-20.01)."""
-    retry_after = None
-    try:
-        retry_after = headers.get("retry-after") if headers else None
-    except Exception:
-        retry_after = None
+    retry_after = headers.get("retry-after") if headers else None
     try:
         log_execution_error(
             request_id=request_id,
@@ -761,14 +757,16 @@ def _log_upstream_error(
             status_code,
             actual_provider,
         )
+    # Body excerpt intentionally omitted: upstream error payloads may contain
+    # sensitive details, and WARNING lines are commonly shipped to centralized
+    # logging. The bounded body excerpt lives in the JSONL/DB record instead.
     logger.warning(
-        "UPSTREAM_ERROR status=%d provider=%s model=%s request_id=%s retry_after=%s body=%s",
+        "UPSTREAM_ERROR status=%d provider=%s model=%s request_id=%s retry_after=%s",
         status_code,
         actual_provider,
         model_name,
         request_id,
         retry_after,
-        raw_body[:200],
     )
 
 

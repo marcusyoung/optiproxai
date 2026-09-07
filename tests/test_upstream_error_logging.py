@@ -201,9 +201,7 @@ class TestProxyUpstreamWiring:
         return calls
 
     @pytest.mark.anyio
-    async def test_non_streaming_non_200_emits_error_event(
-        self, proxy_http, tmp_path
-    ) -> None:
+    async def test_non_streaming_non_200_emits_error_event(self, proxy_http) -> None:
         result = await proxy._proxy_upstream(
             "https://upstream.test/v1",
             "key",
@@ -223,9 +221,7 @@ class TestProxyUpstreamWiring:
         assert "subscription rate limits" in events[0]["body_excerpt"]
 
     @pytest.mark.anyio
-    async def test_streaming_non_200_emits_error_event(
-        self, proxy_http, tmp_path
-    ) -> None:
+    async def test_streaming_non_200_emits_error_event(self, proxy_http) -> None:
         body = {"model": "syn:large:vision", "stream": True}
         result = await proxy._proxy_upstream(
             "https://upstream.test/v1",
