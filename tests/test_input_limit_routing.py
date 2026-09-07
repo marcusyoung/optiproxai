@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 from pydantic import ValidationError
@@ -579,3 +581,113 @@ class TestLastContextCacheRouting:
 
         assert decision.session_key == "session-1"
         assert "session_key" not in decision.model_dump()
+
+
+class TestImageSessionInputLimit:
+    """Image sessions must estimate at true-prompt scale, not tokenize the
+    base64 data URI (TASK-23). Capped vision models stay eligible; a payload
+    exceeding the cap is correctly excluded (under-count protection)."""
+
+    def _img_part(self) -> dict[str, Any]:
+        data_uri = (
+            "data:image/png;base64," + base64.b64encode(b"x" * 1_000_000).decode()
+        )
+        return {"type": "image_url", "image_url": {"url": data_uri}}
+
+    def _image_session(self, tokenish_length: int) -> list[dict[str, Any]]:
+        text = "x " * tokenish_length
+        return [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": text},
+                    self._img_part(),
+                ],
+            }
+        ]
+
+    def test_image_session_keeps_capped_vision_models_eligible(self) -> None:
+        cfg = _config(
+            tiers=_all_tiers(
+                "unused",
+                MEDIUM=TierModelConfig(
+                    primary=[
+                        {"model": "hy3", "max_input_tokens": 160000},
+                        {"model": "Hy3-FP8", "max_input_tokens": 160000},
+                        {"model": "mistral-medium-3.5", "max_input_tokens": 262144},
+                    ],
+                    fallback=[{"model": "big-vision", "max_input_tokens": 1_000_000}],
+                ),
+            ),
+            capabilities=[
+                ModelCapabilityEntry(prefix="hy3", capabilities=["vision"]),
+                ModelCapabilityEntry(prefix="Hy3-FP8", capabilities=["vision"]),
+                ModelCapabilityEntry(
+                    prefix="mistral-medium-3.5", capabilities=["vision"]
+                ),
+                ModelCapabilityEntry(prefix="big-vision", capabilities=["vision"]),
+            ],
+        )
+        router = Router(cfg)
+        _force_tier(router, "MEDIUM")
+
+        decision = router.route(
+            self._image_session(22000),
+            profile="auto",
+            required_capabilities={"vision"},
+        )
+
+        # With the bug, the ~1MB data URI tokenizes to ~339K tokens and every
+        # capped model is rejected, escalating to the 1M fallback. The fix keeps
+        # the estimate at true-prompt scale so a capped vision model is chosen.
+        assert decision.model in {"hy3", "Hy3-FP8", "mistral-medium-3.5"}
+        assert decision.model != "big-vision"
+
+    def test_image_payload_exceeding_cap_excludes_capped_model(self) -> None:
+        # 3 image parts = 3 * 2048 = 6144 tokens, above a 5000 cap. The capped
+        # model must be excluded (under-count protection), escalating to 1M.
+        cfg = _config(
+            tiers=_all_tiers(
+                "unused",
+                MEDIUM=TierModelConfig(
+                    primary=[{"model": "capped", "max_input_tokens": 5000}],
+                    fallback=[{"model": "large", "max_input_tokens": 1_000_000}],
+                ),
+            ),
+            capabilities=[
+                ModelCapabilityEntry(prefix="capped", capabilities=["vision"]),
+                ModelCapabilityEntry(prefix="large", capabilities=["vision"]),
+            ],
+        )
+        router = Router(cfg)
+        _force_tier(router, "MEDIUM")
+        messages = [{"role": "user", "content": [self._img_part() for _ in range(3)]}]
+
+        decision = router.route(
+            messages, profile="auto", required_capabilities={"vision"}
+        )
+        assert decision.model == "large"
+
+    def test_image_payload_under_cap_keeps_capped_model_eligible(self) -> None:
+        # 2 image parts = 4096 tokens < 5000 cap -> capped model stays eligible.
+        cfg = _config(
+            tiers=_all_tiers(
+                "unused",
+                MEDIUM=TierModelConfig(
+                    primary=[{"model": "capped", "max_input_tokens": 5000}],
+                    fallback=[{"model": "large", "max_input_tokens": 1_000_000}],
+                ),
+            ),
+            capabilities=[
+                ModelCapabilityEntry(prefix="capped", capabilities=["vision"]),
+                ModelCapabilityEntry(prefix="large", capabilities=["vision"]),
+            ],
+        )
+        router = Router(cfg)
+        _force_tier(router, "MEDIUM")
+        messages = [{"role": "user", "content": [self._img_part() for _ in range(2)]}]
+
+        decision = router.route(
+            messages, profile="auto", required_capabilities={"vision"}
+        )
+        assert decision.model == "capped"

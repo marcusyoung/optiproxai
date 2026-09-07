@@ -3,10 +3,10 @@ id: TASK-23
 title: >-
   Fix image-session input-limit inflation: image-aware token estimation (flat
   2048 constant)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-09-04 14:45'
-updated_date: '2026-09-04 16:39'
+updated_date: '2026-09-07 17:04'
 labels:
   - routing
   - input-limit
@@ -15,16 +15,12 @@ labels:
   - fallback
 dependencies: []
 references:
+  - src/optiproxai/tokens.py
+  - tests/test_tokens.py
+  - tests/test_input_limit_routing.py
   - >-
-    docs/decisions/doc-8 -
-    Session-keyed-last-context-token-cache-for-input-limit-gating.md
-  - docs/decisions/doc-12 - image model bake-off.md
-  - >-
-    docs/decisions/doc-14 - last-context cache inflated estimate on stripped
-    turns.md
-  - >-
-    backlog/tasks/task-16 -
-    Fix-Hy3-input-limit-cap-misfire-session-keyed-last-context-token-cache.md
+    backlog/docs/decisions/doc-14 -
+    Decision-last-context-cache-keeps-inflated-estimate-on-stripped-turns.md
 documentation:
   - src/optiproxai/tokens.py
   - src/optiproxai/router.py
@@ -54,12 +50,12 @@ Full approved plan: ~/.plannotator/plans/task-23-plan-image-aware-token-2026-09-
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 _estimate_tokens does not tokenize image_url data payloads as text; each image_url content part contributes a fixed flat constant (_IMAGE_PART_TOKEN_ESTIMATE = 2048) to the estimate; URL-reference images also count the constant
-- [ ] #2 Input-limit eligibility no longer rejects ~22-25K image-session prompts against 160K/262K caps: hy3, Hy3-FP8, and mistral-medium-3.5 are eligible candidates on image sessions in routing tests
-- [ ] #3 Near-cap guard test: session estimated near a model's input cap plus a large image payload keeps the capped model ineligible (under-count protection)
-- [ ] #4 doc-8 max(cached, live) semantics unchanged and existing cache tests pass without semantic updates
-- [ ] #5 doc-14 amended: root cause was estimation tokenizing base64 as text; self-heal assumption holds under fixed estimate; deferred-discount follow-up noted moot
-- [ ] #6 Full suite passes; ruff check, ruff format --check, pyright, pytest, uv build all clean (CI bar)
+- [x] #1 _estimate_tokens does not tokenize image_url data payloads as text; each image_url content part contributes a fixed flat constant (_IMAGE_PART_TOKEN_ESTIMATE = 2048) to the estimate; URL-reference images also count the constant
+- [x] #2 Input-limit eligibility no longer rejects ~22-25K image-session prompts against 160K/262K caps: hy3, Hy3-FP8, and mistral-medium-3.5 are eligible candidates on image sessions in routing tests
+- [x] #3 Near-cap guard test: session estimated near a model's input cap plus a large image payload keeps the capped model ineligible (under-count protection)
+- [x] #4 doc-8 max(cached, live) semantics unchanged and existing cache tests pass without semantic updates
+- [x] #5 doc-14 amended: root cause was estimation tokenizing base64 as text; self-heal assumption holds under fixed estimate; deferred-discount follow-up noted moot
+- [x] #6 Full suite passes; ruff check, ruff format --check, pyright, pytest, uv build all clean (CI bar)
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -115,3 +111,23 @@ Under-count risk exists only for vision-capable candidates receiving an image ne
 | 2 | Image-session input-limit routing tests | tests/test_input_limit_routing.py | 1 | test | Data-URI image sessions estimate at true-prompt scale; capped candidates (160000/262144) remain eligible; near-cap session + large image keeps the capped model ineligible; all input-limit tests pass |
 | 3 | Amend doc-14 and run CI bar | backlog/docs/decisions/doc-14 - Decision-last-context-cache-keeps-inflated-estimate-on-stripped-turns.md | 1, 2 | docs | doc-14 amended with estimation root cause; ruff/pyright/format/pytest/build all clean |
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Implemented image-aware token estimation in src/optiproxai/tokens.py: added _IMAGE_PART_TOKEN_ESTIMATE = 2048 and _count_content_tokens helper; _estimate_tokens now counts each image_url content part (data-URI or URL-reference, incl. string image_url field) as the constant instead of tokenizing the base64 payload. Text parts in list-content count their text field (parity with plain-string content).
+
+Added tests/test_tokens.py (5 tests): image constant counting, multiple images each count, URL-reference image, string-field image_url, text-part parity.
+
+Extended tests/test_input_limit_routing.py with TestImageSessionInputLimit (3 tests): capped vision models (hy3/Hy3-FP8/mistral-medium-3.5) stay eligible on image sessions; image payload exceeding cap is excluded (under-count guard); under-cap payload stays eligible.
+
+Amended doc-14 via backlog MCP: root cause was estimation tokenizing base64 as text; self-heal assumption holds under the fixed estimate; deferred-discount follow-up now moot.
+
+CI bar green: ruff check, ruff format --check, pyright (0 errors), full pytest (433 passed), uv build (wheel + sdist). Code uncommitted on branch task/TASK-23 (commit handled by user).
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+TASK-23 fixed image-session input-limit inflation by making _estimate_tokens image-aware. Added module constant _IMAGE_PART_TOKEN_ESTIMATE=2048; image_url content parts (data-URI or URL-reference, including bare-string image_url fields) contribute the constant instead of being tokenized as prose text (~1MB data URI previously inflated estimates to ~339K tokens, forcing fallback promotion every turn on image sessions). Text parts in list-form content count their text field unchanged. Verified by 5 new token unit tests, 3 new routing tests (capped vision models remain eligible; near-cap guard excludes over-cap payloads), and the full suite (433 passed). doc-14 amended. Full CI bar clean. Changes are uncommitted on branch task/TASK-23; user handles commit/PR (commit denied by guardrail).
+<!-- SECTION:FINAL_SUMMARY:END -->

@@ -3,6 +3,7 @@ id: doc-14
 title: 'Decision: last-context cache keeps inflated estimate on stripped turns'
 type: other
 created_date: '2026-09-04 12:43'
+updated_date: '2026-09-07 17:03'
 ---
 # Decision: last-context cache keeps inflated prompt estimate on stripped turns (err-toward-escalation preserved)
 
@@ -28,3 +29,25 @@ The last-context cache (doc-8) records provider-reported `prompt_tokens` per ses
 ## Consequence
 
 Post-image sessions pay one escalated turn after images leave the strip window, then route normally. Accepted. If measurement shows this materially delays hand-back in long sessions, a follow-up could add a conservative discount (e.g. subtract an estimated image-token budget from the cached value, never below the live estimate) — explicitly deferred.
+
+## Amendment — TASK-23 (2026-09-07)
+
+The inflation observed on TASK-17 image sessions was not caused by the cache
+retaining a stale value (doc-8 `max(cached, live)` semantics are unchanged and
+correct). The root cause was token estimation itself: `_estimate_tokens`
+tokenized each `image_url` data URI as prose text, inflating a ~22–25K-token
+prompt to ~339K tokens. That made every candidate fail the input-limit filter
+and forced fallback promotion every turn — independent of the last-context cache.
+
+TASK-23 fixes the root cause: image parts now contribute a fixed
+`_IMAGE_PART_TOKEN_ESTIMATE = 2048` constant instead of being tokenized. With a
+sane ~24K live estimate, doc-8's `max(cached, live)` behaves exactly as
+intended (errs high, never underestimates).
+
+Consequences for this decision:
+- The self-healing assumption in Rationale #3 holds under the fixed estimate: a
+  stripped turn's provider-reported (image-free) `prompt_tokens` overwrites the
+  cache entry, so any inflated value gates at most one turn.
+- The deferred-discount follow-up in Consequence is now **moot**: the live
+  estimate is no longer pathologically inflated, so there is no systematic
+  over-escalation to discount away.
