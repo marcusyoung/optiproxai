@@ -11,7 +11,7 @@ from optiproxai.config import (
     TierModelConfig,
 )
 from optiproxai.fallback_backoff import FallbackBackoffState
-from optiproxai.router import Router
+from optiproxai.router import Router, _session_hash
 
 
 def _make_config() -> OptiproxaiConfig:
@@ -376,6 +376,155 @@ class TestRouterLogging:
 
         assert decision.model == "model-c"
         assert decision.fallbacks == []
+
+
+def _promotion_config() -> OptiproxaiConfig:
+    """Config with multiple fallbacks; callers set primary_selection as needed."""
+    return OptiproxaiConfig(
+        providers={
+            "openrouter": ProviderConfig(
+                name="openrouter",
+                base_url="https://openrouter.ai/api/v1",
+                api_key="test-key",
+            )
+        },
+        default_provider="openrouter",
+        profiles={
+            "auto": ProfileConfig(
+                tiers={
+                    "SIMPLE": TierModelConfig(
+                        primary=["model-a", "model-b"],
+                        fallback=["model-first", "model-second", "model-third"],
+                    )
+                }
+            )
+        },
+        default_profile="auto",
+        smart_proxy={
+            "fallback_backoff": {
+                "enabled": True,
+                "initial_delay_seconds": 5,
+                "multiplier": 2,
+                "max_delay_seconds": 60,
+            }
+        },
+    )
+
+
+class TestPromotedFallbackConfigOrder:
+    """Promoted fallbacks select the first-listed fallback, not hash/rotation."""
+
+    def _route_promoted(self, config: OptiproxaiConfig, **route_kwargs):
+        backoff_state = FallbackBackoffState(config.smart_proxy.fallback_backoff)
+        # Cool down both primaries so the fallback list is promoted to primary.
+        backoff_state.record_retryable_failure("model-a", "openrouter")
+        backoff_state.record_retryable_failure("model-b", "openrouter")
+        router = Router(config, fallback_backoff_state=backoff_state)
+
+        with patch.object(
+            Router,
+            "_classify",
+            return_value={
+                "tier": "SIMPLE",
+                "score": 0.1,
+                "confidence": 0.9,
+                "signals": ["method"],
+                "signal_details": {"method": {"raw": "distilled-features"}},
+                "agentic_score": 0.0,
+            },
+        ):
+            return router.route(
+                [{"role": "user", "content": "hi"}], profile="auto", **route_kwargs
+            )
+
+    def test_session_sticky_promotion_respects_config_order(self) -> None:
+        """Session key hashing to a non-zero index still picks the first fallback."""
+        config = _promotion_config()
+        config.profiles["auto"].tiers["SIMPLE"].primary_selection = "session_sticky"
+
+        # Find a session key whose hash lands on index 1 (would pick model-second
+        # under the buggy hash-based selection).
+        key = next(
+            k
+            for k in (f"session-{i}" for i in range(1000))
+            if _session_hash(k) % 3 == 1
+        )
+
+        decision = self._route_promoted(config, session_key=key)
+
+        assert decision.model == "model-first"
+        # Promoted model is removed from the fallback list; the rest keep order.
+        assert [f.model for f in decision.fallbacks] == [
+            "model-second",
+            "model-third",
+        ]
+
+    def test_round_robin_promotion_respects_config_order(self) -> None:
+        """Rotation state does not reorder a promoted fallback list."""
+        config = _promotion_config()
+        backoff_state = FallbackBackoffState(config.smart_proxy.fallback_backoff)
+        # Cool down both primaries so the fallback list is promoted to primary.
+        backoff_state.record_retryable_failure("model-a", "openrouter")
+        backoff_state.record_retryable_failure("model-b", "openrouter")
+        router = Router(config, fallback_backoff_state=backoff_state)
+
+        with patch.object(
+            Router,
+            "_classify",
+            return_value={
+                "tier": "SIMPLE",
+                "score": 0.1,
+                "confidence": 0.9,
+                "signals": ["method"],
+                "signal_details": {"method": {"raw": "distilled-features"}},
+                "agentic_score": 0.0,
+            },
+        ):
+            # First route advances the router's round-robin state to index 1;
+            # the second promotion must still select config order (index 0).
+            first = router.route([{"role": "user", "content": "hi"}], profile="auto")
+            second = router.route([{"role": "user", "content": "hi"}], profile="auto")
+
+        assert first.model == "model-first"
+        assert second.model == "model-first"
+        assert [f.model for f in second.fallbacks] == [
+            "model-second",
+            "model-third",
+        ]
+
+    def test_session_sticky_primaries_still_rotate(self) -> None:
+        """primary_selection still applies when primaries exist (no promotion)."""
+        config = _promotion_config()
+        config.profiles["auto"].tiers["SIMPLE"].primary_selection = "session_sticky"
+
+        # No cooldown: primaries are used, session_sticky selects by hash.
+        backoff_state = FallbackBackoffState(config.smart_proxy.fallback_backoff)
+        router = Router(config, fallback_backoff_state=backoff_state)
+        key = next(
+            k
+            for k in (f"session-{i}" for i in range(1000))
+            if _session_hash(k) % 2 == 1
+        )
+
+        with patch.object(
+            Router,
+            "_classify",
+            return_value={
+                "tier": "SIMPLE",
+                "score": 0.1,
+                "confidence": 0.9,
+                "signals": ["method"],
+                "signal_details": {"method": {"raw": "distilled-features"}},
+                "agentic_score": 0.0,
+            },
+        ):
+            decision = router.route(
+                [{"role": "user", "content": "hi"}],
+                profile="auto",
+                session_key=key,
+            )
+
+        assert decision.model == "model-b"
 
 
 class TestSessionStickyRouting:

@@ -473,6 +473,7 @@ class Router:
             tier_cfg,
             filter_to_candidates=selection_candidates,
             session_key=session_key,
+            promoted_from_fallback=promoted_from_fallback,
         )
         model_id = primary_candidate.model
 
@@ -830,6 +831,7 @@ class Router:
         tier_cfg: Any,
         filter_to_candidates: list[ResolvedModelCandidate] | None = None,
         session_key: str | None = None,
+        promoted_from_fallback: bool = False,
     ) -> ResolvedModelCandidate:
         """Select a primary candidate via per profile+tier round-robin or session-sticky hash.
 
@@ -851,6 +853,22 @@ class Router:
 
         if len(candidates) == 1:
             return candidates[0]
+
+        # Promoted fallback list: config order is the policy. A fallback promoted
+        # to primary (all primaries filtered out) must respect the declared
+        # fallback priority, not the tier's primary_selection policy. This matches
+        # the retry-time fallback path, which already walks decision.fallbacks in
+        # config order.
+        if promoted_from_fallback:
+            selected = candidates[0]
+            log.debug(
+                "Primary promoted-from-fallback selected by config order profile=%s tier=%s model=%s provider=%s",
+                profile,
+                tier,
+                selected.model,
+                selected.provider or "",
+            )
+            return selected
 
         # Session-sticky: deterministic selection by session key hash
         if session_key is not None and tier_cfg.primary_selection == "session_sticky":
