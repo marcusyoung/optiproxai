@@ -36,6 +36,7 @@ from optiproxai.dashboard import (
     ingest_execution_logs,
     ingest_jsonl_logs,
     ingest_stderr_proxy_logs,
+    log_execution_error,
     log_execution_event,
     recommended_dashboard_ingest_days,
     render_dashboard_html,
@@ -725,6 +726,52 @@ def _log_usage(
     )
 
 
+def _log_upstream_error(
+    *,
+    model_name: str,
+    actual_provider: str | None,
+    status_code: int,
+    raw_body: str,
+    headers: Any,
+    elapsed_ms: float | None = None,
+    request_id: str | None = None,
+    profile: str | None = None,
+) -> None:
+    """Persist a non-200 upstream response to the execution log (TASK-20.01)."""
+    retry_after = None
+    try:
+        retry_after = headers.get("retry-after") if headers else None
+    except Exception:
+        retry_after = None
+    try:
+        log_execution_error(
+            request_id=request_id,
+            model=model_name,
+            provider=actual_provider,
+            profile=profile,
+            status_code=status_code,
+            error_type="upstream_error",
+            body_excerpt=raw_body[:500],
+            retry_after=retry_after,
+            elapsed_ms=elapsed_ms,
+        )
+    except Exception:
+        logger.exception(
+            "Failed to record upstream error event status=%d provider=%s",
+            status_code,
+            actual_provider,
+        )
+    logger.warning(
+        "UPSTREAM_ERROR status=%d provider=%s model=%s request_id=%s retry_after=%s body=%s",
+        status_code,
+        actual_provider,
+        model_name,
+        request_id,
+        retry_after,
+        raw_body[:200],
+    )
+
+
 async def _proxy_upstream(
     base_url: str,
     api_key: str,
@@ -783,9 +830,19 @@ async def _proxy_upstream(
             if upstream.status_code != 200:
                 raw = await upstream.aread()
                 await upstream.aclose()
+                raw_text = raw.decode(errors="replace")
+                _log_upstream_error(
+                    model_name=model_name,
+                    actual_provider=actual_provider,
+                    status_code=upstream.status_code,
+                    raw_body=raw_text,
+                    headers=upstream.headers,
+                    request_id=request_id,
+                    profile=profile,
+                )
                 return _openai_error(
                     upstream.status_code,
-                    f"Upstream error: {raw.decode(errors='replace')[:500]}",
+                    f"Upstream error: {raw_text[:500]}",
                     "upstream_error",
                 )
 
@@ -860,6 +917,16 @@ async def _proxy_upstream(
             resp = await _http.post(url, json=body, headers=headers)
             elapsed = (time.monotonic() - t0) * 1000
             if resp.status_code != 200:
+                _log_upstream_error(
+                    model_name=model_name,
+                    actual_provider=actual_provider,
+                    status_code=resp.status_code,
+                    raw_body=resp.text,
+                    headers=resp.headers,
+                    elapsed_ms=elapsed,
+                    request_id=request_id,
+                    profile=profile,
+                )
                 return _openai_error(
                     resp.status_code,
                     f"Upstream error: {resp.text[:500]}",

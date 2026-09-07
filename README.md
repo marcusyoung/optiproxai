@@ -691,6 +691,8 @@ All routing decisions are logged to `$XDG_STATE_HOME/optiproxai/log/routing-YYYY
 
 Token usage per request is logged to `execution-YYYY-MM-DD.jsonl` in the same directory. Each completed request produces exactly one execution record (streaming requests included) containing the final cumulative `prompt_tokens` / `completion_tokens` / `total_tokens` and total wall-time `elapsed_ms`. The dashboard ingests these records into SQLite for analytics.
 
+Failed upstream responses are also recorded: every non-200 reply from a provider produces an `upstream_error` record in the same execution JSONL (with `event_type="upstream_error"`) containing `status_code`, `error_type`, a 500-character body excerpt, and the `retry-after` header value when present. These rows are also persisted to the dashboard database, so billing-vs-throttle misclassifications (e.g. a subscription-credit 429 misreported by the provider as a rate limit) are forensically retrievable. A matching `UPSTREAM_ERROR` WARNING line is written to the server log. Error records carry no token counts and do not affect routing, cooldown, or retry behavior.
+
 Use logs to build training data:
 
 ```bash

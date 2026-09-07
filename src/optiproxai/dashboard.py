@@ -91,9 +91,12 @@ def _init_dashboard_db() -> None:
         _ensure_column(conn, "routing_logs", "profile", "TEXT")
         _ensure_column(conn, "routing_logs", "signals", "TEXT")
         _ensure_column(conn, "execution_logs", "cached_tokens", "INTEGER DEFAULT 0")
-        _ensure_column(
-            conn, "execution_logs", "cache_read_input_tokens", "INTEGER DEFAULT 0"
-        )
+        _ensure_column(conn, "execution_logs", "cached_tokens", "INTEGER DEFAULT 0")
+        _ensure_column(conn, "execution_logs", "event_type", "TEXT")
+        _ensure_column(conn, "execution_logs", "status_code", "INTEGER")
+        _ensure_column(conn, "execution_logs", "error_type", "TEXT")
+        _ensure_column(conn, "execution_logs", "body_excerpt", "TEXT")
+        _ensure_column(conn, "execution_logs", "retry_after", "TEXT")
         _ensure_column(
             conn,
             "execution_logs",
@@ -340,6 +343,50 @@ def _insert_execution_record(conn: sqlite3.Connection, record: dict[str, Any]) -
     return conn.total_changes - before
 
 
+def _insert_execution_error_record(
+    conn: sqlite3.Connection, record: dict[str, Any]
+) -> int:
+    """Insert an upstream-error execution record into the dashboard DB."""
+    before = conn.total_changes
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO execution_logs
+        (
+            timestamp,
+            request_id,
+            event_type,
+            model,
+            provider,
+            profile,
+            status_code,
+            error_type,
+            body_excerpt,
+            retry_after,
+            elapsed_ms
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record["timestamp"],
+            record.get("request_id"),
+            record.get("event_type") or "upstream_error",
+            record.get("model"),
+            record.get("provider"),
+            record.get("profile"),
+            int(record["status_code"])
+            if record.get("status_code") is not None
+            else None,
+            record.get("error_type"),
+            record.get("body_excerpt"),
+            record.get("retry_after"),
+            float(record["elapsed_ms"])
+            if record.get("elapsed_ms") is not None
+            else None,
+        ),
+    )
+    return conn.total_changes - before
+
+
 def ingest_jsonl_logs(days: int = 1) -> int:
     """Ingest routing JSONL logs into SQLite."""
     _init_dashboard_db()
@@ -435,6 +482,59 @@ def log_execution_event(
         _init_dashboard_db()
         with sqlite3.connect(_DASHBOARD_DB_PATH) as conn:
             _insert_execution_record(conn, record)
+            conn.commit()
+    except Exception:
+        pass
+
+
+def log_execution_error(
+    *,
+    timestamp: str | None = None,
+    request_id: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    profile: str | None = None,
+    status_code: int | None = None,
+    error_type: str | None = None,
+    body_excerpt: str = "",
+    retry_after: str | None = None,
+    elapsed_ms: float | None = None,
+) -> None:
+    """Append a structured upstream-error record (TASK-20.01).
+
+    Mirrors :func:`log_execution_event` but records failed upstream responses
+    so billing/throttle misclassifications are forensically retrievable.
+    Written to the same daily execution JSONL stream and dashboard DB; rows
+    carry ``event_type="upstream_error"`` and zero token counts so dashboard
+    ingestion can distinguish them from usage events.
+    """
+    try:
+        log_directory = log_dir()
+        log_directory.mkdir(parents=True, exist_ok=True)
+        event_timestamp = timestamp or datetime.now(timezone.utc).isoformat()
+        record = {
+            "timestamp": event_timestamp,
+            "event_type": "upstream_error",
+            "request_id": request_id,
+            "model": model,
+            "provider": provider,
+            "profile": profile,
+            "status_code": int(status_code) if status_code is not None else None,
+            "error_type": error_type,
+            "body_excerpt": body_excerpt[:500],
+            "retry_after": retry_after,
+            "elapsed_ms": elapsed_ms,
+        }
+        day = _parse_iso(event_timestamp) or datetime.now(timezone.utc)
+        log_file = (
+            log_directory / f"{_EXECUTION_LOG_PREFIX}{day.strftime('%Y-%m-%d')}.jsonl"
+        )
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+        _init_dashboard_db()
+        with sqlite3.connect(_DASHBOARD_DB_PATH) as conn:
+            _insert_execution_error_record(conn, record)
             conn.commit()
     except Exception:
         pass
