@@ -217,6 +217,19 @@ model_rules:
     #     input_per_mtok: 0.60
     #     cache_read_per_mtok: 0.06
     #     cache_write_per_mtok: 0.90
+    # Rule-level reasoning_effort_values: override the reasoning-effort
+    # allow-list for matching candidates. The built-in allow-list is fixed to
+    # the reasoning_style (e.g. xai caps at none/low/medium/high, coercing
+    # max/xhigh to high). Doubleword accepts a wider vocabulary, so declare it
+    # here to let a tier-level reasoning_effort: "max" reach the model as max.
+    # Precedence: model rule > provider > style default. An empty list ([])
+    # suppresses reasoning-effort injection entirely (equivalent to a "none"
+    # reasoning_style).
+    #
+    # - prefix: "deepseek-ai/DeepSeek-V4.1-Flash"
+    #   provider: "doubleword"
+    #   reasoning_style: xai
+    #   reasoning_effort_values: [none, minimal, low, medium, high, xhigh, max]
 
 # ---------------------------------------------------------------------------
 # Providers
@@ -256,6 +269,11 @@ providers:
     #         ttl: "1h"                 # "5m" (default) or "1h"
     #         target: system            # "system" (default), "tools", or "last_message"
     #         max_breakpoints: 4        # Doubleword ceiling; tunable
+    #     # Provider-level reasoning_effort_values: default allow-list for every
+    #     # model behind this provider (overridable per model rule above).  Use
+    #     # the full Doubleword vocabulary so xhigh/max survive normalization.
+    #     # An empty list ([]) suppresses reasoning-effort injection.
+    #     reasoning_effort_values: [none, minimal, low, medium, high, xhigh, max]
 
 # ---------------------------------------------------------------------------
 # Routing Profiles

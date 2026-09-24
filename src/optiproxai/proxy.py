@@ -1171,21 +1171,37 @@ async def _try_with_fallbacks(
             fb_style = _get_reasoning_style_for_candidate(
                 fb.model, fb.provider, runtime
             )
-            fb_normalized_effort = _normalize_reasoning_effort(
-                fb_style, decision.reasoning_effort
+            fb_allowed_values = _resolve_reasoning_effort_values(
+                fb.model, fb.provider, runtime
             )
-            fb_body = _apply_reasoning_for_style(
-                fb_body, fb_style, effort=decision.reasoning_effort
-            )
-            logger.info(
-                "REASONING_CONTROL injected (fallback) request_id=%s tier=%s style=%s original_effort=%s normalized_effort=%s provider=%s",
-                request_id,
-                decision.tier,
-                fb_style,
-                decision.reasoning_effort,
-                fb_normalized_effort,
-                fb.provider,
-            )
+            if fb_allowed_values == []:
+                logger.info(
+                    "REASONING_CONTROL suppressed (fallback) request_id=%s tier=%s style=%s original_effort=%s provider=%s",
+                    request_id,
+                    decision.tier,
+                    fb_style,
+                    decision.reasoning_effort,
+                    fb.provider,
+                )
+            else:
+                fb_normalized_effort = _normalize_reasoning_effort(
+                    fb_style, decision.reasoning_effort, fb_allowed_values
+                )
+                fb_body = _apply_reasoning_for_style(
+                    fb_body,
+                    fb_style,
+                    effort=decision.reasoning_effort,
+                    allowed_values=fb_allowed_values,
+                )
+                logger.info(
+                    "REASONING_CONTROL injected (fallback) request_id=%s tier=%s style=%s original_effort=%s normalized_effort=%s provider=%s",
+                    request_id,
+                    decision.tier,
+                    fb_style,
+                    decision.reasoning_effort,
+                    fb_normalized_effort,
+                    fb.provider,
+                )
         fb_body, fb_headers = _prepare_body_for_candidate(
             fb_body,
             fb.model,
@@ -1271,6 +1287,60 @@ def _get_reasoning_style_for_candidate(
     return _get_model_reasoning_style(
         model, provider_name, runtime
     ) or _get_provider_reasoning_style(provider_name, runtime)
+
+
+def _get_model_reasoning_effort_values(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> list[str] | None:
+    """Return the best-matching model rule's reasoning-effort allow-list, or None.
+
+    Uses the same prefix/provider scoring as ``_get_model_reasoning_style``: a
+    provider-specific rule outranks a provider-agnostic rule before prefix
+    specificity is compared.  A matching rule whose ``reasoning_effort_values``
+    is set (including an empty list) wins; ``None`` means no rule declared one.
+    """
+    best_values: list[str] | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        if entry.reasoning_effort_values is None:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_values = entry.reasoning_effort_values
+    return best_values
+
+
+def _get_provider_reasoning_effort_values(
+    provider_name: str, runtime: RuntimeState
+) -> list[str] | None:
+    """Return the provider reasoning-effort allow-list, or None when unset."""
+    provider_cfg = runtime.config.providers.get(provider_name)
+    if provider_cfg is not None:
+        return provider_cfg.reasoning_effort_values
+    return None
+
+
+def _resolve_reasoning_effort_values(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> list[str] | None:
+    """Resolve the reasoning-effort allow-list: model rule > provider > None.
+
+    ``None`` means no override was declared, so the style's built-in allow-list
+    applies.  An empty list means injection is suppressed for that candidate.
+    """
+    model_values = _get_model_reasoning_effort_values(model, provider_name, runtime)
+    if model_values is not None:
+        return model_values
+    return _get_provider_reasoning_effort_values(provider_name, runtime)
 
 
 def _get_model_extra_body(
@@ -2119,8 +2189,18 @@ def _has_explicit_reasoning_control(body: dict[str, Any]) -> bool:
     return False
 
 
-def _normalize_reasoning_effort(style: str, effort: str) -> str:
-    """Normalize effort labels to values supported by each reasoning_style."""
+def _normalize_reasoning_effort(
+    style: str, effort: str, allowed_values: list[str] | None = None
+) -> str:
+    """Normalize effort labels to values supported by a style or explicit allow-list.
+
+    When ``allowed_values`` is ``None`` the hard-coded per-style allow-list
+    applies.  When it is a list, its case/whitespace-normalized entries are the
+    allow-list instead (the provider/model override from TASK-25).  A value
+    present in the allow-list is passed through unchanged (so ``max``/``xhigh``
+    reach a provider that accepts them); an absent value keeps the legacy safe
+    coercion (``xhigh``/``max`` -> ``high``, otherwise ``medium``).
+    """
     normalized = effort.strip().lower()
     aliases = {
         "off": "none",
@@ -2132,14 +2212,18 @@ def _normalize_reasoning_effort(style: str, effort: str) -> str:
     }
     normalized = aliases.get(normalized, normalized)
 
-    allowed_by_style = {
-        "openai": {"none", "low", "medium", "high"},
-        "xai": {"none", "low", "medium", "high"},
-        "anthropic": {"low", "medium", "high", "xhigh", "max"},
-        "dashscope": {"none", "low", "medium", "high"},
-        "gemini": {"none", "low", "medium", "high", "xhigh", "max"},
-    }
-    allowed = allowed_by_style.get(style, {"low", "medium", "high"})
+    if allowed_values is not None:
+        allowed = {value.strip().lower() for value in allowed_values}
+    else:
+        allowed_by_style = {
+            "openai": {"none", "low", "medium", "high"},
+            "xai": {"none", "low", "medium", "high"},
+            "anthropic": {"low", "medium", "high", "xhigh", "max"},
+            "dashscope": {"none", "low", "medium", "high"},
+            "gemini": {"none", "low", "medium", "high", "xhigh", "max"},
+        }
+        allowed = allowed_by_style.get(style, {"low", "medium", "high"})
+
     if normalized in allowed:
         return normalized
     if normalized in {"xhigh", "max"}:
@@ -2163,16 +2247,19 @@ def _apply_reasoning_for_style(
     body: dict[str, Any],
     style: str,
     effort: str = "medium",
+    allowed_values: list[str] | None = None,
 ) -> dict[str, Any]:
     """Apply provider-specific reasoning field shape for given style.
 
-    Does not overwrite explicit client-provided reasoning controls.
+    Does not overwrite explicit client-provided reasoning controls.  An explicit
+    empty ``allowed_values`` list suppresses injection entirely, equivalent to a
+    ``none`` style (TASK-25).
     """
-    if style == "none":
+    if style == "none" or allowed_values == []:
         return body
     if _has_explicit_reasoning_control(body):
         return body
-    normalized_effort = _normalize_reasoning_effort(style, effort)
+    normalized_effort = _normalize_reasoning_effort(style, effort, allowed_values)
     if style == "openai":
         body.setdefault("reasoning", {"effort": normalized_effort})
     elif style == "xai":
@@ -2349,21 +2436,37 @@ async def chat_completions(request: Request):
         # (preserve explicit client controls)
         if decision.reasoning_effort:
             style = _get_reasoning_style(decision, state)
-            normalized_effort = _normalize_reasoning_effort(
-                style, decision.reasoning_effort
+            allowed_values = _resolve_reasoning_effort_values(
+                decision.model, decision.provider, state
             )
-            body = _apply_reasoning_for_style(
-                body, style, effort=decision.reasoning_effort
-            )
-            logger.info(
-                "REASONING_CONTROL injected request_id=%s tier=%s style=%s original_effort=%s normalized_effort=%s provider=%s",
-                request_id,
-                decision.tier,
-                style,
-                decision.reasoning_effort,
-                normalized_effort,
-                decision.provider,
-            )
+            if allowed_values == []:
+                logger.info(
+                    "REASONING_CONTROL suppressed request_id=%s tier=%s style=%s original_effort=%s provider=%s",
+                    request_id,
+                    decision.tier,
+                    style,
+                    decision.reasoning_effort,
+                    decision.provider,
+                )
+            else:
+                normalized_effort = _normalize_reasoning_effort(
+                    style, decision.reasoning_effort, allowed_values
+                )
+                body = _apply_reasoning_for_style(
+                    body,
+                    style,
+                    effort=decision.reasoning_effort,
+                    allowed_values=allowed_values,
+                )
+                logger.info(
+                    "REASONING_CONTROL injected request_id=%s tier=%s style=%s original_effort=%s normalized_effort=%s provider=%s",
+                    request_id,
+                    decision.tier,
+                    style,
+                    decision.reasoning_effort,
+                    normalized_effort,
+                    decision.provider,
+                )
 
         response = await _try_with_fallbacks(
             body,
