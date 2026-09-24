@@ -396,6 +396,45 @@ Caveats to weigh before opting in:
 - **Quality**: turns referencing aged-out images ("compare with the chart above") degrade to placeholder-based reasoning — silent quality loss. Opt-in containment is the point; raise `image_ttl_turns` for long image discussions.
 - **One-turn escalation**: the session's last-context token estimate (doc-8) keeps the inflated image-inclusive value for one turn after stripping, which may force one input-limit escalation; it self-heals on the next provider-reported prompt size.
 
+## Reasoning effort
+
+A tier may set a `reasoning_effort` value that the proxy injects into the upstream request using the provider's reasoning style (`reasoning_style`):
+
+```yaml
+profiles:
+  auto:
+    tiers:
+      REASONING:
+        primary: "deepseek-ai/DeepSeek-V4.1-Flash"
+        reasoning_effort: "max"   # none | minimal | low | medium | high | xhigh | max
+```
+
+Each `reasoning_style` has a built-in allow-list:
+
+| `reasoning_style` | Built-in allow-list |
+|---|---|
+| `openai`, `xai`, `dashscope` | `none, low, medium, high` |
+| `anthropic` | `low, medium, high, xhigh, max` |
+| `gemini` | `none, low, medium, high, xhigh, max` |
+
+A value outside the allow-list is coerced (`xhigh`/`max` -> `high`, anything else -> `medium`). Because the allow-list is tied to the style, a provider with a wider vocabulary (e.g. Doubleword, which accepts `none, minimal, low, medium, high, xhigh, max`) cannot receive `max` through the `xai` style.
+
+Override the allow-list per provider or per model rule with `reasoning_effort_values`:
+
+```yaml
+providers:
+  doubleword:
+    reasoning_style: xai
+    reasoning_effort_values: [none, minimal, low, medium, high, xhigh, max]
+
+model_rules:
+  - prefix: "deepseek-ai/DeepSeek-V4.1-Flash"
+    provider: "doubleword"
+    reasoning_effort_values: [none, minimal, low, medium, high, xhigh, max]
+```
+
+Precedence is **model rule > provider > style default**. Within the resolved allow-list a value present is passed through unchanged; a value absent keeps the coercion above. An **empty list (`[]`)** suppresses reasoning-effort injection entirely for the matching candidates, equivalent to a `none` style. Allow-list entries are matched case-insensitively. When unset, the built-in style allow-list applies and behaviour is unchanged.
+
 ## Async / batch routing
 
 `async_mode` is a first-class config model for declaring async/batch routing explicitly, instead of hiding it inside `extra_body`. It supports three delivery modes:

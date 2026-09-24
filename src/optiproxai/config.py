@@ -225,6 +225,16 @@ class ProviderConfig(BaseModel):
             "May be overridden per-model via model_rules[].cache_control."
         ),
     )
+    reasoning_effort_values: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional provider-level override of the reasoning-effort allow-list "
+            "(TASK-25).  When unset the style's built-in allow-list applies.  An "
+            "empty list suppresses reasoning-effort injection entirely, equivalent "
+            "to a 'none' reasoning_style.  May be overridden per-rule via "
+            "model_rules[].reasoning_effort_values."
+        ),
+    )
 
 
 class ModelEntry(BaseModel):
@@ -547,6 +557,15 @@ class ModelRuleEntry(BaseModel):
             "Rule-level opt-in prompt-caching marker injection override.  "
             "Presence-based: a matching rule's cache_control wins over the "
             "provider-level block without field-by-field merge (decision doc-7)."
+        ),
+    )
+    reasoning_effort_values: list[str] | None = Field(
+        default=None,
+        description=(
+            "Rule-level override of the reasoning-effort allow-list (TASK-25).  "
+            "Presence-based: a matching rule's list wins over the provider-level "
+            "list, which wins over the style default.  An empty list suppresses "
+            "reasoning-effort injection for matching candidates."
         ),
     )
     pricing: ModelPricingConfig | None = Field(
