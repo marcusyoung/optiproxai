@@ -175,10 +175,40 @@ class TestBasicAuthDashboard:
         resp = client.get("/dashboard", headers={"Authorization": "Basic not-base64!!"})
         assert resp.status_code == 401
 
-    def test_v1_accepts_basic_auth(self, client):
+    def test_v1_rejects_basic_auth(self, client):
+        """Basic must not authenticate API routes (browser credential CSRF)."""
         raw = generate_key("admin")
         resp = client.get("/v1/models", headers=self._basic("optiproxai", raw))
+        assert resp.status_code == 401
+
+    def test_chat_rejects_basic_auth(self, client):
+        raw = generate_key("admin")
+        resp = client.post(
+            "/v1/chat/completions",
+            headers=self._basic("optiproxai", raw),
+            json={
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+        assert resp.status_code == 401
+
+    def test_v1_still_accepts_bearer(self, client):
+        raw = generate_key("admin")
+        resp = client.get("/v1/models", headers={"Authorization": f"Bearer {raw}"})
         assert resp.status_code == 200
+
+    def test_dashboard_subpath_challenges(self, client):
+        generate_key("admin")
+        resp = client.get("/dashboard/anything")
+        assert resp.status_code == 401
+        assert resp.headers.get("WWW-Authenticate", "").startswith("Basic")
+
+    def test_non_dashboard_path_does_not_get_basic_challenge(self, client):
+        generate_key("admin")
+        resp = client.get("/v1/models", headers=self._basic("optiproxai", "nope"))
+        assert resp.status_code == 401
+        assert "WWW-Authenticate" not in resp.headers
 
     def test_v1_does_not_issue_basic_challenge(self, client):
         generate_key("admin")
