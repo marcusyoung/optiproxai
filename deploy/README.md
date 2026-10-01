@@ -16,6 +16,7 @@ do not run them from this directory.
 | `opx-annotate.sh` | `/usr/local/bin/opx-annotate` | build/extend the training dataset from routing logs |
 | `opx-train.sh` | `/usr/local/bin/opx-train` | train `models/feature_classifier.pkl` |
 | `Caddyfile` | `/etc/caddy/Caddyfile` | alternative to Apache for hosts running Caddy |
+| `logrotate.optiproxai` | `/etc/logrotate.d/optiproxai` | rotate the unbounded `server.log` (copytruncate) |
 
 ## Layout
 
@@ -68,6 +69,7 @@ do not run them from this directory.
    sudo mkdir -p /var/log/optiproxai /var/lib/optiproxai
    sudo chown optiproxai:optiproxai /var/log/optiproxai /var/lib/optiproxai
    sudo install -o root -g root -m 644 optiproxai.service /etc/systemd/system/
+   sudo install -o root -g root -m 644 logrotate.optiproxai /etc/logrotate.d/optiproxai
    sudo systemctl daemon-reload && sudo systemctl enable --now optiproxai
    ```
 
