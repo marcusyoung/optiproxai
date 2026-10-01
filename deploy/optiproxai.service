@@ -1,0 +1,37 @@
+[Unit]
+Description=OptiProxAI OpenAI-compatible routing proxy
+Documentation=https://github.com/marcusyoung/optiproxai
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Service account created with:
+#   sudo useradd --system --create-home --shell /usr/sbin/nologin optiproxai
+User=optiproxai
+Group=optiproxai
+WorkingDirectory=/opt/optiproxai
+
+# Provider keys and OPTIPROXAI_ADMIN_TOKEN live here (chmod 640).
+# Config resolves ${VAR} from the process environment ONLY; systemd provides it.
+# Missing vars resolve to an empty string silently, so keep this file complete.
+EnvironmentFile=/etc/optiproxai/optiproxai.env
+
+# Run the project venv's own console script directly (no uv at runtime).
+# Config binds 127.0.0.1; Apache terminates TLS and reverse-proxies to it.
+ExecStart=/opt/optiproxai/.venv/bin/optiproxai serve --config /opt/optiproxai/config.yaml
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+# read-only keeps /home visible (the uv-managed Python interpreter lives under
+# /home/optiproxai/.local/share/uv/python) while blocking writes there.
+ProtectHome=read-only
+# Runtime state: JSONL logs + dashboard.db (matches OPTIPROXAI_LOG_DIR/DATA_DIR).
+ReadWritePaths=/var/log/optiproxai /var/lib/optiproxai
+
+[Install]
+WantedBy=multi-user.target

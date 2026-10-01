@@ -1,0 +1,20 @@
+# Caddy reverse proxy for OptiProxAI on a VPS.
+# Gives you automatic HTTPS (Let's Encrypt) in front of the local proxy.
+#
+# Replace proxy.example.com with your real DNS name, then:
+#   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile
+#   sudo systemctl reload caddy
+#
+# The proxy itself should bind 127.0.0.1 in config.yaml; only Caddy is exposed.
+
+proxy.example.com {
+	# Cursor appends /chat/completions itself, so forward the full path.
+	# Port must match `port:` in config.yaml (deploy/config.vps.yaml uses 18421).
+	reverse_proxy 127.0.0.1:18421 {
+		# Streaming responses (SSE) must not be buffered; flush_interval is a
+		# reverse_proxy subdirective, not a site-level one.
+		flush_interval -1
+	}
+
+	encode gzip
+}
