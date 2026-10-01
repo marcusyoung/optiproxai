@@ -25,7 +25,7 @@ do not run them from this directory.
   config.yaml            # from config.vps.yaml
   models/feature_classifier.pkl
 /etc/optiproxai/optiproxai.env
-/var/log/optiproxai/     # routing-*.jsonl, execution-*.jsonl (OPTIPROXAI_LOG_DIR)
+/var/log/optiproxai/     # server.log (console), routing-*.jsonl, execution-*.jsonl (OPTIPROXAI_LOG_DIR)
 /var/lib/optiproxai/     # dashboard.db, api_keys.json, dataset, cache (OPTIPROXAI_DATA_DIR)
 ```
 
