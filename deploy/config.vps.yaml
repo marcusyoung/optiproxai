@@ -1,0 +1,385 @@
+# OptiProxAI configuration — VPS deployment
+# Adapted from the OpenCode config for a server behind Apache (TLS terminated
+# by Apache, proxy bound to loopback). Changes vs. the OpenCode config:
+#   - host: 127.0.0.1 (was 0.0.0.0) so only Apache can reach it
+#   - ollamalocal provider removed (no local Ollama on the VPS)
+# Everything else (profiles, model_rules, Doubleword settings) is unchanged.
+#
+# Secrets resolve from ${VAR} in the process environment (systemd
+# EnvironmentFile=/etc/optiproxai/optiproxai.env). Missing vars silently
+# resolve to "".
+host: "127.0.0.1"
+port: 18421
+default_provider: doubleword
+default_profile: code
+disable_axis_overrides: true
+
+# Per-boundary ambiguity handling: a score within `band` of a tier boundary is
+# ambiguous; `prefer` names which of the two adjacent tiers wins (LOWER/UPPER).
+ambiguous_bands:
+  SIMPLE_MEDIUM: {band: 0.01, prefer: UPPER}
+  MEDIUM_COMPLEX: {band: 0.01, prefer: LOWER}
+  COMPLEX_REASONING: {band: 0.05, prefer: LOWER}
+
+
+# Session-sticky routing: optiproxai reads the session key from this header
+# (sent by OpenCode) for deterministic hash-based primary selection.
+routing:
+  session_header: X-Session-Id
+
+# OpenCode attaches its full tool schema to every turn; under the default
+# "declared" policy that forces required=True on every request and filters out
+# non-tools primaries (e.g. mistral-small on SIMPLE). "active" only requires
+# tools when tool use is forced or the current turn shows active tool state.
+smart_proxy:
+  tools_capability_detection: active
+  # TASK-17: age images out of history. Image stays vision-relevant for
+  # image_ttl_turns user turns (default 3), then non-vision candidates become
+  # eligible and receive image parts replaced by the placeholder.
+  image_history_stripping:
+    enabled: true
+    image_ttl_turns: 3
+    placeholder: "[image omitted]"
+
+providers:
+  charm:
+    name: charm
+    base_url: "https://hyper.charm.land/v1"
+    api_key: "${CHARM_API_KEY}"
+    supports_reasoning_content: true
+    reasoning_style: "xai"
+  mistral:
+    name: mistral
+    base_url: "https://api.mistral.ai/v1"
+    api_key: "${MISTRAL_API_KEY}"
+  ollamacloud:
+    name: ollamacloud
+    base_url: "https://ollama.com/v1"
+    api_key: "${OLLAMA_API_KEY}"
+    supports_reasoning_content: true
+  synthetic:
+    name: synthetic
+    base_url: "https://api.synthetic.new/openai/v1"
+    api_key: "${SYNTHETIC_API_KEY}"
+    supports_reasoning_content: true
+  voyage:
+    name: voyage
+    base_url: "https://api.voyageai.com/v1"
+    api_key: "${VOYAGE_API_KEY}"
+  doubleword:
+    name: doubleword
+    base_url: "https://api.doubleword.ai/v1"
+    api_key: "${DOUBLEWORD_API_KEY}"
+    supports_reasoning_content: true
+    reasoning_style: "xai"
+    # TASK-25: Doubleword accepts the full effort vocabulary; without this the
+    # shared xai style caps at high and coerces max -> high.
+    reasoning_effort_values: [none, minimal, low, medium, high, xhigh, max]
+    async_mode:
+      delivery: body
+      field: service_tier
+      value: flex
+    # TASK-26: explicit prompt caching stays OFF. Implicit caching is the
+    # provider default and never bills writes; explicit markers add a write
+    # premium that is not wanted. Kept as documentation of the intended policy.
+    cache_control:
+      enabled: false
+      ttl: "1h"
+      targets: [tools, system, last_message]
+      max_breakpoints: 4
+
+feature_annotator:
+  model: "mistral-medium-3.5"
+  provider: "mistral"
+
+embedding:
+  model: "voyage-4"
+  provider: "voyage"
+  timeout_seconds: 10.0  # hosted API; 30s was for Ollama cold-start reloads
+
+model_rules:
+  # reasoning_style controls how optiproxai injects reasoning controls into the request body
+  # when a tier has reasoning_effort set.
+  #   xai       → reasoning_effort: "high"          (Mistral, DeepSeek, GLM-5.2, K3)
+  #   openai    → reasoning: {effort: "high"}        (gpt-oss)
+  #   none      → no injection
+  - prefix: "mistral-medium-3.5"
+    provider: "mistral"
+    capabilities: [tools, vision, json_mode]
+    reasoning_style: "xai"
+  - prefix: "moonshotai/kimi-k3"
+    provider: "doubleword"
+    capabilities: [tools, json_mode, vision]
+    reasoning_style: "xai"
+    async_mode:
+      enabled: true   # opts in; mechanism inherited from provider
+    pricing:
+      input_per_mtok: 3.00       # USD per 1M tokens (Doubleword realtime)
+      cache_read_per_mtok: 0.30   # cached prefix read price
+      cache_write_per_mtok: 6.00  # cache write premium (1h TTL = 2x input)
+  - prefix: "meta-models/Muse-Glimmer-30B"
+    provider: "doubleword"
+    capabilities: [tools, json_mode, vision]
+    reasoning_style: "xai"
+    pricing:
+      input_per_mtok: 0.11       # USD per 1M tokens
+      cache_read_per_mtok: 0.01   # cached prefix read price
+      cache_write_per_mtok: 0.00  # cache write premium (optional)
+  - prefix: "zai-org/GLM-5.3-Flash"
+    provider: "doubleword"
+    capabilities: [tools, json_mode]
+    reasoning_style: "xai"
+    pricing:
+      input_per_mtok: 0.15       # USD per 1M tokens
+      cache_read_per_mtok: 0.03   # cached prefix read price
+      cache_write_per_mtok: 0.00  # cache write premium (optional)
+  - prefix: "zai-org/GLM-5.3"
+    provider: "doubleword"
+    capabilities: [tools, json_mode]
+    reasoning_style: "xai"
+    async_mode:
+      enabled: false   # opts in; mechanism inherited from provider
+    pricing:
+      input_per_mtok: 1.40       # USD per 1M tokens (Doubleword realtime)
+      cache_read_per_mtok: 0.28   # cached prefix read price
+      cache_write_per_mtok: 0.00  # cache write premium (explicit caching disabled)
+  # TASK-26: vision verified live 2026-09-24 (read a known digit + red square).
+  # Large-context vision fallback (1M context).
+  - prefix: "thinkingmachines/Inkling-NVFP4"
+    provider: "doubleword"
+    capabilities: [tools, json_mode, vision]
+    reasoning_style: "xai"
+    pricing:
+      input_per_mtok: 1.20       # USD per 1M tokens (Doubleword realtime)
+      cache_read_per_mtok: 0.20   # cached prefix read price
+      cache_write_per_mtok: 4.00  # cache write premium (realtime)
+  # TASK-26: vision verified live 2026-09-24 — becomes the primary vision path.
+  # NOTE: zai-org/GLM-5.3-Flash accepts image requests but does NOT process them
+  # (confident hallucination in the 2026-09-24 probe); never declare vision on it.
+  - prefix: "deepseek-ai/DeepSeek-V4.1-Flash"
+    provider: "doubleword"
+    capabilities: [tools, json_mode, vision]
+    reasoning_style: "xai"
+    pricing:
+      input_per_mtok: 0.15       # USD per 1M tokens
+      cache_read_per_mtok: 0.01   # cached prefix read price
+      cache_write_per_mtok: 0.00  # cache write premium (optional)
+
+
+profiles:
+  code:
+    tiers:
+      SIMPLE:
+        reasoning_effort: "low"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+      MEDIUM:
+        reasoning_effort: "medium"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+          - model: "meta-models/Muse-Glimmer-30B" # vision
+            provider: "doubleword"
+            max_input_tokens: 132000
+      COMPLEX:
+        reasoning_effort: "high"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+          - model: "meta-models/Muse-Glimmer-30B" # vision
+            provider: "doubleword"
+            max_input_tokens: 132000
+      REASONING:
+        reasoning_effort: "high"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+          - model: "thinkingmachines/Inkling-NVFP4" # vision, 1M
+            provider: "doubleword"
+            max_input_tokens: 1000000
+          - model: "moonshotai/kimi-k3" # vision, retained extra fallback
+            provider: "doubleword"
+            max_input_tokens: 1048576
+
+  analysis:
+    tiers:
+      SIMPLE:
+        reasoning_effort: "low"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+      MEDIUM:
+        reasoning_effort: "medium"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+          - model: "meta-models/Muse-Glimmer-30B" # vision
+            provider: "doubleword"
+            max_input_tokens: 131000
+      COMPLEX:
+        reasoning_effort: "high"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+          - model: "meta-models/Muse-Glimmer-30B" # vision
+            provider: "doubleword"
+            max_input_tokens: 132000
+      REASONING:
+        reasoning_effort: "high"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+          - model: "thinkingmachines/Inkling-NVFP4" # vision, 1M
+            provider: "doubleword"
+            max_input_tokens: 1000000
+          - model: "moonshotai/kimi-k3" # vision, retained extra fallback
+            provider: "doubleword"
+            max_input_tokens: 1048576
+
+  # Async (non-realtime) variant of the code profile for background workloads
+  # (e.g. opencode-autolearn). Target via model "optiproxai/async".
+  # Each entry opts into the provider async mechanism (service_tier: flex);
+  # entry-level enabled overrides rule-level enabled: false (e.g. GLM-5.3).
+  # Pricing reflects Doubleword async rates (display-only, dashboard estimates).
+  # TASK-26: REASONING models are intentionally left unchanged in this profile;
+  # only the tier-level effort ladder was re-spread.
+  async:
+    tiers:
+      SIMPLE:
+        reasoning_effort: "low"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+            async_mode:
+              enabled: true
+            pricing:
+              input_per_mtok: 0.12       # async price per 1M tokens
+              cache_read_per_mtok: 0.01
+              cache_write_per_mtok: 0.00
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+            async_mode:
+              enabled: true
+            pricing:
+              input_per_mtok: 0.11       # async price per 1M tokens
+              cache_read_per_mtok: 0.02
+              cache_write_per_mtok: 0.00
+      MEDIUM:
+        reasoning_effort: "medium"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+            async_mode:
+              enabled: true
+            pricing:
+              input_per_mtok: 0.12       # async price per 1M tokens
+              cache_read_per_mtok: 0.01
+              cache_write_per_mtok: 0.00
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+            async_mode:
+              enabled: true
+            pricing:
+              input_per_mtok: 0.11       # async price per 1M tokens
+              cache_read_per_mtok: 0.02
+              cache_write_per_mtok: 0.00
+          - model: "meta-models/Muse-Glimmer-30B" # vision
+            provider: "doubleword"
+            max_input_tokens: 132000
+            async_mode:
+              enabled: true
+            pricing:
+              input_per_mtok: 0.07       # async price per 1M tokens
+              cache_read_per_mtok: 0.01
+              cache_write_per_mtok: 0.14
+      COMPLEX:
+        reasoning_effort: "high"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+            async_mode:
+              enabled: true
+            pricing:
+              input_per_mtok: 0.12       # async price per 1M tokens
+              cache_read_per_mtok: 0.01
+              cache_write_per_mtok: 0.00
+        fallback:
+          - model: "zai-org/GLM-5.3-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+            async_mode:
+              enabled: true
+            pricing:
+              input_per_mtok: 0.11       # async price per 1M tokens
+              cache_read_per_mtok: 0.02
+              cache_write_per_mtok: 0.00
+      REASONING:
+        reasoning_effort: "high"
+        primary:
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+            async_mode:
+              enabled: true   # overrides rule-level enabled: false
+            pricing:
+              input_per_mtok: 0.12      # async price per 1M tokens
+              cache_read_per_mtok: 0.01
+              cache_write_per_mtok: 0.00
+        fallback:
+          - model: "zai-org/GLM-5.3"
+            provider: "doubleword"
+            max_input_tokens: 1048576
+            async_mode:
+              enabled: true   # overrides rule-level enabled: false
+            pricing:
+              input_per_mtok: 1.05       # async price per 1M tokens
+              cache_read_per_mtok: 0.21
+              cache_write_per_mtok: 0.00
