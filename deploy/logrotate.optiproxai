@@ -1,0 +1,24 @@
+# Logrotate rule for the OptiProxAI service console log.
+#
+# Install to /etc/logrotate.d/optiproxai (owned root:root, mode 644):
+#   sudo install -o root -g root -m 644 deploy/logrotate.optiproxai /etc/logrotate.d/optiproxai
+#
+# `server.log` is written via systemd StandardOutput=append:, which holds the
+# file open for the life of the service. A normal rename-based rotation would
+# leave systemd writing to the old inode forever, so this uses copytruncate:
+# the log is copied aside and the original is truncated in place, keeping the
+# open descriptor valid and requiring no service restart.
+#
+# The dated routing-*.jsonl / execution-*.jsonl logs are NOT covered here; they
+# self-rotate by filename and are pruned separately.
+
+/var/log/optiproxai/server.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+    copytruncate
+    # Match the optiproxai-owned 750 log directory (logrotate runs as root).
+    su optiproxai optiproxai
+}

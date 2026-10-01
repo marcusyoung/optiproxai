@@ -20,6 +20,13 @@ EnvironmentFile=/etc/optiproxai/optiproxai.env
 # Config binds 127.0.0.1; Apache terminates TLS and reverse-proxies to it.
 ExecStart=/opt/optiproxai/.venv/bin/optiproxai serve --config /opt/optiproxai/config.yaml
 
+# Durable console log (the Linux equivalent of the Windows
+# optiproxai-server.log). Default systemd stdout goes to the journal, which may
+# be volatile; append here so the server log survives reboots and rotates with
+# the JSONL logs. /var/log/optiproxai is already in ReadWritePaths below.
+StandardOutput=append:/var/log/optiproxai/server.log
+StandardError=append:/var/log/optiproxai/server.log
+
 Restart=on-failure
 RestartSec=5
 

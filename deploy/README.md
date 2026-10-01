@@ -16,6 +16,7 @@ do not run them from this directory.
 | `opx-annotate.sh` | `/usr/local/bin/opx-annotate` | build/extend the training dataset from routing logs |
 | `opx-train.sh` | `/usr/local/bin/opx-train` | train `models/feature_classifier.pkl` |
 | `Caddyfile` | `/etc/caddy/Caddyfile` | alternative to Apache for hosts running Caddy |
+| `logrotate.optiproxai` | `/etc/logrotate.d/optiproxai` | rotate the unbounded `server.log` (copytruncate) |
 
 ## Layout
 
@@ -25,7 +26,7 @@ do not run them from this directory.
   config.yaml            # from config.vps.yaml
   models/feature_classifier.pkl
 /etc/optiproxai/optiproxai.env
-/var/log/optiproxai/     # routing-*.jsonl, execution-*.jsonl (OPTIPROXAI_LOG_DIR)
+/var/log/optiproxai/     # server.log (console), routing-*.jsonl, execution-*.jsonl (OPTIPROXAI_LOG_DIR)
 /var/lib/optiproxai/     # dashboard.db, api_keys.json, dataset, cache (OPTIPROXAI_DATA_DIR)
 ```
 
@@ -68,6 +69,7 @@ do not run them from this directory.
    sudo mkdir -p /var/log/optiproxai /var/lib/optiproxai
    sudo chown optiproxai:optiproxai /var/log/optiproxai /var/lib/optiproxai
    sudo install -o root -g root -m 644 optiproxai.service /etc/systemd/system/
+   sudo install -o root -g root -m 644 logrotate.optiproxai /etc/logrotate.d/optiproxai
    sudo systemctl daemon-reload && sudo systemctl enable --now optiproxai
    ```
 
