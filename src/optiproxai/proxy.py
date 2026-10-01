@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
 import logging
@@ -226,8 +227,38 @@ app = FastAPI(title="optiproxai", version="0.1.0", lifespan=lifespan)
 _AUTH_EXEMPT = {"/health", "/docs", "/openapi.json", "/admin/reload-config"}
 
 
+def _basic_auth_token(header: str) -> str | None:
+    """Extract the password from a Basic auth header; return None if malformed.
+
+    The dashboard is browser-only (it cannot set a Bearer header), so it is
+    reachable with HTTP Basic whose *password* is the OptiProxAI API key. The
+    username is ignored to keep the credential single-valued.
+    """
+    try:
+        decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    _, _, password = decoded.partition(":")
+    return password or None
+
+
+def _extract_api_key(request: Request) -> str | None:
+    """Return the API key from a Bearer or Basic Authorization header."""
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:] or None
+    if auth.startswith("Basic "):
+        return _basic_auth_token(auth)
+    return None
+
+
 class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
-    """Require a valid Bearer token when API keys are configured."""
+    """Require a valid API key when keys are configured.
+
+    Programmatic clients use ``Authorization: Bearer <key>``. Browsers hitting
+    the dashboard use ``Authorization: Basic`` with the key as the password,
+    signalled by a ``WWW-Authenticate`` challenge so the browser prompts.
+    """
 
     async def dispatch(self, request: Request, call_next):
         # Skip auth if no keys configured (backward-compat)
@@ -238,13 +269,17 @@ class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
         if request.url.path in _AUTH_EXEMPT:
             return await call_next(request)
 
-        auth = request.headers.get("authorization", "")
-        if auth.startswith("Bearer "):
-            token = auth[7:]
-            if validate_key(token):
-                return await call_next(request)
+        token = _extract_api_key(request)
+        if token and validate_key(token):
+            return await call_next(request)
 
-        return _openai_error(401, "Invalid or missing API key", "authentication_error")
+        response = _openai_error(
+            401, "Invalid or missing API key", "authentication_error"
+        )
+        # Challenge browsers so they prompt on the dashboard (and its stats API).
+        if request.url.path.startswith("/dashboard"):
+            response.headers["WWW-Authenticate"] = 'Basic realm="optiproxai"'
+        return response
 
 
 app.add_middleware(ApiKeyAuthMiddleware)

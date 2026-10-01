@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
 from unittest.mock import patch
 
@@ -131,6 +132,59 @@ class TestWithKeysConfigured:
             },
         )
         assert resp.status_code == 401
+
+
+class TestBasicAuthDashboard:
+    """The dashboard is reachable with Basic auth whose password is the API key."""
+
+    @staticmethod
+    def _basic(user: str, secret: str) -> dict[str, str]:
+        encoded = base64.b64encode(f"{user}:{secret}".encode()).decode()
+        return {"Authorization": f"Basic {encoded}"}
+
+    def test_dashboard_challenges_with_basic_realm(self, client):
+        generate_key("admin")
+        resp = client.get("/dashboard")
+        assert resp.status_code == 401
+        assert resp.headers.get("WWW-Authenticate", "").startswith("Basic")
+
+    def test_dashboard_stats_challenges(self, client):
+        generate_key("admin")
+        resp = client.get("/dashboard/stats")
+        assert resp.status_code == 401
+        assert resp.headers.get("WWW-Authenticate", "").startswith("Basic")
+
+    def test_dashboard_with_valid_key_as_password(self, client):
+        raw = generate_key("admin")
+        resp = client.get("/dashboard", headers=self._basic("optiproxai", raw))
+        assert resp.status_code == 200
+
+    def test_dashboard_stats_with_valid_key_as_password(self, client):
+        raw = generate_key("admin")
+        resp = client.get("/dashboard/stats", headers=self._basic("anyone", raw))
+        assert resp.status_code == 200
+
+    def test_dashboard_with_invalid_key_rejected(self, client):
+        generate_key("admin")
+        resp = client.get("/dashboard", headers=self._basic("optiproxai", "nope"))
+        assert resp.status_code == 401
+        assert resp.headers.get("WWW-Authenticate", "").startswith("Basic")
+
+    def test_dashboard_with_malformed_basic_header_rejected(self, client):
+        generate_key("admin")
+        resp = client.get("/dashboard", headers={"Authorization": "Basic not-base64!!"})
+        assert resp.status_code == 401
+
+    def test_v1_accepts_basic_auth(self, client):
+        raw = generate_key("admin")
+        resp = client.get("/v1/models", headers=self._basic("optiproxai", raw))
+        assert resp.status_code == 200
+
+    def test_v1_does_not_issue_basic_challenge(self, client):
+        generate_key("admin")
+        resp = client.get("/v1/models")
+        assert resp.status_code == 401
+        assert "WWW-Authenticate" not in resp.headers
 
 
 @pytest.mark.usefixtures("_configured")
