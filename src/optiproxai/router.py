@@ -99,6 +99,27 @@ class RoutingDecision(BaseModel):
     session_key: str | None = Field(default=None, exclude=True)
 
 
+def mask_decision_secrets(value: Any) -> Any:
+    """Recursively mask non-empty ``api_key`` values in a decision dump.
+
+    Provider credentials must never leave the process: the CLI ``route``
+    command and the ``/v1/route`` debug endpoint both serialize a
+    ``RoutingDecision`` (including its fallbacks), so both must pass the dump
+    through this helper before returning it. Empty values are left as-is so the
+    output still distinguishes "unset" from "present".
+    """
+    if isinstance(value, dict):
+        return {
+            key: "***"
+            if key == "api_key" and isinstance(item, str) and item
+            else mask_decision_secrets(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [mask_decision_secrets(item) for item in value]
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Router
 # ---------------------------------------------------------------------------

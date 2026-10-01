@@ -2675,3 +2675,31 @@ class TestAdminTokenCompareDigest:
             400,
             500,
         )  # auth passed; reload may fail for other reasons
+
+
+class TestRouteDebugSecretMasking:
+    """The /v1/route decision dump must not leak provider credentials."""
+
+    def test_route_debug_masks_api_key(self, configured_proxy) -> None:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/v1/route",
+                json={"messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload["api_key"] == "***"
+        for fallback in payload["fallbacks"]:
+            assert fallback["api_key"] == "***"
+
+    def test_route_debug_never_contains_config_secret(self, configured_proxy) -> None:
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/v1/route",
+                json={"messages": [{"role": "user", "content": "hello"}]},
+            )
+
+        # "fake" is the single api_key in the test config; it must not surface
+        # anywhere in the raw response body (main entry or any fallback).
+        assert "fake" not in resp.text
