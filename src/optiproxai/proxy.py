@@ -50,6 +50,7 @@ from optiproxai.router import (
     InputLimitNotSatisfiedError,
     Router,
     RoutingDecision,
+    mask_decision_secrets,
     parse_tier_override,
 )
 
@@ -2781,7 +2782,9 @@ async def route_debug(request: Request):
         state.config.smart_proxy.decorative_tool_schema_handling,
     )
 
-    payload = decision.model_dump()
+    # The dump carries resolved provider credentials (main + fallbacks); mask
+    # them before the decision leaves the process, matching CLI `route` output.
+    payload = mask_decision_secrets(decision.model_dump())
     payload["tier_override"] = tier_override
     payload["tools_capability_detection"] = {
         "policy": tools_capability_decision.policy,

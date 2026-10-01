@@ -57,6 +57,25 @@ class TestRouteKeyMasking:
         assert masked["fallbacks"][1]["api_key"] == ""
         assert masked["metadata"]["api_key"] == "***"
 
+    def test_mask_decision_secrets_masks_deeply_nested_lists(self) -> None:
+        from optiproxai.router import mask_decision_secrets
+
+        value = {
+            "api_key": "top",
+            "fallbacks": [
+                {"model": "a", "api_key": "fb"},
+                {"model": "b", "api_key": ""},
+            ],
+            "config": {"providers": [{"api_key": "deep"}]},
+        }
+
+        masked = mask_decision_secrets(value)
+
+        assert masked["api_key"] == "***"
+        assert masked["fallbacks"][0]["api_key"] == "***"
+        assert masked["fallbacks"][1]["api_key"] == ""
+        assert masked["config"]["providers"][0]["api_key"] == "***"
+
     def test_route_masks_api_key_output(self, runner, empty_dir) -> None:
         config_path = empty_dir / "config.yaml"
         config_path.write_text(

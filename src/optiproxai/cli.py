@@ -227,16 +227,9 @@ def _handle_config_error(e: ConfigNotFoundError | ConfigIncompleteError) -> NoRe
 
 def _mask_keys_in_decision(value: Any) -> Any:
     """Mask non-empty api_key values in a routing decision dump."""
-    if isinstance(value, dict):
-        return {
-            key: "***"
-            if key == "api_key" and isinstance(item, str) and item
-            else _mask_keys_in_decision(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_mask_keys_in_decision(item) for item in value]
-    return value
+    from optiproxai.router import mask_decision_secrets
+
+    return mask_decision_secrets(value)
 
 
 @click.group()
