@@ -9,10 +9,12 @@
 
 proxy.example.com {
 	# Cursor appends /chat/completions itself, so forward the full path.
-	reverse_proxy 127.0.0.1:18420
-
-	# Streaming responses (SSE) must not be buffered.
-	flush_interval -1
+	# Port must match `port:` in config.yaml (deploy/config.vps.yaml uses 18421).
+	reverse_proxy 127.0.0.1:18421 {
+		# Streaming responses (SSE) must not be buffered; flush_interval is a
+		# reverse_proxy subdirective, not a site-level one.
+		flush_interval -1
+	}
 
 	encode gzip
 }

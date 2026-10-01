@@ -15,16 +15,9 @@ set -euo pipefail
 
 ENV_FILE="/etc/optiproxai/optiproxai.env"
 REPO="/opt/optiproxai"
-DATADIR="${OPTIPROXAI_DATA_DIR:-/var/lib/optiproxai}"
-DATASET="$DATADIR/distilled_feature_dataset.json"
 
 if [[ ! -r "$ENV_FILE" ]]; then
     echo "opx-train: cannot read $ENV_FILE (run as the optiproxai user)" >&2
-    exit 1
-fi
-
-if [[ ! -f "$DATASET" ]]; then
-    echo "opx-train: dataset not found: $DATASET (run opx-annotate first)" >&2
     exit 1
 fi
 
@@ -32,6 +25,16 @@ set -a
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 set +a
+
+# Derive paths AFTER sourcing the env file, so a non-default
+# OPTIPROXAI_DATA_DIR takes effect before the dataset is validated.
+DATADIR="${OPTIPROXAI_DATA_DIR:-/var/lib/optiproxai}"
+DATASET="$DATADIR/distilled_feature_dataset.json"
+
+if [[ ! -f "$DATASET" ]]; then
+    echo "opx-train: dataset not found: $DATASET (run opx-annotate first)" >&2
+    exit 1
+fi
 
 cd "$REPO"
 

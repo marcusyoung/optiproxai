@@ -16,9 +16,6 @@ set -euo pipefail
 
 ENV_FILE="/etc/optiproxai/optiproxai.env"
 REPO="/opt/optiproxai"
-LOGDIR="${OPTIPROXAI_LOG_DIR:-/var/log/optiproxai}"
-DATADIR="${OPTIPROXAI_DATA_DIR:-/var/lib/optiproxai}"
-DATASET="$DATADIR/distilled_feature_dataset.json"
 
 FORCE=0
 TRAIN=0
@@ -42,6 +39,12 @@ set -a
 # shellcheck disable=SC1090
 . "$ENV_FILE"
 set +a
+
+# Derive paths AFTER sourcing the env file, so a non-default
+# OPTIPROXAI_LOG_DIR / OPTIPROXAI_DATA_DIR takes effect.
+LOGDIR="${OPTIPROXAI_LOG_DIR:-/var/log/optiproxai}"
+DATADIR="${OPTIPROXAI_DATA_DIR:-/var/lib/optiproxai}"
+DATASET="$DATADIR/distilled_feature_dataset.json"
 
 cd "$REPO"
 

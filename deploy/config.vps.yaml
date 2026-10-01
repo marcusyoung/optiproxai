@@ -138,7 +138,7 @@ model_rules:
     capabilities: [tools, json_mode]
     reasoning_style: "xai"
     async_mode:
-      enabled: false   # opts in; mechanism inherited from provider
+      enabled: false   # rule-level opt-OUT of async; this model never uses the provider batch mechanism
     pricing:
       input_per_mtok: 1.40       # USD per 1M tokens (Doubleword realtime)
       cache_read_per_mtok: 0.28   # cached prefix read price
@@ -368,7 +368,7 @@ profiles:
             provider: "doubleword"
             max_input_tokens: 1048576
             async_mode:
-              enabled: true   # overrides rule-level enabled: false
+              enabled: true   # opts into the provider mechanism (rule has no async_mode)
             pricing:
               input_per_mtok: 0.12      # async price per 1M tokens
               cache_read_per_mtok: 0.01
@@ -378,7 +378,7 @@ profiles:
             provider: "doubleword"
             max_input_tokens: 1048576
             async_mode:
-              enabled: true   # overrides rule-level enabled: false
+              enabled: true   # overrides the rule-level enabled: false on zai-org/GLM-5.3
             pricing:
               input_per_mtok: 1.05       # async price per 1M tokens
               cache_read_per_mtok: 0.21
