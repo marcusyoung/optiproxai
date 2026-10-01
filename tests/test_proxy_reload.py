@@ -2680,26 +2680,73 @@ class TestAdminTokenCompareDigest:
 class TestRouteDebugSecretMasking:
     """The /v1/route decision dump must not leak provider credentials."""
 
-    def test_route_debug_masks_api_key(self, configured_proxy) -> None:
-        with TestClient(app, raise_server_exceptions=False) as client:
-            resp = client.post(
-                "/v1/route",
-                json={"messages": [{"role": "user", "content": "hello"}]},
+    def _config_with_fallback(self, tmp_path: Path) -> Path:
+        """Config whose SIMPLE tier has a primary plus a distinct fallback.
+
+        Both providers carry their own credential, so the response contains
+        more than one secret and the fallback masking is actually exercised.
+        """
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            _config_text(
+                primary_model="primary-model",
+                fallback_models='[{model: "fallback-model", provider: "fallback"}]',
+                provider_body="""  fallback:
+    name: fallback
+    base_url: "http://fallback.example/v1"
+    api_key: "fallback-secret"
+""",
             )
+        )
+        return path
+
+    def test_route_debug_masks_api_key(self, configured_proxy) -> None:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("optiproxai.scorer.Scorer.classify", _simple_classification)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post(
+                    "/v1/route",
+                    json={"messages": [{"role": "user", "content": "hello"}]},
+                )
 
         assert resp.status_code == 200
         payload = resp.json()
         assert payload["api_key"] == "***"
+
+    def test_route_debug_masks_fallback_api_key(self, tmp_path: Path) -> None:
+        configure(str(self._config_with_fallback(tmp_path)))
+
+        with pytest.MonkeyPatch.context() as mp:
+            # Route deterministically to SIMPLE (which has the fallback) and
+            # avoid a live embedding call in the scorer.
+            mp.setattr("optiproxai.scorer.Scorer.classify", _simple_classification)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post(
+                    "/v1/route",
+                    json={"messages": [{"role": "user", "content": "hello"}]},
+                )
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        # Non-vacuous: the fallback must actually be present and masked.
+        assert payload["fallbacks"], "test config produced no fallbacks"
+        assert payload["api_key"] == "***"
         for fallback in payload["fallbacks"]:
             assert fallback["api_key"] == "***"
 
-    def test_route_debug_never_contains_config_secret(self, configured_proxy) -> None:
-        with TestClient(app, raise_server_exceptions=False) as client:
-            resp = client.post(
-                "/v1/route",
-                json={"messages": [{"role": "user", "content": "hello"}]},
-            )
+    def test_route_debug_never_contains_config_secret(self, tmp_path: Path) -> None:
+        configure(str(self._config_with_fallback(tmp_path)))
 
-        # "fake" is the single api_key in the test config; it must not surface
-        # anywhere in the raw response body (main entry or any fallback).
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr("optiproxai.scorer.Scorer.classify", _simple_classification)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post(
+                    "/v1/route",
+                    json={"messages": [{"role": "user", "content": "hello"}]},
+                )
+
+        assert resp.status_code == 200
+        # Neither the primary nor the fallback credential may surface anywhere
+        # in the raw response body.
         assert "fake" not in resp.text
+        assert "fallback-secret" not in resp.text
