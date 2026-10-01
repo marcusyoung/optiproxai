@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "hindsight": {
+      "url": "https://hindsight.int2.uk/mcp/optiproxai",
+      "headers": {
+        "Authorization": "Bearer ${env:HINDSIGHT_API_TOKEN}"
+      }
+    },
+    "backlog": {
+      "type": "stdio",
+      "command": "cmd",
+      "args": [
+        "/c",
+        "C:\\Users\\myoun\\AppData\\Roaming\\npm\\backlog.cmd",
+        "mcp",
+        "start",
+        "--cwd",
+        "C:\\Users\\myoun\\git-repos\\optiproxai"
+      ],
+      "env": {
+        "BACKLOG_CWD": "C:\\Users\\myoun\\git-repos\\optiproxai"
+      }
+    }
+  }
+}

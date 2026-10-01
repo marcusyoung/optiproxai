@@ -29,3 +29,7 @@ models/
 .mcp.json
 opencode.json
 .opencodereview/
+
+# Added by hindsight-cursor plugin — session rules are regenerated each session.
+/.cursor\rules\hindsight-session.mdc
+/.cursor/rules/hindsight-session.mdc
