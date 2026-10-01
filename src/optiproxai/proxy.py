@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import copy
 import json
 import logging
@@ -226,8 +227,56 @@ app = FastAPI(title="optiproxai", version="0.1.0", lifespan=lifespan)
 _AUTH_EXEMPT = {"/health", "/docs", "/openapi.json", "/admin/reload-config"}
 
 
+def _basic_auth_token(header: str) -> str | None:
+    """Extract the password from a Basic auth header; return None if malformed.
+
+    The dashboard is browser-only (it cannot set a Bearer header), so it is
+    reachable with HTTP Basic whose *password* is the OptiProxAI API key. The
+    username is ignored to keep the credential single-valued.
+
+    Only used for the dashboard; see ``_extract_api_key`` for why Basic must not
+    be accepted on the API routes.
+    """
+    try:
+        decoded = base64.b64decode(header[6:], validate=True).decode("utf-8")
+    except (ValueError, UnicodeDecodeError):
+        return None
+    _, _, password = decoded.partition(":")
+    return password or None
+
+
+def _is_dashboard_path(path: str) -> bool:
+    """Return True for the dashboard HTML and its stats API."""
+    return path == "/dashboard" or path.startswith("/dashboard/")
+
+
+def _extract_api_key(request: Request, *, allow_basic: bool) -> str | None:
+    """Return the API key from the Authorization header, if present.
+
+    ``Bearer`` is accepted everywhere. ``Basic`` is accepted only when
+    ``allow_basic`` is set (dashboard paths): browsers automatically attach
+    cached Basic credentials to same-origin requests, so accepting Basic on
+    ``/v1/*`` would let any page the user visits trigger authenticated upstream
+    calls (CSRF), even though reading the response is blocked by CORS.
+    """
+    auth = request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:] or None
+    if allow_basic and auth.startswith("Basic "):
+        return _basic_auth_token(auth)
+    return None
+
+
 class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
-    """Require a valid Bearer token when API keys are configured."""
+    """Require a valid API key when keys are configured.
+
+    Programmatic clients use ``Authorization: Bearer <key>`` on any path.
+    Browsers hitting the dashboard use ``Authorization: Basic`` with the key as
+    the password (username ignored), signalled by a ``WWW-Authenticate``
+    challenge so the browser prompts. Basic is deliberately restricted to
+    dashboard paths to keep the API routes out of reach of browser-managed
+    credentials.
+    """
 
     async def dispatch(self, request: Request, call_next):
         # Skip auth if no keys configured (backward-compat)
@@ -238,13 +287,18 @@ class ApiKeyAuthMiddleware(BaseHTTPMiddleware):
         if request.url.path in _AUTH_EXEMPT:
             return await call_next(request)
 
-        auth = request.headers.get("authorization", "")
-        if auth.startswith("Bearer "):
-            token = auth[7:]
-            if validate_key(token):
-                return await call_next(request)
+        is_dashboard = _is_dashboard_path(request.url.path)
+        token = _extract_api_key(request, allow_basic=is_dashboard)
+        if token and validate_key(token):
+            return await call_next(request)
 
-        return _openai_error(401, "Invalid or missing API key", "authentication_error")
+        response = _openai_error(
+            401, "Invalid or missing API key", "authentication_error"
+        )
+        # Challenge browsers so they prompt on the dashboard (and its stats API).
+        if is_dashboard:
+            response.headers["WWW-Authenticate"] = 'Basic realm="optiproxai"'
+        return response
 
 
 app.add_middleware(ApiKeyAuthMiddleware)

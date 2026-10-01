@@ -214,7 +214,24 @@ client = OpenAI(
 )
 ```
 
-When at least one OptiProxAI proxy key exists, every API request must include `Authorization: Bearer <key>`. `/health` and `/docs` are exempt.
+When at least one OptiProxAI proxy key exists, every API request must include `Authorization: Bearer <key>`. `/health`, `/docs`, `/openapi.json`, and `/admin/reload-config` are exempt.
+
+### Dashboard access from a browser
+
+A browser navigation cannot attach an `Authorization: Bearer` header, so the [dashboard](#dashboard) would be unreachable once keys are configured. On dashboard paths only, OptiProxAI therefore also accepts **HTTP Basic**, where the API key is the **password** and the username is ignored:
+
+```text
+https://<your-proxy>/dashboard
+  → browser prompts
+  → username: optiproxai      (any value works)
+  → password: optiproxai-aBcDeFgH...
+```
+
+The dashboard endpoint returns `WWW-Authenticate: Basic` on `401` so browsers prompt automatically. This is the same key your API clients use — there is no second credential to manage, and rotating the key updates both.
+
+Basic is deliberately **not** accepted on `/v1/*`: browsers automatically attach cached Basic credentials to same-origin requests, so allowing it there would let any page the user visits trigger authenticated upstream calls (CSRF), even though CORS blocks reading the response. API clients must use `Bearer`.
+
+> Note: the dashboard HTML is server-rendered, and the auth challenge is only issued when a key is configured. With no keys, `/dashboard` opens without a prompt as before.
 
 ## Routing profiles
 
