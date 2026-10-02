@@ -49,19 +49,38 @@ class TestParseTierOverride:
 
     @pytest.mark.parametrize("tier", ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"])
     def test_valid_tier_string_content(self, tier: str) -> None:
-        """A valid token at position 0 of string content sets the override."""
-        messages = [{"role": "user", "content": f"/optiproxai:{tier} hello world"}]
+        """A valid token anywhere in string content sets the override."""
+        messages = [{"role": "user", "content": f"::{tier} hello world"}]
         override, stripped = parse_tier_override(messages)
         assert override == tier
         assert stripped[-1]["content"] == "hello world"
 
+    def test_token_anywhere_mid_sentence(self) -> None:
+        """The token is honoured and stripped when it appears mid-sentence."""
+        messages = [{"role": "user", "content": "please use ::reasoning for this"}]
+        override, stripped = parse_tier_override(messages)
+        assert override == "REASONING"
+        assert stripped[-1]["content"] == "please use for this"
+
+    def test_cursor_user_query_wrapper(self) -> None:
+        """A token inside Cursor's <user_query> envelope is still found (regression)."""
+        messages = [
+            {
+                "role": "user",
+                "content": "<user_query>\n::reasoning prove P != NP\n</user_query>",
+            }
+        ]
+        override, stripped = parse_tier_override(messages)
+        assert override == "REASONING"
+        assert "::reasoning" not in stripped[-1]["content"]
+
     def test_list_content_first_text_part(self) -> None:
-        """List content strips the token from the first text part."""
+        """List content strips the token from the first text part containing it."""
         messages = [
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "/optiproxai:complex describe this"},
+                    {"type": "text", "text": "::complex describe this"},
                     {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
                 ],
             }
@@ -70,26 +89,34 @@ class TestParseTierOverride:
         assert override == "COMPLEX"
         assert stripped[-1]["content"][0]["text"] == "describe this"
         # original input not mutated
-        assert messages[0]["content"][0]["text"] == "/optiproxai:complex describe this"
+        assert messages[0]["content"][0]["text"] == "::complex describe this"
 
-    def test_list_content_token_in_later_part_ignored(self) -> None:
-        """A token in a later part (not the first text part) is ignored."""
+    def test_list_content_token_in_later_text_part_found(self) -> None:
+        """A token in a later text part is found and stripped."""
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "plain text first"},
-                    {"type": "text", "text": "/optiproxai:reasoning later"},
+                    {"type": "text", "text": "::reasoning later"},
                 ],
             }
         ]
         override, stripped = parse_tier_override(messages)
-        assert override is None
-        assert stripped is messages
+        assert override == "REASONING"
+        assert stripped[-1]["content"][0]["text"] == "plain text first"
+        assert stripped[-1]["content"][1]["text"] == "later"
 
-    def test_token_and_leading_whitespace_stripped(self) -> None:
-        """The token and its trailing whitespace are stripped from content."""
-        messages = [{"role": "user", "content": "/optiproxai:medium   spaced text"}]
+    def test_only_first_token_honoured(self) -> None:
+        """Only the first ::<tier> token is stripped; later tokens stay as text."""
+        messages = [{"role": "user", "content": "::simple then ::complex x"}]
+        override, stripped = parse_tier_override(messages)
+        assert override == "SIMPLE"
+        assert stripped[-1]["content"] == "then ::complex x"
+
+    def test_token_and_surrounding_whitespace_stripped(self) -> None:
+        """The token and its surrounding whitespace are stripped from content."""
+        messages = [{"role": "user", "content": "::medium   spaced text"}]
         override, stripped = parse_tier_override(messages)
         assert override == "MEDIUM"
         assert stripped[-1]["content"] == "spaced text"
@@ -97,25 +124,39 @@ class TestParseTierOverride:
     @pytest.mark.parametrize("token", ["reasoning", "REASONING", "Reasoning"])
     def test_case_insensitive_tier_matching(self, token: str) -> None:
         """Tier matching is case-insensitive."""
-        messages = [{"role": "user", "content": f"/optiproxai:{token} question"}]
+        messages = [{"role": "user", "content": f"::{token} question"}]
         override, _ = parse_tier_override(messages)
         assert override == "REASONING"
 
+    def test_no_false_positive_mid_identifier(self) -> None:
+        """A ::<tier> run preceded by an identifier char is not a token."""
+        messages = [{"role": "user", "content": "std::reasoning should not match"}]
+        override, stripped = parse_tier_override(messages)
+        assert override is None
+        assert stripped is messages
+
+    def test_no_false_positive_extended_colon_run(self) -> None:
+        """A token inside a longer colon run (:::) is not matched."""
+        messages = [{"role": "user", "content": ":::reasoning nope"}]
+        override, stripped = parse_tier_override(messages)
+        assert override is None
+        assert stripped is messages
+
     def test_invalid_tier_stripped_no_override(self) -> None:
         """An invalid tier yields override=None but the token is stripped."""
-        messages = [{"role": "user", "content": "/optiproxai:foo hello"}]
+        messages = [{"role": "user", "content": "::foo hello"}]
         override, stripped = parse_tier_override(messages)
         assert override is None
         assert stripped[-1]["content"] == "hello"
 
     def test_invalid_tier_emits_warning(self, caplog: pytest.LogCaptureFixture) -> None:
         """An invalid tier logs a warning at log.warning level."""
-        messages = [{"role": "user", "content": "/optiproxai:nope hello"}]
+        messages = [{"role": "user", "content": "::nope hello"}]
         with caplog.at_level("WARNING", logger="optiproxai.router"):
             parse_tier_override(messages)
         assert any("Invalid tier override" in rec.message for rec in caplog.records)
 
-    def test_no_prefix_returns_original(self) -> None:
+    def test_no_token_returns_original(self) -> None:
         """Messages without the token are returned unchanged (same object)."""
         messages: list[dict[str, Any]] = [{"role": "user", "content": "plain"}]
         override, stripped = parse_tier_override(messages)
@@ -126,7 +167,7 @@ class TestParseTierOverride:
         """Tokens in assistant messages do not trigger an override."""
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": "hi"},
-            {"role": "assistant", "content": "/optiproxai:reasoning reply"},
+            {"role": "assistant", "content": "::reasoning reply"},
         ]
         override, stripped = parse_tier_override(messages)
         assert override is None
@@ -135,7 +176,7 @@ class TestParseTierOverride:
     def test_token_in_earlier_user_message_ignored(self) -> None:
         """Only the latest user message is scanned."""
         messages: list[dict[str, Any]] = [
-            {"role": "user", "content": "/optiproxai:reasoning old turn"},
+            {"role": "user", "content": "::reasoning old turn"},
             {"role": "assistant", "content": "response"},
             {"role": "user", "content": "plain current turn"},
         ]
@@ -145,7 +186,7 @@ class TestParseTierOverride:
 
     def test_empty_content_after_stripping_preserved(self) -> None:
         """Stripping to empty preserves "" (the message is not removed)."""
-        messages = [{"role": "user", "content": "/optiproxai:simple"}]
+        messages = [{"role": "user", "content": "::simple"}]
         override, stripped = parse_tier_override(messages)
         assert override == "SIMPLE"
         assert len(stripped) == 1
@@ -339,35 +380,33 @@ profiles:
 
     @pytest.mark.parametrize("tier", ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"])
     def test_valid_override_pins_tier_via_header(self, proxy_client, tier: str) -> None:
-        """A valid /optiproxai:<tier> token forces the overridden tier (AC #4)."""
+        """A valid ::<tier> token forces the overridden tier (AC #4)."""
         client, _ = proxy_client
         resp = client.post(
             "/v1/chat/completions",
             json={
                 "model": "optiproxai/auto",
-                "messages": [{"role": "user", "content": f"/optiproxai:{tier} hi"}],
+                "messages": [{"role": "user", "content": f"::{tier} hi"}],
             },
         )
         assert resp.status_code == 200
         assert resp.headers["X-Optiproxai-Tier"] == tier
 
     def test_token_stripped_from_upstream_body(self, proxy_client) -> None:
-        """The /optiproxai:<tier> token never reaches the upstream model (AC #5)."""
+        """The ::<tier> token never reaches the upstream model (AC #5)."""
         client, captured = proxy_client
         resp = client.post(
             "/v1/chat/completions",
             json={
                 "model": "optiproxai/auto",
-                "messages": [
-                    {"role": "user", "content": "/optiproxai:complex hi there"}
-                ],
+                "messages": [{"role": "user", "content": "::complex hi there"}],
             },
         )
         assert resp.status_code == 200
         upstream_body = captured[0]["body"]
         contents = [m["content"] for m in upstream_body["messages"]]
         assert contents == ["hi there"]
-        assert not any("/optiproxai:" in str(c) for c in contents)
+        assert not any("::complex" in str(c) for c in contents)
         assert upstream_body["model"] == "auto-complex"
 
     def test_tier_override_log_line(self, proxy_client, caplog) -> None:
@@ -378,9 +417,7 @@ profiles:
                 "/v1/chat/completions",
                 json={
                     "model": "optiproxai/auto",
-                    "messages": [
-                        {"role": "user", "content": "/optiproxai:reasoning hi"}
-                    ],
+                    "messages": [{"role": "user", "content": "::reasoning hi"}],
                 },
             )
         tier_lines = [r for r in caplog.records if "TIER_OVERRIDE" in r.getMessage()]
@@ -388,13 +425,13 @@ profiles:
         assert "tier_override=REASONING" in tier_lines[0].getMessage()
 
     def test_invalid_tier_stripped_and_normal_routing(self, proxy_client) -> None:
-        """/optiproxai:foo strips the token but routes normally (AC #6)."""
+        """::foo strips the token but routes normally (AC #6)."""
         client, captured = proxy_client
         resp = client.post(
             "/v1/chat/completions",
             json={
                 "model": "optiproxai/auto",
-                "messages": [{"role": "user", "content": "/optiproxai:foo hello"}],
+                "messages": [{"role": "user", "content": "::foo hello"}],
             },
         )
         assert resp.status_code == 200
@@ -416,7 +453,7 @@ profiles:
             json={
                 "model": "optiproxai/auto",
                 "messages": [
-                    {"role": "user", "content": "/optiproxai:reasoning earlier turn"},
+                    {"role": "user", "content": "::reasoning earlier turn"},
                     {"role": "assistant", "content": "earlier reply"},
                     {"role": "user", "content": "plain current turn"},
                 ],
@@ -424,7 +461,7 @@ profiles:
         )
         assert resp.status_code == 200
         contents = [m["content"] for m in captured[0]["body"]["messages"]]
-        assert contents[0] == "/optiproxai:reasoning earlier turn"
+        assert contents[0] == "::reasoning earlier turn"
 
     def test_token_in_assistant_message_not_triggered(self, proxy_client) -> None:
         """A token in an assistant message does not trigger anything (AC #7)."""
@@ -434,21 +471,21 @@ profiles:
             json={
                 "model": "optiproxai/auto",
                 "messages": [
-                    {"role": "assistant", "content": "/optiproxai:complex quoted"},
+                    {"role": "assistant", "content": "::complex quoted"},
                     {"role": "user", "content": "plain question"},
                 ],
             },
         )
         assert resp.status_code == 200
         contents = [m["content"] for m in captured[0]["body"]["messages"]]
-        assert contents[0] == "/optiproxai:complex quoted"
+        assert contents[0] == "::complex quoted"
 
     def test_route_debug_honours_override(self, proxy_client) -> None:
         """route_debug parses and passes the override to route() (ACs #8/#9)."""
         client, _ = proxy_client
         resp = client.post(
             "/v1/route",
-            json={"messages": [{"role": "user", "content": "/optiproxai:complex hi"}]},
+            json={"messages": [{"role": "user", "content": "::complex hi"}]},
         )
         assert resp.status_code == 200
         payload = resp.json()
@@ -477,17 +514,13 @@ profiles:
         with patch.object(state.router, "route", new=route_spy):
             resp = client.post(
                 "/v1/route",
-                json={
-                    "messages": [
-                        {"role": "user", "content": "/optiproxai:foo hello world"}
-                    ]
-                },
+                json={"messages": [{"role": "user", "content": "::foo hello world"}]},
             )
         assert resp.status_code == 200
         routed_messages = route_spy.call_args.args[0]
         contents = [m["content"] for m in routed_messages]
         assert contents == ["hello world"]
-        # /optiproxai:foo is an invalid tier, so the scorer runs on stripped content
+        # ::foo is an invalid tier, so the scorer runs on stripped content
         payload = resp.json()
         assert payload["tier_override"] is None
 
@@ -551,7 +584,7 @@ profiles:
             with patch.object(router, "route", new=route_spy):
                 result = runner.invoke(
                     main,
-                    ["route", "/optiproxai:reasoning hi", "--config", str(config_path)],
+                    ["route", "::reasoning hi", "--config", str(config_path)],
                 )
         assert result.exit_code == 0, result.output
         assert route_spy.call_args.kwargs.get("tier_override") == "REASONING"
@@ -560,7 +593,7 @@ profiles:
     def test_override_shows_tier_in_output(
         self, runner, config_path, tier: str
     ) -> None:
-        """A /optiproxai:<tier> prompt shows the overridden tier in the JSON output (ACs #3/#4)."""
+        """A ::<tier> prompt shows the overridden tier in the JSON output (ACs #3/#4)."""
         import json
 
         from optiproxai.cli import main
@@ -569,7 +602,7 @@ profiles:
             main,
             [
                 "route",
-                f"/optiproxai:{tier} explain something",
+                f"::{tier} explain something",
                 "--config",
                 str(config_path),
             ],
@@ -581,20 +614,20 @@ profiles:
     def test_invalid_tier_falls_through_to_normal_scoring(
         self, runner, config_path
     ) -> None:
-        """An invalid /optiproxai:foo prompt falls through to normal scoring (AC #5)."""
+        """An invalid ::foo prompt falls through to normal scoring (AC #5)."""
         import json
 
         from optiproxai.cli import main
 
         result = runner.invoke(
-            main, ["route", "/optiproxai:foo hello", "--config", str(config_path)]
+            main, ["route", "::foo hello", "--config", str(config_path)]
         )
         assert result.exit_code == 0, result.output
         data = json.loads(result.output)
         assert data["tier"] in {"SIMPLE", "MEDIUM", "COMPLEX", "REASONING"}
 
-    def test_no_prefix_routes_normally(self, runner, config_path) -> None:
-        """A prompt without /optiproxai: prefix routes normally (AC #6)."""
+    def test_no_token_routes_normally(self, runner, config_path) -> None:
+        """A prompt without a token routes normally (AC #6)."""
         import json
 
         from optiproxai.cli import main
@@ -621,7 +654,7 @@ profiles:
                     main,
                     [
                         "route",
-                        "/optiproxai:foo hello world",
+                        "::foo hello world",
                         "--config",
                         str(config_path),
                     ],

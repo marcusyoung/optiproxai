@@ -3,7 +3,7 @@
 Covers: resolution precedence (model rule > provider > style default), in-list
 pass-through, out-of-list coercion, empty-list suppression, the unchanged style
 default for providers without the field, and both the primary and fallback
-injection paths (including the /optiproxai:<tier> override).
+injection paths (including the ::<tier> override).
 """
 
 from __future__ import annotations
@@ -297,7 +297,7 @@ def _reasoning_request(client: Any) -> Any:
         "/v1/chat/completions",
         json={
             "model": "optiproxai/auto",
-            "messages": [{"role": "user", "content": "/optiproxai:reasoning hi"}],
+            "messages": [{"role": "user", "content": "::reasoning hi"}],
         },
     )
 
