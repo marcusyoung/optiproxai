@@ -65,7 +65,7 @@ hash  = int.from_bytes(sha256(session_key.encode()).digest()[:8], "big")
 
 ## Verifying selection live
 
-Force the tier with `/optiproxai:<tier>` and vary the session id; the
+Force the tier with a `::<tier>` token anywhere in the latest user message and vary the session id; the
 returned `model` is the chosen primary (or its upstream alias):
 
 ```powershell
@@ -73,7 +73,7 @@ returned `model` is the chosen primary (or its upstream alias):
   $id = "verify-$_-$(Get-Random)"
   $r = curl.exe -s http://localhost:18421/v1/chat/completions `
     -H "Content-Type: application/json" -H "X-Session-Id: $id" `
-    -d '{"model":"optiproxai/auto","messages":[{"role":"user","content":"/optiproxai:reasoning prove P != NP"}]}' `
+    -d '{"model":"optiproxai/auto","messages":[{"role":"user","content":"::reasoning prove P != NP"}]}' `
     | ConvertFrom-Json
   Write-Host "$id -> $($r.model)"
 }
@@ -193,7 +193,7 @@ uv run optiproxai serve --port 18499 > /tmp/proxy.log 2>&1 &
 sleep 12
 curl -s http://localhost:18499/v1/chat/completions \
   -H "Content-Type: application/json" -H "X-Session-Id: verify-3-5801476" \
-  -d '{"model":"optiproxai/auto","messages":[{"role":"user","content":"/optiproxai:reasoning prove P != NP"}]}' \
+  -d '{"model":"optiproxai/auto","messages":[{"role":"user","content":"::reasoning prove P != NP"}]}' \
   | python -c "import sys,json;d=json.load(sys.stdin);print('model=',d.get('model'),'error=',d.get('error'))"
 kill %1
 grep -Ei "FALLBACK|USAGE|syn:large|REASONING" /tmp/proxy.log | tail -20

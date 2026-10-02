@@ -52,14 +52,14 @@ curl http://localhost:18420/v1/chat/completions \
 
 ## Per-turn tier override
 
-Force a tier for a single request by starting the message with `/optiproxai:<tier>`:
+Force a tier for a single request with a `::<tier>` token anywhere in the latest user message:
 
 ```bash
 curl http://localhost:18420/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "optiproxai/auto",
-    "messages": [{"role": "user", "content": "/optiproxai:reasoning prove P != NP"}]
+    "messages": [{"role": "user", "content": "::reasoning prove P != NP"}]
   }'
 ```
 

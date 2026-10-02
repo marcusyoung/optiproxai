@@ -2397,7 +2397,7 @@ async def chat_completions(request: Request):
         # Extract session key for session-sticky primary selection
         session_key = request.headers.get(state.config.routing.session_header)
 
-        # Strip a per-turn /optiproxai:<tier> override token from the latest user
+        # Strip a per-turn ::<tier> override token from the latest user
         # message before routing so it never leaks upstream.
         tier_override, stripped_messages = parse_tier_override(messages)
         if tier_override is not None or stripped_messages is not messages:

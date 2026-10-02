@@ -136,28 +136,57 @@ def _session_hash(session_key: str) -> int:
     return int.from_bytes(hashlib.sha256(session_key.encode()).digest()[:8], "big")
 
 
-# Per-turn tier override token, e.g. "/optiproxai:reasoning" (decision record doc-2)
-_TIER_OVERRIDE_PATTERN = re.compile(r"^/optiproxai:(\w+)\s*")
+# Per-turn tier override token, e.g. "::reasoning", matched anywhere in the
+# latest user message (decision record doc-2, amended 2026-10-02). Scanning the
+# whole message instead of position 0 lets the token survive client-added
+# wrappers such as Cursor's "<user_query>...</user_query>" envelope, and a
+# slash-free token avoids Cursor's slash-command autocomplete. The
+# ``(?<![\w:])`` guard keeps it a distinct token: it will not match
+# mid-identifier ("std::reasoning") or inside a longer colon run.
+_TIER_OVERRIDE_PATTERN = re.compile(r"(?<![\w:])::(\w+)", re.IGNORECASE)
+
+
+def _strip_tier_override(text: str) -> tuple[str | None, str]:
+    """Match and strip the first ``::<tier>`` token from a text chunk.
+
+    Returns ``(tier_name, stripped_text)``. ``tier_name`` is the first matched
+    word with its original casing (callers validate it so invalid tiers can be
+    warned on); ``stripped_text`` has the token and its immediately surrounding
+    horizontal whitespace removed. When no token is present the original string
+    is returned unchanged.
+    """
+    match = _TIER_OVERRIDE_PATTERN.search(text)
+    if match is None:
+        return None, text
+
+    start, end = match.span()
+    left = text[:start].rstrip(" \t")
+    right = text[end:].lstrip(" \t")
+    stripped = f"{left} {right}" if left and right else f"{left}{right}"
+    return match.group(1), stripped
 
 
 def parse_tier_override(
     messages: list[dict[str, Any]],
 ) -> tuple[str | None, list[dict[str, Any]]]:
-    """Extract and strip a tier override token from the latest user message.
+    """Extract and strip a ``::<tier>`` override token from the latest user message.
 
     Only the latest user message is scanned (history, assistant, and system
-    messages are ignored). The token must be at position 0 of the content;
-    for list content, only the first ``{"type": "text", "text": ...}`` part
-    is checked. Tier names are matched case-insensitively against
-    ``_TIER_ORDER``.
+    messages are ignored). The token may appear anywhere in that message rather
+    than only at position 0, so it survives client-added wrappers (for example
+    Cursor's ``<user_query>...</user_query>`` envelope). Only the first
+    ``::<tier>`` match is honoured; for list content, parts are scanned in
+    order and the first text part containing a token wins. Tier names are
+    matched case-insensitively against ``_TIER_ORDER``.
 
     Returns:
         ``(tier_override, stripped_messages)`` where ``tier_override`` is the
         upper-cased tier name for a valid token, or ``None`` for an invalid or
         absent token. When a token is found (valid or not), the returned
         message list is a shallow copy in which only the latest user message
-        dict is deep-copied with the token and leading whitespace removed.
-        When no token is found, the original list is returned unchanged.
+        dict is deep-copied with the token and its surrounding whitespace
+        removed. When no token is found, the original list is returned
+        unchanged.
     """
     for idx in range(len(messages) - 1, -1, -1):
         message = messages[idx]
@@ -169,27 +198,27 @@ def parse_tier_override(
         tier_name: str | None = None
 
         if isinstance(content, str):
-            match = _TIER_OVERRIDE_PATTERN.match(content)
-            if match is not None:
-                tier_name = match.group(1)
+            tier_name, stripped_text = _strip_tier_override(content)
+            if tier_name is not None:
                 new_message = dict(message)
-                new_message["content"] = content[match.end() :]
+                new_message["content"] = stripped_text
         elif isinstance(content, list):
-            # Only the first text part is eligible (decision record doc-2)
             for part_idx, part in enumerate(content):
                 if not (isinstance(part, dict) and part.get("type") == "text"):
                     continue
                 text = part.get("text")
-                if isinstance(text, str):
-                    match = _TIER_OVERRIDE_PATTERN.match(text)
-                    if match is not None:
-                        tier_name = match.group(1)
-                        new_content = list(content)
-                        new_part = dict(part)
-                        new_part["text"] = text[match.end() :]
-                        new_content[part_idx] = new_part
-                        new_message = dict(message)
-                        new_message["content"] = new_content
+                if not isinstance(text, str):
+                    continue
+                part_tier, stripped_text = _strip_tier_override(text)
+                if part_tier is None:
+                    continue
+                tier_name = part_tier
+                new_content = list(content)
+                new_part = dict(part)
+                new_part["text"] = stripped_text
+                new_content[part_idx] = new_part
+                new_message = dict(message)
+                new_message["content"] = new_content
                 break
 
         if tier_name is None or new_message is None:
