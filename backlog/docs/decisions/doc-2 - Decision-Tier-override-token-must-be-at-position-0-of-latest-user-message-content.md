@@ -47,13 +47,13 @@ Cursor does not send the raw user text as the latest user turn. It wraps the mes
 ## New decision
 - **Syntax:** `::<tier>` (e.g. `::reasoning`), matched **anywhere in the latest user message only** — never in assistant, system, or earlier user turns.
 - **Regex:** `(?<![:\w])::(\w+)` (case-insensitive). The negative lookbehind keeps it a distinct token: it does not match mid-identifier (`std::reasoning`) or inside a longer colon run (`:::reasoning`), which preserves the false-positive protection this document originally sought.
-- **Only the first match is honoured.** For list content, parts are scanned in order; the first text part containing a token wins.
+- **Only the first match is honoured.** For list content, parts are scanned in order; the first text part containing a token wins. Only that first match is stripped — any *additional* `::<tier>` tokens remain as literal text, since the left-boundary guard cannot distinguish a directive from prose such as `x = ::simple`.
 - **The legacy `/optiproxai:<tier>` form is dropped.** The token is slash-free to avoid chat-client slash-command autocomplete and is position-independent to survive client-added wrappers. Migration: replace `/optiproxai:reasoning ` with `::reasoning` (anywhere in the message).
 
 ## Rationale for reversing "position 0 only"
 The original rationale — avoid false positives from a token discussed in prose — is better served by token distinctiveness than by position. `::<tier>` with a left-boundary guard is unlikely to occur in prose/code and cannot collide with identifiers, so scanning the whole latest turn is safe and makes the feature client-agnostic. Position 0 was never the real source of unambiguity once a distinctive token exists.
 
 ## Consequences
-- The token is stripped wherever it appears in the latest user message, so it never leaks upstream.
+- The matched (first) token is stripped wherever it appears in the latest user message, so the directive normally does not leak upstream. Additional `::<tier>` tokens, if any, are left as literal text.
 - Clients that wrap user text (Cursor `<user_query>`, and future wrappers) work unchanged.
 - Per-turn override toggling (including via `/` command UIs) remains unsupported for the same reason as before: only the latest user message is scanned, so a marker routinely present in an earlier turn is not repeatedly enforced.

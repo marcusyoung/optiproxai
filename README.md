@@ -130,13 +130,13 @@ Any tool or library that supports the OpenAI API works with optiproxai: LangChai
 
 ## Per-turn tier override
 
-Force the routing tier for a single request with a `::<tier>` token in the latest user message. The token may appear anywhere in that message and is stripped before forwarding upstream so the model never sees it.
+Force the routing tier for a single request with a `::<tier>` token in the latest user message. The token may appear anywhere in that message; the matched token is stripped before forwarding upstream.
 
 **Syntax**: `::<tier>` anywhere in the latest user message (e.g. `please ::reasoning prove P != NP`).
 
 **Valid tiers** (case-insensitive): `simple`, `medium`, `complex`, `reasoning`.
 
-The token is deliberately slash-free and position-independent so it survives client-added message wrappers (for example Cursor sends the user turn wrapped in `<user_query>...</user_query>`) and avoids slash-command autocomplete in chat UIs. Only the first `::<tier>` token in the latest user message is honoured.
+The token is deliberately slash-free and position-independent so it survives client-added message wrappers (for example Cursor sends the user turn wrapped in `<user_query>...</user_query>`) and avoids slash-command autocomplete in chat UIs. Only the first `::<tier>` token in the latest user message is honoured, and only that first match is stripped; any additional `::<tier>` tokens remain as literal text for the model.
 
 When a valid override is present, OptiProxAI skips the scorer and pins the tier. Capability filtering, input-limit checks, and tier fallback still apply. If the pinned tier is not defined in the profile, OptiProxAI falls back to an adjacent tier as usual.
 
