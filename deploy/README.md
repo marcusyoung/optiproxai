@@ -88,6 +88,37 @@ do not run them from this directory.
    sudo certbot --apache -d <your-hostname>
    ```
 
+## Running the CLI
+
+Use the installed `opx` wrapper as the service account. It sources
+`/etc/optiproxai/optiproxai.env` and then execs the editable venv CLI:
+
+```bash
+sudo -u optiproxai opx route "hello world"
+sudo -u optiproxai opx config
+```
+
+Do **not** use the README quickstart's `uvx --from git+https://github.com/...`
+on the VPS. `uvx` is not on a non-login shell's `PATH` here (uv lives under
+`/home/optiproxai/.local/bin`), so it reports "command not found"; and even if it
+resolved, it would clone a fresh copy into uv's tool cache and run it **without**
+the env file — reading the default XDG paths instead of `/var/lib/optiproxai`
+and `/var/log/optiproxai`, and rebuilding the heavy dependency tree. The wrapper
+exists to avoid exactly that.
+
+Raw equivalent (no wrapper):
+
+```bash
+sudo -u optiproxai bash -lc 'cd /opt/optiproxai && set -a && . /etc/optiproxai/optiproxai.env && set +a && ./.venv/bin/optiproxai route "hello world"'
+```
+
+Pin a tier per request with a `::<tier>` token anywhere in the prompt
+(`simple`/`medium`/`complex`/`reasoning`, case-insensitive):
+
+```bash
+sudo -u optiproxai opx route "::reasoning prove P != NP"
+```
+
 ## Authentication
 
 OptiProxAI handles auth itself; the reverse proxy needs no htpasswd and no
