@@ -147,10 +147,20 @@ run them as the service account:
 
 ```bash
 sudo -u optiproxai opx-annotate            # annotate new records (MISTRAL_API_KEY)
+sudo -u optiproxai opx-annotate --force    # re-annotate every record (ignores stored labels)
 sudo -u optiproxai opx-annotate --train    # annotate, then train (VOYAGE_API_KEY)
 sudo -u optiproxai opx-train               # train only
 sudo systemctl restart optiproxai          # the classifier is cached after first load
 ```
+
+Without a flag, `opx-annotate` teacher-annotates records that are **not yet
+teacher-annotated** (`--annotate-missing`). This is deliberately *not* keyed off
+the `semanticLabels` in the routing logs: once a trained classifier is loaded,
+the service stamps its own predicted labels on every record, so keying off log
+labels would skip teacher annotation forever and train the student on its own
+predictions. Teacher labels always win over those runtime self-labels. Pass
+`--force` (or `-f`) to re-annotate *every* record with the teacher
+(`--force-annotate`), e.g. after changing the annotator model or calibration.
 
 Training writes `/opt/optiproxai/models/feature_classifier.pkl` in place. Keep a
 backup first if you want a rollback.
