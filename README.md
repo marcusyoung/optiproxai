@@ -387,6 +387,24 @@ model_rules:
 
 `model_rules` is the primary metadata key. The legacy `model_capabilities` key is accepted only when `model_rules` is unset. The optional `extra_body` field injects extra request-body fields for any candidate matching the rule (e.g. `prompt_cache_key` to improve cache-hit routing); it uses the same prefix/provider precedence as `reasoning_style` and is merged last, so its values win over client-provided fields. Use the dedicated `async_mode` config for async/batch routing instead of `extra_body`.
 
+### Subagent routing (pin named custom subagents)
+
+Under BYOK, Cursor pins a subagent's conversation to the parent conversation's model and excludes custom/BYOK model IDs from explicit subagent model selection, so a custom subagent (e.g. one that needs a stronger retrieval model) cannot be pinned Cursor-side. OptiProxAI sits in front of every request and cannot be bypassed by that pinning, so the route can be decided at the proxy.
+
+Declare a `subagent_routes` list to pin a named custom subagent to a provider + model. Detection is a literal substring scan of the full request message list (never a regex). A match requires both the `signature` and the `require` marker in the same message text:
+
+```yaml
+subagent_routes:
+  - name: web-researcher
+    provider: doubleword            # optional; blank = default_provider
+    model: "tencent/Hy3-FP8"
+    reasoning_effort: high          # optional
+```
+
+`signature` defaults to Cursor's injected named-subagent line (`You are operating as the "<name>" custom subagent.`, with `{name}` substituted) and may be overridden with any literal marker, so the mechanism is not tied to one client's wording. `require` defaults to Cursor's generic subagent reminder (`You are running as a subagent under a parent agent.`); it guards against pinning an ordinary request that merely quotes the named line. Set `require: ""` to match on the signature alone.
+
+When a route matches, the classifier does not run: the decision is pinned to the configured provider/model and reports the `subagent_pin` signal. Parent requests never carry the subagent marker, so parent routing is unaffected. Empty/absent `subagent_routes` is a strict no-op — routing is byte-for-byte unchanged.
+
 ### Image-history stripping (opt-in)
 
 Vision capability is detected from the whole message history, so a single image anywhere in a session pins all subsequent turns to vision-capable models. In long mixed image+text conversations that means paying vision-model prices (and hitting their context ceilings) even after the images have scrolled out of relevance.
