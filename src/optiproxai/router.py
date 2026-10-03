@@ -19,6 +19,7 @@ from optiproxai.config import (
     OptiproxaiConfig,
     ProviderConfig,
     ResolvedModelCandidate,
+    SubagentRoute,
     resolve_env,
 )
 from optiproxai.fallback_backoff import FallbackBackoffState
@@ -240,6 +241,48 @@ def parse_tier_override(
     return None, messages
 
 
+def _iter_message_content(messages: list[dict[str, Any]]):
+    """Yield each message's full text content (``str`` or concatenated parts).
+
+    Named-custom-subagent markers are injected into message content, so the
+    detector scans every message's text regardless of role. For list content,
+    text parts are concatenated per message so the signature and its compound
+    ``require`` marker may live in different parts of the same message.
+    """
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, str):
+            yield content
+        elif isinstance(content, list):
+            yield "".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+
+
+def _detect_subagent_route(
+    messages: list[dict[str, Any]],
+    routes: list[SubagentRoute],
+) -> SubagentRoute | None:
+    """Return the first configured route whose markers appear in the messages.
+
+    Scans the FULL raw message list (not ``classification_input.text``, which
+    keeps only the last 3500 characters and would lose a marker at the start of
+    a long conversation) in config order, first match wins. Matching is a
+    literal substring test (never a regex). A match requires the entry's
+    ``signature`` AND its ``require`` marker in the same message text; an empty
+    ``require`` disables the second condition.
+    """
+    for route in routes:
+        signature = route.resolved_signature
+        require = route.resolved_require
+        for text in _iter_message_content(messages):
+            if signature in text and (not require or require in text):
+                return route
+    return None
+
+
 class Router:
     """Given chat messages, decides which model and provider to use."""
 
@@ -321,6 +364,22 @@ class Router:
 
         # --- Build classification input from conversation context ---
         classification_input = build_classification_input(messages)
+
+        # --- Subagent pin: before classification, pin a matched named custom
+        # subagent to its configured provider+model. Empty routes = strict no-op
+        # (byte-for-byte unchanged routing for every request, parent included).
+        if self.config.subagent_routes:
+            subagent_route = _detect_subagent_route(
+                messages, self.config.subagent_routes
+            )
+            if subagent_route is not None:
+                return self._build_subagent_decision(
+                    subagent_route,
+                    classification_input=classification_input,
+                    required_capabilities=required_capabilities,
+                    profile=profile,
+                    session_key=session_key,
+                )
 
         # --- Resolve tier: valid override pins the tier and skips the scorer ---
         score: float
@@ -593,6 +652,87 @@ class Router:
             required_capabilities=sorted(list(required_capabilities)),
             reasoning_effort=tier_cfg.reasoning_effort,
             async_mode=primary_candidate.async_mode,
+            session_key=session_key,
+        )
+
+    def _build_subagent_decision(
+        self,
+        route: SubagentRoute,
+        *,
+        classification_input: ClassificationInput,
+        required_capabilities: set[str],
+        profile: str,
+        session_key: str | None,
+    ) -> RoutingDecision:
+        """Build a decision pinned to a configured subagent route's provider/model.
+
+        The classifier does not run for a pinned subagent: ``score``/``confidence``
+        are 1.0 and ``signals`` is ``["subagent_pin"]``. ``tier`` is an
+        observability label only (``_DEFAULT_TIER`` — the classifier did not run),
+        and ``fallbacks`` is empty because substituting another model is exactly
+        what the pin prevents. Input-limit filtering is deliberately bypassed:
+        an over-cap pinned session surfaces the upstream provider's error rather
+        than being re-routed to a different model.
+
+        Capability requirements are still enforced: the pinned model must declare
+        the request's required capabilities, otherwise the pin would silently
+        send e.g. an image to a non-vision model. A mismatch raises
+        ``CapabilityNotSatisfiedError`` rather than falling back to another model.
+        """
+        provider_name = route.provider or self.config.default_provider
+        unmet_capabilities = required_capabilities - self._get_model_capabilities(
+            route.model, provider_name
+        )
+        if unmet_capabilities:
+            log.warning(
+                "Pinned subagent model lacks required capabilities "
+                "subagent=%s model=%s provider=%s missing=%s",
+                route.name,
+                route.model,
+                provider_name,
+                sorted(unmet_capabilities),
+            )
+            raise CapabilityNotSatisfiedError(unmet_capabilities)
+        provider_cfg = self._lookup_provider(provider_name)
+        signals = ["subagent_pin"]
+        try:
+            from optiproxai.logger import RoutingLogger
+
+            # Log the real classification input (prompt + context) augmented with
+            # the subagent metadata, so pinned turns stay observable like every
+            # other turn instead of logging a constant signature.
+            context = dict(classification_input.__dict__)
+            context["subagent_route"] = route.name
+            context["subagent_signature"] = route.resolved_signature
+            RoutingLogger.log_decision(
+                classification_input.text,
+                tier=_DEFAULT_TIER,
+                score=1.0,
+                confidence=1.0,
+                signals=signals,
+                agentic_score=0.0,
+                model=route.model,
+                provider=provider_name,
+                profile=profile,
+                context=context,
+            )
+        except Exception:
+            log.exception("Failed to persist subagent routing decision log")
+
+        return RoutingDecision(
+            model=route.model,
+            provider=provider_name,
+            base_url=provider_cfg.base_url,
+            api_key=resolve_env(provider_cfg.api_key),
+            tier=_DEFAULT_TIER,
+            score=1.0,
+            confidence=1.0,
+            signals=signals,
+            agentic_score=0.0,
+            profile=profile,
+            fallbacks=[],
+            required_capabilities=sorted(required_capabilities),
+            reasoning_effort=route.reasoning_effort,
             session_key=session_key,
         )
 

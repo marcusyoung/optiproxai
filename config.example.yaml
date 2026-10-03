@@ -232,6 +232,32 @@ model_rules:
     #   reasoning_effort_values: [none, minimal, low, medium, high, xhigh, max]
 
 # ---------------------------------------------------------------------------
+# Subagent routes (pin named custom subagents to a provider + model)
+# ---------------------------------------------------------------------------
+# Under BYOK, Cursor pins a subagent's conversation to the parent conversation's
+# model and excludes custom/BYOK model IDs from subagent model selection, so a
+# subagent cannot be pinned Cursor-side. The proxy sits in front of every
+# request, so a named custom subagent can be pinned here instead.
+#
+# Detection is a literal substring scan of the FULL request message list (never
+# a regex). A match requires BOTH the `signature` and the `require` marker in the
+# same message text. `signature` defaults to Cursor's injected named-subagent
+# line (with `{name}` substituted); `require` defaults to Cursor's generic
+# subagent reminder, which guards against pinning ordinary chat that merely
+# quotes the named line. Set `require: ""` to match on the signature alone.
+# Empty/absent `subagent_routes` is a strict no-op.
+#
+# subagent_routes:
+#   - name: web-researcher
+#     provider: doubleword          # optional; blank = default_provider
+#     model: "tencent/Hy3-FP8"      # the pinned model
+#     reasoning_effort: high        # optional
+#     # signature / require default to Cursor's injected lines; override for
+#     # another harness's marker (a fully literal signature may omit {name}):
+#     # signature: "MyHarness subagent {name} engaged"
+#     # require: ""
+
+# ---------------------------------------------------------------------------
 # Providers
 # ---------------------------------------------------------------------------
 providers:

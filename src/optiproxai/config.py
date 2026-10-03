@@ -608,6 +608,88 @@ def _resolve_provider_for_aux_llm(
     return provider_cfg.base_url, resolve_env(provider_cfg.api_key)
 
 
+# Default request marker Cursor injects for a named custom subagent. The
+# ``{name}`` placeholder is substituted with the route's ``name``.
+DEFAULT_SUBAGENT_SIGNATURE = 'You are operating as the "{name}" custom subagent.'
+
+# Default second (compound) marker: Cursor's generic subagent reminder, present
+# on every subagent turn but absent from a parent message that merely quotes the
+# named line. Requiring it guards against pinning ordinary chat.
+DEFAULT_SUBAGENT_REQUIRE = "You are running as a subagent under a parent agent."
+
+
+class SubagentRoute(BaseModel):
+    """Pin a named custom subagent's requests to a provider + model.
+
+    Each entry declares the literal request marker ("signature") that
+    identifies the subagent and the provider+model to pin it to. Detection is
+    a literal substring scan of the full request message list (never a regex:
+    message bodies can be megabytes, so a config-supplied regex would be a
+    performance/ReDoS hazard).
+
+    A match requires BOTH ``signature`` and ``require`` to appear in the same
+    message text (compound guard). ``signature`` defaults to Cursor's injected
+    named-custom-subagent line; ``require`` defaults to Cursor's generic
+    subagent reminder. A fully literal ``signature`` with no ``{name}``
+    placeholder is accepted, so the mechanism is not tied to one client's
+    wording. Set ``require`` to an empty string to disable the second
+    condition and fall back to single-signature behavior.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str  # subagent identity, e.g. 'web-researcher'
+    signature: str | None = Field(
+        default=None,
+        description=(
+            "Literal marker identifying the subagent. ``{name}`` is "
+            "substituted with this entry's name. Defaults to Cursor's "
+            "injected named-custom-subagent line."
+        ),
+    )
+    require: str | None = Field(
+        default=None,
+        description=(
+            "Second literal that must ALSO be present (compound guard). "
+            "Defaults to Cursor's generic subagent reminder; set to empty "
+            "string to disable and match on ``signature`` alone."
+        ),
+    )
+    provider: str = ""  # empty = default_provider
+    model: str
+    reasoning_effort: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_required_fields(self) -> "SubagentRoute":
+        """Reject blank name/model/signature, which would produce useless routes."""
+        if not self.name.strip():
+            raise ValueError("subagent_routes[].name must be non-empty")
+        if not self.model.strip():
+            raise ValueError(f"subagent_routes[{self.name!r}].model must be non-empty")
+        if not self.resolved_signature.strip():
+            # An empty signature makes ``"" in text`` always true, so the route
+            # would pin every message (and, with an empty require, everything).
+            raise ValueError(
+                f"subagent_routes[{self.name!r}].signature must be non-empty"
+            )
+        return self
+
+    @property
+    def resolved_signature(self) -> str:
+        """Return the signature with ``{name}`` substituted (or a literal)."""
+        template = (
+            self.signature if self.signature is not None else DEFAULT_SUBAGENT_SIGNATURE
+        )
+        return template.replace("{name}", self.name)
+
+    @property
+    def resolved_require(self) -> str:
+        """Return the compound marker; ``""`` disables the second condition."""
+        if self.require is None:
+            return DEFAULT_SUBAGENT_REQUIRE
+        return self.require
+
+
 class OptiproxaiConfig(BaseModel):
     """Top-level OptiProxAI configuration."""
 
@@ -624,6 +706,8 @@ class OptiproxaiConfig(BaseModel):
     smart_proxy: SmartProxyConfig = Field(default_factory=SmartProxyConfig)
     model_rules: list[ModelRuleEntry] = Field(default_factory=list)
     model_capabilities: list[ModelRuleEntry] = Field(default_factory=list)
+    # Config-declared named-custom-subagent pins. Empty/absent = strict no-op.
+    subagent_routes: list[SubagentRoute] = Field(default_factory=list)
     disable_axis_overrides: bool = False
     # Per-boundary ambiguity handling passed to the scorer. Keys are the lower
     # tier of each boundary pair (SIMPLE, MEDIUM, COMPLEX); values are
@@ -673,6 +757,35 @@ class OptiproxaiConfig(BaseModel):
                 default_provider=self.default_provider,
             )
 
+        return self
+
+    @model_validator(mode="after")
+    def _validate_subagent_routes(self) -> "OptiproxaiConfig":
+        """Validate subagent pins: provider resolution + duplicate signatures.
+
+        ``provider`` blank resolves to ``default_provider``; an unknown
+        provider is a hard error (not a silent fallback). A route is identified
+        by its resolved ``(signature, require)`` pair, so only an identical pair
+        is unreachable: two routes with the same signature but different
+        requirements are both reachable and therefore valid.
+        """
+        seen_markers: dict[tuple[str, str], str] = {}
+        for route in self.subagent_routes:
+            resolved_provider = route.provider or self.default_provider
+            if resolved_provider not in self.providers:
+                raise ValueError(
+                    f"subagent_routes[{route.name!r}].provider "
+                    f"'{resolved_provider}' is not a configured provider"
+                )
+            markers = (route.resolved_signature, route.resolved_require)
+            if markers in seen_markers:
+                raise ValueError(
+                    "subagent_routes contain a duplicate resolved marker pair: "
+                    f"signature {markers[0]!r} with require {markers[1]!r} is "
+                    f"declared by both {seen_markers[markers]!r} and "
+                    f"{route.name!r}"
+                )
+            seen_markers[markers] = route.name
         return self
 
     @model_validator(mode="after")
