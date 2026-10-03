@@ -481,7 +481,7 @@ def test_teacher_upgrades_log_labelled_checkpoint_entry(tmp_path: Path) -> None:
     assert annotator.calls == ["Self labelled"]
 
 
-def test_force_reattributes_already_annotated_checkpoint_entry(
+def test_force_reannotates_already_annotated_checkpoint_entry(
     tmp_path: Path,
 ) -> None:
     checkpoint = tmp_path / "dataset.json"
