@@ -375,6 +375,8 @@ class Router:
             if subagent_route is not None:
                 return self._build_subagent_decision(
                     subagent_route,
+                    classification_input=classification_input,
+                    required_capabilities=required_capabilities,
                     profile=profile,
                     session_key=session_key,
                 )
@@ -657,6 +659,8 @@ class Router:
         self,
         route: SubagentRoute,
         *,
+        classification_input: ClassificationInput,
+        required_capabilities: set[str],
         profile: str,
         session_key: str | None,
     ) -> RoutingDecision:
@@ -669,15 +673,39 @@ class Router:
         what the pin prevents. Input-limit filtering is deliberately bypassed:
         an over-cap pinned session surfaces the upstream provider's error rather
         than being re-routed to a different model.
+
+        Capability requirements are still enforced: the pinned model must declare
+        the request's required capabilities, otherwise the pin would silently
+        send e.g. an image to a non-vision model. A mismatch raises
+        ``CapabilityNotSatisfiedError`` rather than falling back to another model.
         """
         provider_name = route.provider or self.config.default_provider
+        unmet_capabilities = required_capabilities - self._get_model_capabilities(
+            route.model, provider_name
+        )
+        if unmet_capabilities:
+            log.warning(
+                "Pinned subagent model lacks required capabilities "
+                "subagent=%s model=%s provider=%s missing=%s",
+                route.name,
+                route.model,
+                provider_name,
+                sorted(unmet_capabilities),
+            )
+            raise CapabilityNotSatisfiedError(unmet_capabilities)
         provider_cfg = self._lookup_provider(provider_name)
         signals = ["subagent_pin"]
         try:
             from optiproxai.logger import RoutingLogger
 
+            # Log the real classification input (prompt + context) augmented with
+            # the subagent metadata, so pinned turns stay observable like every
+            # other turn instead of logging a constant signature.
+            context = dict(classification_input.__dict__)
+            context["subagent_route"] = route.name
+            context["subagent_signature"] = route.resolved_signature
             RoutingLogger.log_decision(
-                route.resolved_signature,
+                classification_input.text,
                 tier=_DEFAULT_TIER,
                 score=1.0,
                 confidence=1.0,
@@ -686,10 +714,7 @@ class Router:
                 model=route.model,
                 provider=provider_name,
                 profile=profile,
-                context={
-                    "subagent_route": route.name,
-                    "signature": route.resolved_signature,
-                },
+                context=context,
             )
         except Exception:
             log.exception("Failed to persist subagent routing decision log")

@@ -102,6 +102,10 @@ class TestSubagentRouteModel:
         with pytest.raises(ValidationError):
             _web_route(model="  ")
 
+    def test_blank_signature_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            _web_route(signature="   ")
+
     def test_extra_field_forbidden(self) -> None:
         with pytest.raises(ValidationError):
             _web_route(unexpected="x")
@@ -125,6 +129,26 @@ class TestSubagentConfigValidation:
         route_b = _web_route(name="other", signature=WEB_SIGNATURE)
         with pytest.raises(ValidationError):
             _config(subagent_routes=[route_a, route_b])
+
+    def test_same_signature_distinct_require_is_allowed(self) -> None:
+        # Matching uses the (signature, require) pair, so a shared signature with
+        # different requirements stays reachable and must be accepted.
+        route_a = SubagentRoute(
+            name="a",
+            signature="SHARED",
+            require="REQ-A",
+            provider="retrieval",
+            model="m1",
+        )
+        route_b = SubagentRoute(
+            name="b",
+            signature="SHARED",
+            require="REQ-B",
+            provider="retrieval",
+            model="m2",
+        )
+        cfg = _config(subagent_routes=[route_a, route_b])
+        assert len(cfg.subagent_routes) == 2
 
     def test_distinct_signatures_accepted(self) -> None:
         cfg = _config(
@@ -278,3 +302,56 @@ class TestSubagentDetection:
         text = log_file.read_text(encoding="utf-8")
         assert "subagent_pin" in text
         assert "hy3-retrieval" in text
+
+    def test_pin_requires_capabilities(self) -> None:
+        # The pinned model declares no capabilities; a vision request must fail
+        # rather than silently route an image to a non-vision model.
+        from optiproxai.router import CapabilityNotSatisfiedError
+
+        router = Router(_config(subagent_routes=[_web_route()]))
+        with pytest.raises(CapabilityNotSatisfiedError):
+            router.route(
+                [_subagent_message()],
+                profile="auto",
+                required_capabilities={"vision"},
+            )
+
+    def test_pin_succeeds_when_capability_declared(self) -> None:
+        from optiproxai.config import ModelRuleEntry
+
+        router = Router(
+            _config(
+                subagent_routes=[_web_route()],
+                model_rules=[
+                    ModelRuleEntry(prefix="hy3-retrieval", capabilities=["vision"])
+                ],
+            )
+        )
+        decision = router.route(
+            [_subagent_message()],
+            profile="auto",
+            required_capabilities={"vision"},
+        )
+        assert decision.model == "hy3-retrieval"
+
+    def test_pinned_log_preserves_real_context(self) -> None:
+        from datetime import datetime, timezone
+
+        from optiproxai.logger import RoutingLogger
+
+        router = Router(_config(subagent_routes=[_web_route()]))
+        message = _subagent_message()
+        message["content"] = "BLUEFIN marker " + message["content"]
+        router.route([message], profile="auto")
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        lines = (
+            (RoutingLogger._log_dir / f"routing-{today}.jsonl")
+            .read_text(encoding="utf-8")
+            .strip()
+            .splitlines()
+        )
+        entry = __import__("json").loads(lines[-1])
+        # The real classification text is logged, not the constant signature.
+        assert "BLUEFIN" in entry["prompt"]
+        assert entry["classification_context"]["subagent_route"] == "web-researcher"
+        assert "last_user_message" in entry["classification_context"]

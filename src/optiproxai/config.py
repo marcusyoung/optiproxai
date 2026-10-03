@@ -661,11 +661,17 @@ class SubagentRoute(BaseModel):
 
     @model_validator(mode="after")
     def _validate_required_fields(self) -> "SubagentRoute":
-        """Reject blank name/model, which would produce useless routes."""
+        """Reject blank name/model/signature, which would produce useless routes."""
         if not self.name.strip():
             raise ValueError("subagent_routes[].name must be non-empty")
         if not self.model.strip():
             raise ValueError(f"subagent_routes[{self.name!r}].model must be non-empty")
+        if not self.resolved_signature.strip():
+            # An empty signature makes ``"" in text`` always true, so the route
+            # would pin every message (and, with an empty require, everything).
+            raise ValueError(
+                f"subagent_routes[{self.name!r}].signature must be non-empty"
+            )
         return self
 
     @property
@@ -758,11 +764,12 @@ class OptiproxaiConfig(BaseModel):
         """Validate subagent pins: provider resolution + duplicate signatures.
 
         ``provider`` blank resolves to ``default_provider``; an unknown
-        provider is a hard error (not a silent fallback). Duplicate resolved
-        signatures are rejected because the first match wins, so a duplicate
-        would make the later entry unreachable.
+        provider is a hard error (not a silent fallback). A route is identified
+        by its resolved ``(signature, require)`` pair, so only an identical pair
+        is unreachable: two routes with the same signature but different
+        requirements are both reachable and therefore valid.
         """
-        seen_signatures: dict[str, str] = {}
+        seen_markers: dict[tuple[str, str], str] = {}
         for route in self.subagent_routes:
             resolved_provider = route.provider or self.default_provider
             if resolved_provider not in self.providers:
@@ -770,14 +777,15 @@ class OptiproxaiConfig(BaseModel):
                     f"subagent_routes[{route.name!r}].provider "
                     f"'{resolved_provider}' is not a configured provider"
                 )
-            signature = route.resolved_signature
-            if signature in seen_signatures:
+            markers = (route.resolved_signature, route.resolved_require)
+            if markers in seen_markers:
                 raise ValueError(
-                    "subagent_routes contain a duplicate resolved signature: "
-                    f"{signature!r} is declared by both "
-                    f"{seen_signatures[signature]!r} and {route.name!r}"
+                    "subagent_routes contain a duplicate resolved marker pair: "
+                    f"signature {markers[0]!r} with require {markers[1]!r} is "
+                    f"declared by both {seen_markers[markers]!r} and "
+                    f"{route.name!r}"
                 )
-            seen_signatures[signature] = route.name
+            seen_markers[markers] = route.name
         return self
 
     @model_validator(mode="after")

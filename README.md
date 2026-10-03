@@ -391,7 +391,7 @@ model_rules:
 
 Under BYOK, Cursor pins a subagent's conversation to the parent conversation's model and excludes custom/BYOK model IDs from explicit subagent model selection, so a custom subagent (e.g. one that needs a stronger retrieval model) cannot be pinned Cursor-side. OptiProxAI sits in front of every request and cannot be bypassed by that pinning, so the route can be decided at the proxy.
 
-Declare a `subagent_routes` list to pin a named custom subagent to a provider + model. Detection is a literal substring scan of the full request message list (never a regex). A match requires both the `signature` and the `require` marker in the same message text:
+Declare a `subagent_routes` list to pin a named custom subagent to a provider + model. Detection is a literal substring scan of the full request message list (never a regex). A match requires both the `signature` and the `require` marker in the same message text. These markers are content, not an authenticated subagent identity: a parent request that itself contains both literals (for example, quoting the injected reminder) will also be pinned. The `require` guard makes that unlikely in normal use, but it is not a guarantee.
 
 ```yaml
 subagent_routes:
@@ -403,7 +403,7 @@ subagent_routes:
 
 `signature` defaults to Cursor's injected named-subagent line (`You are operating as the "<name>" custom subagent.`, with `{name}` substituted) and may be overridden with any literal marker, so the mechanism is not tied to one client's wording. `require` defaults to Cursor's generic subagent reminder (`You are running as a subagent under a parent agent.`); it guards against pinning an ordinary request that merely quotes the named line. Set `require: ""` to match on the signature alone.
 
-When a route matches, the classifier does not run: the decision is pinned to the configured provider/model and reports the `subagent_pin` signal. Parent requests never carry the subagent marker, so parent routing is unaffected. Empty/absent `subagent_routes` is a strict no-op — routing is byte-for-byte unchanged.
+When a route matches, the classifier does not run: the decision is pinned to the configured provider/model and reports the `subagent_pin` signal. The pinned model must still declare any capabilities the request requires (e.g. `vision`), otherwise routing fails with a capability error rather than sending the request to an incapable model. Empty/absent `subagent_routes` is a strict no-op — routing is byte-for-byte unchanged.
 
 ### Image-history stripping (opt-in)
 
