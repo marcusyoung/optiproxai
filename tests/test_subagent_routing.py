@@ -333,6 +333,8 @@ class TestSubagentDetection:
             required_capabilities={"vision"},
         )
         assert decision.model == "hy3-retrieval"
+        # The decision must still report the requirements the proxy computed.
+        assert decision.required_capabilities == ["vision"]
 
     def test_pinned_log_preserves_real_context(self) -> None:
         from datetime import datetime, timezone

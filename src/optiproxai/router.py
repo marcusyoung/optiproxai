@@ -731,7 +731,7 @@ class Router:
             agentic_score=0.0,
             profile=profile,
             fallbacks=[],
-            required_capabilities=[],
+            required_capabilities=sorted(required_capabilities),
             reasoning_effort=route.reasoning_effort,
             session_key=session_key,
         )
