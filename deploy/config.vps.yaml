@@ -138,7 +138,7 @@ model_rules:
     capabilities: [tools, json_mode]
     reasoning_style: "xai"
     async_mode:
-      enabled: false   # rule-level opt-out by default; a profile can opt this model back in (e.g. async REASONING)
+      enabled: false   # opts in; mechanism inherited from provider
     pricing:
       input_per_mtok: 1.40       # USD per 1M tokens (Doubleword realtime)
       cache_read_per_mtok: 0.28   # cached prefix read price
@@ -164,6 +164,26 @@ model_rules:
       input_per_mtok: 0.15       # USD per 1M tokens
       cache_read_per_mtok: 0.01   # cached prefix read price
       cache_write_per_mtok: 0.00  # cache write premium (optional)
+  - prefix: "tencent/Hy3-FP8"
+    provider: "doubleword"
+    capabilities: [tools, json_mode]
+    reasoning_style: "xai"
+    pricing:
+      input_per_mtok: 0.14
+      cache_read_per_mtok: 0.14
+
+# ---------------------------------------------------------------------------
+# Subagent routes (TASK-28)
+# ---------------------------------------------------------------------------
+# Pin a named custom subagent to a provider+model. Detection is a literal
+# substring scan of the full request message list; a match requires BOTH the
+# `signature` and the `require` marker in the same message text. Defaults match
+# Cursor's injected lines. See config.example.yaml for the full explanation.
+subagent_routes:
+  - name: web-researcher
+    provider: doubleword          # optional; blank = default_provider
+    model: "tencent/Hy3-FP8"      # pinned retrieval-strong model
+    reasoning_effort: high        # optional
 
 
 profiles:
@@ -206,7 +226,7 @@ profiles:
             provider: "doubleword"
             max_input_tokens: 132000
       REASONING:
-        reasoning_effort: "high"
+        reasoning_effort: "max"
         primary:
           - model: "deepseek-ai/DeepSeek-V4.1-Flash"
             provider: "doubleword"
@@ -261,7 +281,7 @@ profiles:
             provider: "doubleword"
             max_input_tokens: 132000
       REASONING:
-        reasoning_effort: "high"
+        reasoning_effort: "max"
         primary:
           - model: "deepseek-ai/DeepSeek-V4.1-Flash"
             provider: "doubleword"
@@ -378,7 +398,7 @@ profiles:
             provider: "doubleword"
             max_input_tokens: 1048576
             async_mode:
-              enabled: true   # overrides the rule-level enabled: false on zai-org/GLM-5.3
+              enabled: true   # overrides rule-level enabled: false
             pricing:
               input_per_mtok: 1.05       # async price per 1M tokens
               cache_read_per_mtok: 0.21
