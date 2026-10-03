@@ -766,6 +766,15 @@ uv run python scripts/build_agentic_dataset.py \
   --output data/distilled_feature_dataset.json
 ```
 
+With a trained classifier loaded, the service writes its own predicted
+`semanticLabels` into every routing record. `--annotate-missing` therefore means
+"not yet **teacher**-annotated" (tracked via each dataset entry's `source`), not
+"the log lacks labels" — otherwise the offline annotator would never run and the
+student would be trained on its own predictions. Teacher labels always replace
+runtime self-labels. Use `--force-annotate` (or `opx-annotate --force`) to
+re-annotate every record, e.g. after changing the annotator model or calibration.
+Without an annotator, dataset building reuses the labels already in the logs.
+
 Train the feature classifier bundle:
 
 ```bash

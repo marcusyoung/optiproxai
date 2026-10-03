@@ -437,20 +437,48 @@ def extract_distilled_feature_examples(
             print(f"  [{idx}/{total}] skip: empty prompt")
             continue
 
-        labels = (
-            None if force_annotate else _extract_semantic_labels_from_record(record)
-        )
-        source = "log"
-        if labels is None and annotator is not None:
-            if prompt in latest_by_prompt:
+        current = latest_by_prompt.get(prompt)
+
+        if annotator is not None:
+            # Teacher path. "Missing" means not yet teacher-annotated — NOT
+            # "lacks semanticLabels in the log". With a trained classifier
+            # deployed, the student stamps its own labels on every routing
+            # record, so keying off log labels would silently skip teacher
+            # annotation forever and train the student on its own predictions.
+            already_annotated = (
+                current is not None and current.get("source") == "annotated"
+            )
+            if already_annotated and not force_annotate:
                 skipped += 1
-                print(f"  [{idx}/{total}] skip: duplicate")
+                print(f"  [{idx}/{total}] skip: already annotated")
                 continue
+
             print(f"  [{idx}/{total}] annotate: {prompt[:120].replace(chr(10), ' ')}")
             labels = annotator.annotate(prompt)
-            source = "annotated"
+            if labels is None:
+                skipped += 1
+                print(f"  [{idx}/{total}] skip: no labels returned")
+                continue
+            if not _validate_semantic_labels(labels):
+                continue
+
+            # Teacher labels always win over log/self labels: no timestamp
+            # comparison, so a newer self-label can never downgrade them.
+            latest_by_prompt[prompt] = _make_example(
+                prompt, labels, record, "annotated"
+            )
             annotated_since_save += 1
 
+            if checkpoint_path and annotated_since_save >= _CHECKPOINT_INTERVAL:
+                _save_examples(latest_by_prompt, checkpoint_path)
+                print(
+                    f"  [{idx}/{total}] checkpoint: {len(latest_by_prompt)} examples saved"
+                )
+                annotated_since_save = 0
+            continue
+
+        # Offline path (no annotator): reuse labels already present in the log.
+        labels = _extract_semantic_labels_from_record(record)
         if labels is None:
             skipped += 1
             print(f"  [{idx}/{total}] skip: no labels returned")
@@ -459,20 +487,11 @@ def extract_distilled_feature_examples(
         if not _validate_semantic_labels(labels):
             continue
 
-        example = _make_example(prompt, labels, record, source)
-
-        current = latest_by_prompt.get(prompt)
+        example = _make_example(prompt, labels, record, "log")
         if current is None or (example["timestamp"] or "") >= (
             current["timestamp"] or ""
         ):
             latest_by_prompt[prompt] = example
-
-        if checkpoint_path and annotated_since_save >= _CHECKPOINT_INTERVAL:
-            _save_examples(latest_by_prompt, checkpoint_path)
-            print(
-                f"  [{idx}/{total}] checkpoint: {len(latest_by_prompt)} examples saved"
-            )
-            annotated_since_save = 0
 
     return sorted(
         latest_by_prompt.values(),
@@ -535,12 +554,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--annotate-missing",
         action="store_true",
-        help="Use LLM annotation for records missing semantic labels",
+        help=(
+            "LLM-annotate records missing a teacher label, including ones that "
+            "carry only the classifier's own runtime semanticLabels"
+        ),
     )
     parser.add_argument(
         "--force-annotate",
         action="store_true",
-        help="Ignore pre-existing semanticLabels from routing logs and re-annotate all records with the LLM",
+        help="Re-annotate every record with the LLM, including ones already teacher-annotated",
     )
     parser.add_argument("--model", help="LLM model for annotation")
     parser.add_argument("--base-url", help="LLM base URL for annotation")

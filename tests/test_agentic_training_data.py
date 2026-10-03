@@ -425,3 +425,110 @@ def test_checkpoint_resumes_and_skips_already_annotated(tmp_path: Path) -> None:
 
     assert len(examples) == 2
     assert annotator.calls == ["New prompt"]
+
+
+def test_teacher_annotates_records_carrying_only_self_labels() -> None:
+    """With an annotator, a log that carries only the classifier's own
+    semanticLabels must still be teacher-annotated (not silently skipped)."""
+    records = [
+        {
+            "timestamp": "2026-03-23T10:00:00+00:00",
+            "prompt": "Explain the architecture",
+            "signals": {"semanticLabels": _labels("high")},
+        },
+    ]
+    annotator = _StubAnnotator({"Explain the architecture": _labels("low")})
+
+    examples = extract_distilled_feature_examples(records, annotator=annotator)
+
+    assert len(examples) == 1
+    assert examples[0]["source"] == "annotated"
+    assert examples[0]["agenticTask"] == "low"
+    assert annotator.calls == ["Explain the architecture"]
+
+
+def test_teacher_upgrades_log_labelled_checkpoint_entry(tmp_path: Path) -> None:
+    """A checkpoint entry that only carries a log/self label is re-annotated by
+    the teacher and promoted to source == "annotated"."""
+    checkpoint = tmp_path / "dataset.json"
+    existing = [
+        {
+            "prompt": "Self labelled",
+            "tokenCount": 2,
+            **_labels("high"),
+            "timestamp": "2026-04-01T00:00:00",
+            "source": "log",
+        }
+    ]
+    checkpoint.write_text(json.dumps(existing), encoding="utf-8")
+
+    records = [
+        {
+            "timestamp": "2026-04-02T00:00:00",
+            "prompt": "Self labelled",
+            "signals": {"semanticLabels": _labels("high")},
+        },
+    ]
+    annotator = _StubAnnotator({"Self labelled": _labels("low")})
+
+    examples = extract_distilled_feature_examples(
+        records, annotator=annotator, checkpoint_path=checkpoint
+    )
+
+    assert len(examples) == 1
+    assert examples[0]["source"] == "annotated"
+    assert examples[0]["agenticTask"] == "low"
+    assert annotator.calls == ["Self labelled"]
+
+
+def test_force_reattributes_already_annotated_checkpoint_entry(
+    tmp_path: Path,
+) -> None:
+    checkpoint = tmp_path / "dataset.json"
+    existing = [
+        {
+            "prompt": "Already done",
+            "tokenCount": 2,
+            **_labels("high"),
+            "timestamp": "2026-04-01T00:00:00",
+            "source": "annotated",
+        }
+    ]
+    checkpoint.write_text(json.dumps(existing), encoding="utf-8")
+
+    records = [
+        {
+            "timestamp": "2026-04-02T00:00:00",
+            "prompt": "Already done",
+            "signals": {},
+        },
+    ]
+    annotator = _StubAnnotator({"Already done": _labels("medium")})
+
+    examples = extract_distilled_feature_examples(
+        records,
+        annotator=annotator,
+        checkpoint_path=checkpoint,
+        force_annotate=True,
+    )
+
+    assert len(examples) == 1
+    assert examples[0]["agenticTask"] == "medium"
+    assert annotator.calls == ["Already done"]
+
+
+def test_offline_path_uses_log_labels_without_annotator() -> None:
+    """Without an annotator, dataset building still reuses runtime log labels."""
+    records = [
+        {
+            "timestamp": "2026-03-23T10:00:00+00:00",
+            "prompt": "Summarize this article",
+            "signals": {"semanticLabels": _labels("low")},
+        },
+    ]
+
+    examples = extract_distilled_feature_examples(records)
+
+    assert len(examples) == 1
+    assert examples[0]["source"] == "log"
+    assert examples[0]["agenticTask"] == "low"
