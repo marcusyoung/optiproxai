@@ -627,10 +627,13 @@ class SubagentRoute(BaseModel):
     message bodies can be megabytes, so a config-supplied regex would be a
     performance/ReDoS hazard).
 
-    A match requires BOTH ``signature`` and ``require`` to appear in the same
-    message text (compound guard). ``signature`` defaults to Cursor's injected
-    named-custom-subagent line; ``require`` defaults to Cursor's generic
-    subagent reminder. A fully literal ``signature`` with no ``{name}``
+    A match requires BOTH ``signature`` and ``require`` to be present
+    somewhere in the full message list (compound guard). They need not appear
+    in the same message: Cursor injects the named-signature line and the
+    generic subagent reminder into different messages of the same turn, so each
+    marker is matched across the whole list. ``signature`` defaults to Cursor's
+    injected named-custom-subagent line; ``require`` defaults to Cursor's
+    generic subagent reminder. A fully literal ``signature`` with no ``{name}``
     placeholder is accepted, so the mechanism is not tied to one client's
     wording. Set ``require`` to an empty string to disable the second
     condition and fall back to single-signature behavior.
@@ -650,9 +653,10 @@ class SubagentRoute(BaseModel):
     require: str | None = Field(
         default=None,
         description=(
-            "Second literal that must ALSO be present (compound guard). "
-            "Defaults to Cursor's generic subagent reminder; set to empty "
-            "string to disable and match on ``signature`` alone."
+            "Second literal that must ALSO be present somewhere in the message "
+            "list (compound guard). It need not share a message with "
+            "``signature``. Defaults to Cursor's generic subagent reminder; set "
+            "to empty string to disable and match on ``signature`` alone."
         ),
     )
     provider: str = ""  # empty = default_provider

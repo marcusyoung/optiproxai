@@ -223,6 +223,40 @@ class TestSubagentDetection:
         decision = router.route(messages, profile="auto")
         assert decision.model == "hy3-retrieval"
 
+    def test_signature_and_require_in_different_messages_pins(self) -> None:
+        # Cursor injects the named-signature line and the generic reminder into
+        # different messages of the same turn; the guard must match both across
+        # the whole list, not require them in the same message.
+        router = Router(_config(subagent_routes=[_web_route()]))
+        messages = [
+            {"role": "system", "content": "parent system prompt"},
+            {"role": "user", "content": f"{WEB_SIGNATURE}"},
+            {"role": "assistant", "content": "working"},
+            {"role": "user", "content": f"{GENERIC}"},
+        ]
+        decision = router.route(messages, profile="auto")
+        assert decision.model == "hy3-retrieval"
+        assert decision.signals == ["subagent_pin"]
+
+    def test_require_anywhere_without_signature_does_not_pin(self) -> None:
+        # The generic reminder alone (no named signature anywhere) must not pin.
+        router = Router(_config(subagent_routes=[_web_route()]))
+        messages = [{"role": "user", "content": f"{GENERIC} but no named line"}]
+        with patch.object(
+            Router,
+            "_classify",
+            return_value={
+                "tier": "SIMPLE",
+                "score": 0.1,
+                "confidence": 0.9,
+                "signals": [],
+                "agentic_score": 0.0,
+            },
+        ) as mock_classify:
+            decision = router.route(messages, profile="auto")
+        assert mock_classify.call_count == 1
+        assert decision.signals != ["subagent_pin"]
+
     def test_unrecognised_subagent_name_does_not_pin(self) -> None:
         router = Router(_config(subagent_routes=[_web_route()]))
         messages = [
