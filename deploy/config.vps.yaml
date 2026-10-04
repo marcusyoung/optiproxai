@@ -177,8 +177,9 @@ model_rules:
 # ---------------------------------------------------------------------------
 # Pin a named custom subagent to a provider+model. Detection is a literal
 # substring scan of the full request message list; a match requires BOTH the
-# `signature` and the `require` marker in the same message text. Defaults match
-# Cursor's injected lines. See config.example.yaml for the full explanation.
+# `signature` and the `require` marker to be present somewhere in the message
+# list (they need not share a message). Defaults match Cursor's injected lines.
+# See config.example.yaml for the full explanation.
 subagent_routes:
   - name: web-researcher
     provider: doubleword          # optional; blank = default_provider

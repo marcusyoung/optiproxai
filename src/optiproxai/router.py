@@ -246,8 +246,8 @@ def _iter_message_content(messages: list[dict[str, Any]]):
 
     Named-custom-subagent markers are injected into message content, so the
     detector scans every message's text regardless of role. For list content,
-    text parts are concatenated per message so the signature and its compound
-    ``require`` marker may live in different parts of the same message.
+    text parts are concatenated per message so a marker split across parts of
+    the same message still matches.
     """
     for message in messages:
         content = message.get("content")
@@ -270,16 +270,21 @@ def _detect_subagent_route(
     Scans the FULL raw message list (not ``classification_input.text``, which
     keeps only the last 3500 characters and would lose a marker at the start of
     a long conversation) in config order, first match wins. Matching is a
-    literal substring test (never a regex). A match requires the entry's
-    ``signature`` AND its ``require`` marker in the same message text; an empty
-    ``require`` disables the second condition.
+    literal substring test (never a regex). The entry's ``signature`` and
+    ``require`` markers must both be present somewhere in the message list, but
+    they need not appear in the same message: Cursor injects the named-signature
+    line and the generic subagent reminder into different messages of the same
+    turn, so each marker is matched across the whole list (a marker present in
+    ANY message counts). An empty ``require`` disables the second condition.
     """
     for route in routes:
         signature = route.resolved_signature
         require = route.resolved_require
-        for text in _iter_message_content(messages):
-            if signature in text and (not require or require in text):
-                return route
+        texts = list(_iter_message_content(messages))
+        sig_present = any(signature in text for text in texts)
+        req_present = not require or any(require in text for text in texts)
+        if sig_present and req_present:
+            return route
     return None
 
 
