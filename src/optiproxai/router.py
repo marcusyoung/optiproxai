@@ -275,7 +275,7 @@ def _detect_subagent_route(
     they need not appear in the same message: Cursor injects the named-signature
     line and the generic subagent reminder into different messages of the same
     turn, so each marker is matched across the whole list (a marker present in
-    ANY message counts).     An empty ``require`` disables the second condition.
+    ANY message counts). An empty ``require`` disables the second condition.
 
     Message text is materialized once before the route loop so megabyte-sized
     bodies are not re-concatenated for every configured route.
