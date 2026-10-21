@@ -3,7 +3,10 @@
 # by Apache, proxy bound to loopback). Changes vs. the OpenCode config:
 #   - host: 127.0.0.1 (was 0.0.0.0) so only Apache can reach it
 #   - ollamalocal provider removed (no local Ollama on the VPS)
-# Everything else (profiles, model_rules, Doubleword settings) is unchanged.
+#   - model_rules and profiles retargeted to Doubleword snapshot aliases
+#     (DeepSeek-V4.1-Flash-1017) after the 2026-10-30 deprecation notice
+#   - REASONING tiers raised to reasoning_effort: max
+#   - subagent_routes pins web-researcher to zai-org/GLM-5.3-Flash
 #
 # Secrets resolve from ${VAR} in the process environment (systemd
 # EnvironmentFile=/etc/optiproxai/optiproxai.env). Missing vars silently
@@ -112,11 +115,11 @@ model_rules:
     capabilities: [tools, json_mode, vision]
     reasoning_style: "xai"
     async_mode:
-      enabled: true   # opts in; mechanism inherited from provider
+      enabled: false   # opts in; mechanism inherited from provider
     pricing:
       input_per_mtok: 3.00       # USD per 1M tokens (Doubleword realtime)
       cache_read_per_mtok: 0.30   # cached prefix read price
-      cache_write_per_mtok: 6.00  # cache write premium (1h TTL = 2x input)
+      cache_write_per_mtok: 0.00
   - prefix: "meta-models/Muse-Glimmer-30B"
     provider: "doubleword"
     capabilities: [tools, json_mode, vision]
@@ -156,7 +159,7 @@ model_rules:
   # TASK-26: vision verified live 2026-09-24 — becomes the primary vision path.
   # NOTE: zai-org/GLM-5.3-Flash accepts image requests but does NOT process them
   # (confident hallucination in the 2026-09-24 probe); never declare vision on it.
-  - prefix: "deepseek-ai/DeepSeek-V4.1-Flash"
+  - prefix: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
     provider: "doubleword"
     capabilities: [tools, json_mode, vision]
     reasoning_style: "xai"
@@ -164,6 +167,8 @@ model_rules:
       input_per_mtok: 0.15       # USD per 1M tokens
       cache_read_per_mtok: 0.01   # cached prefix read price
       cache_write_per_mtok: 0.00  # cache write premium (optional)
+  # Deprecated by Doubleword on 2026-10-30; retained until the retained-config
+  # sweep so any stale reference fails loudly at the deadline rather than now.
   - prefix: "tencent/Hy3-FP8"
     provider: "doubleword"
     capabilities: [tools, json_mode]
@@ -183,8 +188,8 @@ model_rules:
 subagent_routes:
   - name: web-researcher
     provider: doubleword          # optional; blank = default_provider
-    model: "tencent/Hy3-FP8"      # pinned retrieval-strong model
-    reasoning_effort: high        # optional
+    model: "zai-org/GLM-5.3-Flash" # replaces tencent/Hy3-FP8 (dropped 2026-10-30)
+    reasoning_effort: low         # fetch-loop turn cost; synthesis runs in gptr
 
 
 profiles:
@@ -193,7 +198,7 @@ profiles:
       SIMPLE:
         reasoning_effort: "low"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
         fallback:
@@ -203,7 +208,7 @@ profiles:
       MEDIUM:
         reasoning_effort: "medium"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
         fallback:
@@ -216,7 +221,7 @@ profiles:
       COMPLEX:
         reasoning_effort: "high"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
         fallback:
@@ -229,7 +234,7 @@ profiles:
       REASONING:
         reasoning_effort: "max"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
         fallback:
@@ -248,7 +253,7 @@ profiles:
       SIMPLE:
         reasoning_effort: "low"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
         fallback:
@@ -258,7 +263,7 @@ profiles:
       MEDIUM:
         reasoning_effort: "medium"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
         fallback:
@@ -271,7 +276,7 @@ profiles:
       COMPLEX:
         reasoning_effort: "high"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
         fallback:
@@ -284,7 +289,7 @@ profiles:
       REASONING:
         reasoning_effort: "max"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
         fallback:
@@ -310,7 +315,7 @@ profiles:
       SIMPLE:
         reasoning_effort: "low"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
             async_mode:
@@ -332,7 +337,7 @@ profiles:
       MEDIUM:
         reasoning_effort: "medium"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
             async_mode:
@@ -363,7 +368,7 @@ profiles:
       COMPLEX:
         reasoning_effort: "high"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
             async_mode:
@@ -385,11 +390,11 @@ profiles:
       REASONING:
         reasoning_effort: "high"
         primary:
-          - model: "deepseek-ai/DeepSeek-V4.1-Flash"
+          - model: "deepseek-ai/DeepSeek-V4.1-Flash-1017"
             provider: "doubleword"
             max_input_tokens: 1048576
             async_mode:
-              enabled: true   # opts into the provider mechanism (rule has no async_mode)
+              enabled: true   # overrides rule-level enabled: false
             pricing:
               input_per_mtok: 0.12      # async price per 1M tokens
               cache_read_per_mtok: 0.01
