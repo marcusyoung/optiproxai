@@ -2901,6 +2901,22 @@ class TestNormalizeAssistantContentParts:
         flattened = proxy_mod._flatten_assistant_content_parts(content)
         assert flattened == ("pong", "brief reason")
 
+    def test_flatten_nested_think_chunk_list(self) -> None:
+        """Mistral ThinkChunk: thinking is a list of TextChunk parts."""
+        content = [
+            {
+                "type": "thinking",
+                "thinking": [
+                    {"type": "text", "text": "step one; "},
+                    {"type": "text", "text": "step two"},
+                ],
+            },
+            {"type": "text", "text": "pong"},
+        ]
+        flattened = proxy_mod._flatten_assistant_content_parts(content)
+        assert flattened == ("pong", "step one; step two")
+        assert not (flattened and flattened[1] and flattened[1].startswith("{"))
+
     def test_flatten_returns_none_for_string_content(self) -> None:
         assert proxy_mod._flatten_assistant_content_parts("already string") is None
 

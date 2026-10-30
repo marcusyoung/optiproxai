@@ -491,7 +491,11 @@ def _omit_configured_body_keys(
 
 
 def _thinking_text_from_part(part: dict[str, Any]) -> str:
-    """Extract text from a Mistral-style thinking content part."""
+    """Extract text from a Mistral-style thinking content part.
+
+    Official ThinkChunk payloads nest ``thinking`` as a list of text parts
+    (``[{"type": "text", "text": "..."}]``); also accept string or dict values.
+    """
     for key in ("thinking", "text", "content", "output"):
         value = part.get(key)
         if isinstance(value, str):
@@ -500,6 +504,17 @@ def _thinking_text_from_part(part: dict[str, Any]) -> str:
             nested = _text_from_content_part(value)
             if nested:
                 return nested
+        if isinstance(value, list):
+            fragments: list[str] = []
+            for item in value:
+                if isinstance(item, str) and item:
+                    fragments.append(item)
+                elif isinstance(item, dict):
+                    nested = _text_from_content_part(item)
+                    if nested:
+                        fragments.append(nested)
+            if fragments:
+                return "".join(fragments)
     return _text_from_content_part(part)
 
 
