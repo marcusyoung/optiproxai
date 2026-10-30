@@ -254,6 +254,16 @@ class ProviderConfig(BaseModel):
             "model_rules[].normalize_assistant_content_parts."
         ),
     )
+    unwrap_image_url_objects: bool = Field(
+        default=False,
+        description=(
+            "When true, rewrite request message parts of type image_url whose "
+            "image_url is an object with a string url into Mistral's string "
+            "wire format (image_url as a plain string) (TASK-31).  Default "
+            "false keeps OpenAI object shape.  May be overridden per-rule via "
+            "model_rules[].unwrap_image_url_objects."
+        ),
+    )
 
 
 class ModelEntry(BaseModel):
@@ -594,6 +604,14 @@ class ModelRuleEntry(BaseModel):
             "(TASK-30).  When set, wins over "
             "ProviderConfig.normalize_assistant_content_parts for matching "
             "model/provider."
+        ),
+    )
+    unwrap_image_url_objects: bool | None = Field(
+        default=None,
+        description=(
+            "Rule-level override for image_url object unwrapping (TASK-31).  "
+            "When set, wins over ProviderConfig.unwrap_image_url_objects for "
+            "matching model/provider."
         ),
     )
     pricing: ModelPricingConfig | None = Field(

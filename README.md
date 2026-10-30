@@ -354,6 +354,7 @@ providers:
     api_key: "${MISTRAL_API_KEY}"
     omit_body_keys: [user]   # Cursor injects user; Mistral returns 422 otherwise
     normalize_assistant_content_parts: true  # flatten thinking+text parts for Cursor
+    unwrap_image_url_objects: true  # image_url object -> string wire format for Mistral
 ```
 
 ### Normalize Mistral-style assistant content parts
@@ -365,6 +366,13 @@ treats that shape as a client failure even on HTTP 200. Set
 `model_rules`) to rewrite completions so clients see string `content` and
 optional string `reasoning_content`. Applies to non-streaming JSON and SSE;
 default is off.
+
+### Unwrap image_url objects for Mistral-style providers
+
+Cursor sends OpenAI multimodal parts as `{"type":"image_url","image_url":{"url":"data:..."}}`.
+Mistral chat-completions expects the same part type but with `image_url` as a
+plain string. Set `unwrap_image_url_objects: true` on the provider (or via
+`model_rules`) to rewrite request parts before the upstream send; default off.
 
 ### Important: model IDs are provider-specific
 

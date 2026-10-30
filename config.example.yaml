@@ -288,6 +288,7 @@ providers:
     #     api_key: "${MISTRAL_API_KEY}"
     #     omit_body_keys: [user]
     #     normalize_assistant_content_parts: true
+    #     unwrap_image_url_objects: true   # image_url object -> string for Mistral
 
     # Example: provider with async_mode mechanism declaration.
     # The provider declares HOW async works (delivery/field/value).

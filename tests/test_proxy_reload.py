@@ -2967,8 +2967,105 @@ class TestNormalizeAssistantContentParts:
             name="openrouter", base_url="https://openrouter.ai/api/v1"
         )
         assert bare.normalize_assistant_content_parts is False
+        assert bare.unwrap_image_url_objects is False
         rule = ModelRuleEntry(prefix="mistral-")
         assert rule.normalize_assistant_content_parts is None
+        assert rule.unwrap_image_url_objects is None
+
+
+class TestUnwrapImageUrlObjects:
+    def test_unwraps_object_image_url_to_string(self) -> None:
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64,AAA"},
+                        },
+                    ],
+                }
+            ]
+        }
+        out = proxy_mod._unwrap_image_url_objects_in_body(body)
+        assert out is not body
+        parts = out["messages"][0]["content"]
+        assert parts[0] == {"type": "text", "text": "what is this?"}
+        assert parts[1] == {
+            "type": "image_url",
+            "image_url": "data:image/jpeg;base64,AAA",
+        }
+        # original untouched
+        assert body["messages"][0]["content"][1]["image_url"] == {
+            "url": "data:image/jpeg;base64,AAA"
+        }
+
+    def test_identity_when_nothing_to_unwrap(self) -> None:
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": "https://x/y.png"},
+                        {"type": "image_url", "image_url": {"file_id": "f1"}},
+                        {"type": "text", "text": "hi"},
+                    ],
+                },
+                {"role": "user", "content": "plain string"},
+            ]
+        }
+        assert proxy_mod._unwrap_image_url_objects_in_body(body) is body
+
+    @pytest.mark.asyncio
+    async def test_prepare_body_unwraps_when_enabled(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            _config_text(provider_body="    unwrap_image_url_objects: true\n")
+        )
+        configure(str(path))
+        runtime = proxy_mod._state
+        assert runtime is not None
+        body = {
+            "model": "auto-simple",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,BB"},
+                        }
+                    ],
+                }
+            ],
+        }
+        prepared, _headers = proxy_mod._prepare_body_for_candidate(
+            body, "auto-simple", "dummy", runtime
+        )
+        part = prepared["messages"][0]["content"][0]
+        assert part == {"type": "image_url", "image_url": "data:image/png;base64,BB"}
+
+    @pytest.mark.asyncio
+    async def test_prepare_body_passthrough_when_disabled(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(_config_text())
+        configure(str(path))
+        runtime = proxy_mod._state
+        assert runtime is not None
+        image_part = {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,BB"},
+        }
+        body = {
+            "model": "auto-simple",
+            "messages": [{"role": "user", "content": [image_part]}],
+        }
+        prepared, _headers = proxy_mod._prepare_body_for_candidate(
+            body, "auto-simple", "dummy", runtime
+        )
+        assert prepared["messages"][0]["content"][0] == image_part
 
 
 class TestNormalizeAssistantContentPartsUpstream:

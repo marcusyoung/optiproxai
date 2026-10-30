@@ -1568,6 +1568,43 @@ def _resolve_normalize_assistant_content_parts(
     return bool(provider_cfg.normalize_assistant_content_parts)
 
 
+def _get_model_unwrap_image_url_objects(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> bool | None:
+    """Return model-rule override for image_url object unwrapping (TASK-31)."""
+    best_value: bool | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        if entry.unwrap_image_url_objects is None:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_value = entry.unwrap_image_url_objects
+    return best_value
+
+
+def _resolve_unwrap_image_url_objects(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> bool:
+    """Resolve opt-in image_url unwrapping (rule, then provider)."""
+    model_override = _get_model_unwrap_image_url_objects(model, provider_name, runtime)
+    if model_override is not None:
+        return model_override
+    provider_cfg = runtime.config.providers.get(provider_name)
+    if provider_cfg is None:
+        return False
+    return bool(provider_cfg.unwrap_image_url_objects)
+
+
 def _get_model_reasoning_style(
     model: str, provider_name: str, runtime: RuntimeState
 ) -> str | None:
@@ -2358,6 +2395,60 @@ def _normalize_content_part(
     return part
 
 
+def _unwrap_image_url_objects_in_body(body: dict[str, Any]) -> dict[str, Any]:
+    """Unwrap OpenAI ``image_url`` objects to Mistral's string wire format.
+
+    Copy-on-change: walk ``messages[].content[]`` and rewrite only parts with
+    ``type == "image_url"`` whose ``image_url`` is a dict containing a string
+    ``url`` into ``{"type": "image_url", "image_url": <url>}`` (TASK-31).
+    Text parts, file_id-only parts, and already-string image_url parts are
+    untouched. Never logs URLs (may embed base64 payloads).
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    changed_indexes: list[int] = []
+    unwrapped_messages = list(messages)
+    unwrapped_count = 0
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict) or not isinstance(msg.get("content"), list):
+            continue
+        next_content: list[Any] = []
+        changed = False
+        for part in msg["content"]:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "image_url"
+                and isinstance(part.get("image_url"), dict)
+                and isinstance(part["image_url"].get("url"), str)
+            ):
+                next_content.append(
+                    {"type": "image_url", "image_url": part["image_url"]["url"]}
+                )
+                changed = True
+                unwrapped_count += 1
+                continue
+            next_content.append(part)
+        if changed:
+            next_msg = dict(msg)
+            next_msg["content"] = next_content
+            unwrapped_messages[idx] = next_msg
+            changed_indexes.append(idx)
+
+    if not changed_indexes:
+        return body
+
+    out = dict(body)
+    out["messages"] = unwrapped_messages
+    logger.info(
+        "UNWRAP_IMAGE_URL_OBJECTS changed_messages=%d unwrapped_parts=%d",
+        len(changed_indexes),
+        unwrapped_count,
+    )
+    return out
+
+
 def _normalize_message_content_for_candidate(
     body: dict[str, Any], model: str, provider_name: str, runtime: RuntimeState
 ) -> dict[str, Any]:
@@ -2441,6 +2532,8 @@ def _prepare_body_for_candidate(
     prepared = _normalize_message_content_for_candidate(
         prepared, model, provider_name, runtime
     )
+    if _resolve_unwrap_image_url_objects(model, provider_name, runtime):
+        prepared = _unwrap_image_url_objects_in_body(prepared)
     extra_body = _get_model_extra_body(model, provider_name, runtime)
     if extra_body:
         prepared = {**prepared, **extra_body}
