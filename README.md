@@ -340,6 +340,21 @@ Config path resolution order:
 4. `$XDG_CONFIG_HOME/optiproxai/config.yaml`
 5. `/etc/optiproxai/config.yaml`
 
+### Omit client-only body keys per provider
+
+Some OpenAI-compatible clients (notably Cursor) send top-level fields that strict
+providers reject. Set `omit_body_keys` on the provider to drop those keys from
+the outbound chat-completions body (top-level names only; empty = no-op):
+
+```yaml
+providers:
+  mistral:
+    name: mistral
+    base_url: "https://api.mistral.ai/v1"
+    api_key: "${MISTRAL_API_KEY}"
+    omit_body_keys: [user]   # Cursor injects user; Mistral returns 422 otherwise
+```
+
 ### Important: model IDs are provider-specific
 
 optiproxai does not rewrite model IDs. Configured model IDs are sent literally to the selected provider.

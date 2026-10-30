@@ -235,6 +235,15 @@ class ProviderConfig(BaseModel):
             "model_rules[].reasoning_effort_values."
         ),
     )
+    omit_body_keys: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Optional top-level chat-completions body keys to drop before the "
+            "upstream request (TASK-29).  Empty = no-op.  Use for strict "
+            "providers that reject OpenAI-compatible client fields (e.g. "
+            "Cursor's `user`).  Nested paths are not supported."
+        ),
+    )
 
 
 class ModelEntry(BaseModel):

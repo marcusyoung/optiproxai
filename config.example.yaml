@@ -276,6 +276,16 @@ providers:
     #     base_url: "http://host.docker.internal:8317/v1"
     #     api_key: "${LOCAL_PROXY_API_KEY}"
 
+    # Example: strict provider that rejects OpenAI-compatible client-only fields.
+    # Cursor sends a top-level `user` (auth0|…) that Mistral 422s as extra_forbidden.
+    # omit_body_keys drops those top-level keys from the outbound body only.
+    #
+    # mistral:
+    #     name: mistral
+    #     base_url: "https://api.mistral.ai/v1"
+    #     api_key: "${MISTRAL_API_KEY}"
+    #     omit_body_keys: [user]
+
     # Example: provider with async_mode mechanism declaration.
     # The provider declares HOW async works (delivery/field/value).
     # Models/rules opt in with `enabled: true` (see model_rules above).
