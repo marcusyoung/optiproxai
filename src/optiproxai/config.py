@@ -244,6 +244,16 @@ class ProviderConfig(BaseModel):
             "Cursor's `user`).  Nested paths are not supported."
         ),
     )
+    normalize_assistant_content_parts: bool = Field(
+        default=False,
+        description=(
+            "When true, rewrite assistant completion content that arrives as a "
+            "parts array (e.g. Mistral thinking+text) into OpenAI-shaped string "
+            "content plus optional reasoning_content (TASK-30).  Applies to "
+            "non-stream JSON and SSE.  May be overridden per-rule via "
+            "model_rules[].normalize_assistant_content_parts."
+        ),
+    )
 
 
 class ModelEntry(BaseModel):
@@ -575,6 +585,15 @@ class ModelRuleEntry(BaseModel):
             "Presence-based: a matching rule's list wins over the provider-level "
             "list, which wins over the style default.  An empty list suppresses "
             "reasoning-effort injection for matching candidates."
+        ),
+    )
+    normalize_assistant_content_parts: bool | None = Field(
+        default=None,
+        description=(
+            "Rule-level override for assistant content-part flattening "
+            "(TASK-30).  When set, wins over "
+            "ProviderConfig.normalize_assistant_content_parts for matching "
+            "model/provider."
         ),
     )
     pricing: ModelPricingConfig | None = Field(

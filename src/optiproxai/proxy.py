@@ -490,6 +490,142 @@ def _omit_configured_body_keys(
     return {key: value for key, value in body.items() if key not in omit}
 
 
+def _thinking_text_from_part(part: dict[str, Any]) -> str:
+    """Extract text from a Mistral-style thinking content part."""
+    for key in ("thinking", "text", "content", "output"):
+        value = part.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, dict):
+            nested = _text_from_content_part(value)
+            if nested:
+                return nested
+    return _text_from_content_part(part)
+
+
+def _flatten_assistant_content_parts(
+    content: Any,
+) -> tuple[str, str | None] | None:
+    """Flatten assistant content parts to (content_str, reasoning_or_None).
+
+    Returns ``None`` when ``content`` is not a list (caller leaves it unchanged).
+    Thinking parts become reasoning text; all other parts become the content
+    string via ``_text_from_content_part``.
+    """
+    if not isinstance(content, list):
+        return None
+
+    content_fragments: list[str] = []
+    reasoning_fragments: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            content_fragments.append(part)
+            continue
+        if not isinstance(part, dict):
+            continue
+        part_type = str(part.get("type") or "")
+        if part_type == "thinking":
+            text = _thinking_text_from_part(part)
+            if text:
+                reasoning_fragments.append(text)
+            continue
+        content_fragments.append(_text_from_content_part(part))
+
+    reasoning = "".join(reasoning_fragments) if reasoning_fragments else None
+    return ("".join(content_fragments), reasoning)
+
+
+def _normalize_assistant_message(message: dict[str, Any]) -> dict[str, Any]:
+    """Copy-on-change: flatten list ``content``; map thinking to reasoning_content."""
+    flattened = _flatten_assistant_content_parts(message.get("content"))
+    if flattened is None:
+        return message
+    content_text, reasoning_text = flattened
+    out = dict(message)
+    out["content"] = content_text
+    if reasoning_text:
+        out["reasoning_content"] = reasoning_text
+    return out
+
+
+def _normalize_completion_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite ``choices[].message`` content parts (copy-on-change)."""
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return payload
+
+    changed = False
+    new_choices: list[Any] = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            new_choices.append(choice)
+            continue
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            new_choices.append(choice)
+            continue
+        normalized = _normalize_assistant_message(message)
+        if normalized is message:
+            new_choices.append(choice)
+            continue
+        changed = True
+        new_choices.append({**choice, "message": normalized})
+
+    if not changed:
+        return payload
+    return {**payload, "choices": new_choices}
+
+
+def _normalize_stream_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite ``choices[].delta`` content parts (copy-on-change)."""
+    choices = chunk.get("choices")
+    if not isinstance(choices, list):
+        return chunk
+
+    changed = False
+    new_choices: list[Any] = []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            new_choices.append(choice)
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            new_choices.append(choice)
+            continue
+        normalized = _normalize_assistant_message(delta)
+        if normalized is delta:
+            new_choices.append(choice)
+            continue
+        changed = True
+        new_choices.append({**choice, "delta": normalized})
+
+    if not changed:
+        return chunk
+    return {**chunk, "choices": new_choices}
+
+
+def _rewrite_sse_data_line(line: str) -> tuple[str, bool]:
+    """Normalize a single SSE ``data:`` JSON line if content parts are present.
+
+    Returns ``(line, rewritten)``. Non-JSON / ``[DONE]`` lines pass through.
+    """
+    if not line.startswith("data: ") or line == "data: [DONE]":
+        return line, False
+    try:
+        chunk = json.loads(line[6:])
+    except (json.JSONDecodeError, TypeError):
+        return line, False
+    if not isinstance(chunk, dict):
+        return line, False
+    normalized = _normalize_stream_chunk(chunk)
+    if normalized is chunk:
+        return line, False
+    return (
+        "data: " + json.dumps(normalized, ensure_ascii=False, separators=(",", ":")),
+        True,
+    )
+
+
 def _decorative_tool_schema_adaptation_payload(
     adaptation: DecorativeToolSchemaAdaptation,
 ) -> dict[str, Any]:
@@ -859,6 +995,8 @@ async def _proxy_upstream(
     # Per-provider top-level body key omissions (TASK-29), e.g. Cursor's `user`
     # for strict APIs like Mistral. Empty/absent config is a no-op. Skip when
     # runtime is not configured (direct unit-test call sites).
+    runtime: RuntimeState | None = None
+    normalize_assistant_parts = False
     if actual_provider:
         runtime = _state or _runtime_state_from_legacy_globals()
         provider_cfg = (
@@ -899,6 +1037,10 @@ async def _proxy_upstream(
 
     is_streaming = body.get("stream", False)
     model_name = body.get("model", "unknown")
+    if actual_provider and runtime is not None:
+        normalize_assistant_parts = _resolve_normalize_assistant_content_parts(
+            model_name, actual_provider, runtime
+        )
     extra_headers = (
         _optiproxai_headers(
             decision,
@@ -962,22 +1104,47 @@ async def _proxy_upstream(
 
             async def _stream():
                 last_usage: dict[str, Any] | None = None
+                rewrite_logged = False
                 try:
                     for line in buffered_lines:
-                        yield f"{line}\n"
-                        if line.startswith("data: ") and line != "data: [DONE]":
+                        out_line = line
+                        if normalize_assistant_parts:
+                            out_line, rewritten = _rewrite_sse_data_line(line)
+                            if rewritten and not rewrite_logged:
+                                rewrite_logged = True
+                                logger.info(
+                                    "NORMALIZE_ASSISTANT_CONTENT_PARTS "
+                                    "provider=%s stream=%s request_id=%s",
+                                    actual_provider,
+                                    True,
+                                    request_id,
+                                )
+                        yield f"{out_line}\n"
+                        if out_line.startswith("data: ") and out_line != "data: [DONE]":
                             try:
-                                chunk = json.loads(line[6:])
+                                chunk = json.loads(out_line[6:])
                                 usage = chunk.get("usage")
                                 if usage:
                                     last_usage = usage
                             except (json.JSONDecodeError, TypeError):
                                 pass
                     async for line in line_iter:
-                        yield f"{line}\n"
-                        if line.startswith("data: ") and line != "data: [DONE]":
+                        out_line = line
+                        if normalize_assistant_parts:
+                            out_line, rewritten = _rewrite_sse_data_line(line)
+                            if rewritten and not rewrite_logged:
+                                rewrite_logged = True
+                                logger.info(
+                                    "NORMALIZE_ASSISTANT_CONTENT_PARTS "
+                                    "provider=%s stream=%s request_id=%s",
+                                    actual_provider,
+                                    True,
+                                    request_id,
+                                )
+                        yield f"{out_line}\n"
+                        if out_line.startswith("data: ") and out_line != "data: [DONE]":
                             try:
-                                chunk = json.loads(line[6:])
+                                chunk = json.loads(out_line[6:])
                                 usage = chunk.get("usage")
                                 if usage:
                                     last_usage = usage
@@ -1041,6 +1208,17 @@ async def _proxy_upstream(
                     f"Upstream error: {message}",
                     error_type,
                 )
+            if normalize_assistant_parts:
+                normalized = _normalize_completion_payload(resp_data)
+                if normalized is not resp_data:
+                    logger.info(
+                        "NORMALIZE_ASSISTANT_CONTENT_PARTS "
+                        "provider=%s stream=%s request_id=%s",
+                        actual_provider,
+                        False,
+                        request_id,
+                    )
+                    resp_data = normalized
             _log_usage(
                 model_name,
                 actual_provider,
@@ -1334,6 +1512,45 @@ async def _try_with_fallbacks(
 
 
 # ── Reasoning control injection helpers ───────────────────────────────────────
+
+
+def _get_model_normalize_assistant_content_parts(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> bool | None:
+    """Return model-rule override for assistant content-part flattening."""
+    best_value: bool | None = None
+    best_score: tuple[int, int] = (-1, -1)
+    for entry in runtime.config.model_rules:
+        prefix_matches = entry.prefix == "*" or model.startswith(entry.prefix)
+        if not prefix_matches:
+            continue
+        if entry.provider and entry.provider != provider_name:
+            continue
+        if entry.normalize_assistant_content_parts is None:
+            continue
+        score = (
+            1 if entry.provider else 0,
+            0 if entry.prefix == "*" else len(entry.prefix),
+        )
+        if score > best_score:
+            best_score = score
+            best_value = entry.normalize_assistant_content_parts
+    return best_value
+
+
+def _resolve_normalize_assistant_content_parts(
+    model: str, provider_name: str, runtime: RuntimeState
+) -> bool:
+    """Resolve opt-in assistant content-part flattening (rule, then provider)."""
+    model_override = _get_model_normalize_assistant_content_parts(
+        model, provider_name, runtime
+    )
+    if model_override is not None:
+        return model_override
+    provider_cfg = runtime.config.providers.get(provider_name)
+    if provider_cfg is None:
+        return False
+    return bool(provider_cfg.normalize_assistant_content_parts)
 
 
 def _get_model_reasoning_style(

@@ -353,7 +353,18 @@ providers:
     base_url: "https://api.mistral.ai/v1"
     api_key: "${MISTRAL_API_KEY}"
     omit_body_keys: [user]   # Cursor injects user; Mistral returns 422 otherwise
+    normalize_assistant_content_parts: true  # flatten thinking+text parts for Cursor
 ```
+
+### Normalize Mistral-style assistant content parts
+
+Some providers (notably Mistral large-4) return `message.content` as an array of
+parts (`type: thinking` + `type: text`) instead of an OpenAI string. Cursor
+treats that shape as a client failure even on HTTP 200. Set
+`normalize_assistant_content_parts: true` on the provider (or override via
+`model_rules`) to rewrite completions so clients see string `content` and
+optional string `reasoning_content`. Applies to non-streaming JSON and SSE;
+default is off.
 
 ### Important: model IDs are provider-specific
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import secrets
 from pathlib import Path
 import re
@@ -10,6 +11,7 @@ import httpx
 import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from starlette.responses import StreamingResponse
 
 import optiproxai.proxy as proxy_mod
 from optiproxai.config import (
@@ -2888,3 +2890,272 @@ class TestOmitBodyKeysUpstream:
             name="openrouter", base_url="https://openrouter.ai/api/v1"
         )
         assert bare.omit_body_keys == []
+
+
+class TestNormalizeAssistantContentParts:
+    def test_flatten_thinking_and_text_parts(self) -> None:
+        content = [
+            {"type": "thinking", "thinking": "brief reason"},
+            {"type": "text", "text": "pong"},
+        ]
+        flattened = proxy_mod._flatten_assistant_content_parts(content)
+        assert flattened == ("pong", "brief reason")
+
+    def test_flatten_returns_none_for_string_content(self) -> None:
+        assert proxy_mod._flatten_assistant_content_parts("already string") is None
+
+    def test_normalize_completion_payload_copy_on_change(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "thinking", "thinking": "why"},
+                            {"type": "text", "text": "pong"},
+                        ],
+                        "tool_calls": [{"id": "c1"}],
+                    },
+                }
+            ]
+        }
+        out = proxy_mod._normalize_completion_payload(payload)
+        assert out is not payload
+        message = out["choices"][0]["message"]
+        assert message["content"] == "pong"
+        assert message["reasoning_content"] == "why"
+        assert message["tool_calls"] == [{"id": "c1"}]
+        assert payload["choices"][0]["message"]["content"][1]["text"] == "pong"
+
+    def test_normalize_stream_chunk_flattens_delta_parts(self) -> None:
+        chunk = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": [
+                            {"type": "thinking", "thinking": "t"},
+                            {"type": "text", "text": "hi"},
+                        ]
+                    },
+                }
+            ]
+        }
+        out = proxy_mod._normalize_stream_chunk(chunk)
+        assert out["choices"][0]["delta"]["content"] == "hi"
+        assert out["choices"][0]["delta"]["reasoning_content"] == "t"
+
+    def test_provider_config_defaults_false(self) -> None:
+        bare = ProviderConfig(
+            name="openrouter", base_url="https://openrouter.ai/api/v1"
+        )
+        assert bare.normalize_assistant_content_parts is False
+        rule = ModelRuleEntry(prefix="mistral-")
+        assert rule.normalize_assistant_content_parts is None
+
+
+class TestNormalizeAssistantContentPartsUpstream:
+    @pytest.mark.asyncio
+    async def test_nonstream_flattens_when_enabled(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            _config_text(provider_body="    normalize_assistant_content_parts: true\n")
+        )
+        configure(str(path))
+
+        async def fake_post(url: str, *, json: dict[str, Any] | None = None, **kwargs):
+            del url, json, kwargs
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": [
+                                    {"type": "thinking", "thinking": "reason"},
+                                    {"type": "text", "text": "pong"},
+                                ],
+                            },
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+                request=httpx.Request(
+                    "POST", "http://localhost:9999/v1/chat/completions"
+                ),
+            )
+
+        fake_http = MagicMock()
+        fake_http.post = fake_post
+
+        with patch.object(proxy_mod, "_http", fake_http):
+            result = await proxy_mod._proxy_upstream(
+                "http://localhost:9999/v1",
+                "fake",
+                {
+                    "model": "auto-simple",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                decision=None,
+                actual_provider="dummy",
+                request_id="norm-on",
+            )
+
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == 200
+        body = json.loads(result.body)
+        message = body["choices"][0]["message"]
+        assert message["content"] == "pong"
+        assert message["reasoning_content"] == "reason"
+        assert isinstance(message["content"], str)
+
+    @pytest.mark.asyncio
+    async def test_nonstream_passthrough_when_disabled(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(_config_text())
+        configure(str(path))
+        parts = [
+            {"type": "thinking", "thinking": "reason"},
+            {"type": "text", "text": "pong"},
+        ]
+
+        async def fake_post(url: str, *, json: dict[str, Any] | None = None, **kwargs):
+            del url, json, kwargs
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": parts},
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+                request=httpx.Request(
+                    "POST", "http://localhost:9999/v1/chat/completions"
+                ),
+            )
+
+        fake_http = MagicMock()
+        fake_http.post = fake_post
+
+        with patch.object(proxy_mod, "_http", fake_http):
+            result = await proxy_mod._proxy_upstream(
+                "http://localhost:9999/v1",
+                "fake",
+                {
+                    "model": "auto-simple",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                decision=None,
+                actual_provider="dummy",
+                request_id="norm-off",
+            )
+
+        assert isinstance(result, JSONResponse)
+        body = json.loads(result.body)
+        assert body["choices"][0]["message"]["content"] == parts
+
+    @pytest.mark.asyncio
+    async def test_stream_flattens_delta_parts_when_enabled(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            _config_text(provider_body="    normalize_assistant_content_parts: true\n")
+        )
+        configure(str(path))
+
+        class FakeStreamingResponse:
+            status_code = 200
+
+            def __init__(self, lines: list[str]):
+                self._lines = lines
+
+            async def aiter_lines(self):
+                for line in self._lines:
+                    yield line
+
+            async def aread(self):
+                return "\n".join(self._lines).encode()
+
+            async def aclose(self):
+                return None
+
+        parts_chunk = {
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {
+                        "content": [
+                            {"type": "thinking", "thinking": "t"},
+                            {"type": "text", "text": "pong"},
+                        ]
+                    },
+                }
+            ]
+        }
+        response = FakeStreamingResponse(
+            [
+                f"data: {json.dumps(parts_chunk, separators=(',', ':'))}",
+                "",
+                "data: [DONE]",
+                "",
+            ]
+        )
+
+        async def fake_send(*args, **kwargs):
+            del args, kwargs
+            return response
+
+        fake_http = MagicMock()
+        fake_http.build_request = MagicMock(
+            return_value=httpx.Request(
+                "POST", "http://localhost:9999/v1/chat/completions"
+            )
+        )
+        fake_http.send = fake_send
+
+        with patch.object(proxy_mod, "_http", fake_http):
+            result = await proxy_mod._proxy_upstream(
+                "http://localhost:9999/v1",
+                "fake",
+                {
+                    "model": "auto-simple",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": True,
+                },
+                decision=None,
+                actual_provider="dummy",
+                request_id="norm-stream",
+            )
+
+        assert isinstance(result, StreamingResponse)
+        lines: list[str] = []
+        async for raw in result.body_iterator:
+            text = raw.decode() if isinstance(raw, bytes) else str(raw)
+            lines.append(text.rstrip("\n"))
+
+        data_lines = [line for line in lines if line.startswith("data: {")]
+        assert data_lines
+        chunk = json.loads(data_lines[0][6:])
+        delta = chunk["choices"][0]["delta"]
+        assert delta["content"] == "pong"
+        assert delta["reasoning_content"] == "t"
+        assert "data: [DONE]" in lines
