@@ -6,6 +6,7 @@ import re
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -2750,3 +2751,140 @@ class TestRouteDebugSecretMasking:
         # in the raw response body.
         assert "fake" not in resp.text
         assert "fallback-secret" not in resp.text
+
+
+class TestOmitConfiguredBodyKeys:
+    def test_identity_when_keys_empty_or_absent(self) -> None:
+        body = {"model": "m", "user": "auth0|x", "messages": []}
+        assert proxy_mod._omit_configured_body_keys(body, None) is body
+        assert proxy_mod._omit_configured_body_keys(body, []) is body
+        assert proxy_mod._omit_configured_body_keys(body, ["missing"]) is body
+
+    def test_copy_on_change_omits_listed_keys_only(self) -> None:
+        body = {"model": "m", "user": "auth0|secret", "messages": [], "stream": False}
+        out = proxy_mod._omit_configured_body_keys(body, ["user"])
+        assert out is not body
+        assert "user" not in out
+        assert out["model"] == "m"
+        assert body["user"] == "auth0|secret"
+
+
+class TestOmitBodyKeysUpstream:
+    @pytest.mark.asyncio
+    async def test_omits_configured_keys_before_httpx_post(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(
+            _config_text(provider_body="    omit_body_keys:\n      - user\n")
+        )
+        configure(str(path))
+        captured: dict[str, Any] = {}
+
+        async def fake_post(url: str, *, json: dict[str, Any] | None = None, **kwargs):
+            del url, kwargs
+            captured["json"] = json
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": "ok"}}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+                request=httpx.Request(
+                    "POST", "http://localhost:9999/v1/chat/completions"
+                ),
+            )
+
+        fake_http = MagicMock()
+        fake_http.post = fake_post
+
+        client_body = {
+            "model": "auto-simple",
+            "user": "auth0|user_SHOULD_NOT_FORWARD",
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        with patch.object(proxy_mod, "_http", fake_http):
+            result = await proxy_mod._proxy_upstream(
+                "http://localhost:9999/v1",
+                "fake",
+                client_body,
+                decision=None,
+                actual_provider="dummy",
+                request_id="omit-on",
+            )
+
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == 200
+        assert "user" not in captured["json"]
+        assert captured["json"]["model"] == "auto-simple"
+        assert client_body["user"] == "auth0|user_SHOULD_NOT_FORWARD"
+
+    @pytest.mark.asyncio
+    async def test_forwards_user_when_omit_list_empty(self, tmp_path: Path) -> None:
+        path = tmp_path / "config.yaml"
+        path.write_text(_config_text())
+        configure(str(path))
+        captured: dict[str, Any] = {}
+
+        async def fake_post(url: str, *, json: dict[str, Any] | None = None, **kwargs):
+            del url, kwargs
+            captured["json"] = json
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl-test",
+                    "object": "chat.completion",
+                    "choices": [
+                        {"index": 0, "message": {"role": "assistant", "content": "ok"}}
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "total_tokens": 2,
+                    },
+                },
+                request=httpx.Request(
+                    "POST", "http://localhost:9999/v1/chat/completions"
+                ),
+            )
+
+        fake_http = MagicMock()
+        fake_http.post = fake_post
+
+        with patch.object(proxy_mod, "_http", fake_http):
+            result = await proxy_mod._proxy_upstream(
+                "http://localhost:9999/v1",
+                "fake",
+                {
+                    "model": "auto-simple",
+                    "user": "auth0|keep-me",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+                decision=None,
+                actual_provider="dummy",
+                request_id="omit-off",
+            )
+
+        assert isinstance(result, JSONResponse)
+        assert result.status_code == 200
+        assert captured["json"]["user"] == "auth0|keep-me"
+
+    def test_provider_config_loads_omit_body_keys(self) -> None:
+        cfg = ProviderConfig(
+            name="mistral",
+            base_url="https://api.mistral.ai/v1",
+            omit_body_keys=["user"],
+        )
+        assert cfg.omit_body_keys == ["user"]
+        bare = ProviderConfig(
+            name="openrouter", base_url="https://openrouter.ai/api/v1"
+        )
+        assert bare.omit_body_keys == []

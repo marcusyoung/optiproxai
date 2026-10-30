@@ -473,6 +473,23 @@ def _adapt_decorative_tool_schema_payload(
     )
 
 
+def _omit_configured_body_keys(
+    body: dict[str, Any], keys: list[str] | tuple[str, ...] | None
+) -> dict[str, Any]:
+    """Return body with configured top-level keys removed (copy-on-change).
+
+    Empty/absent ``keys`` is a no-op. When any listed key is present, returns a
+    shallow copy without those keys; otherwise returns ``body`` unchanged.
+    Never logs key values (they may be client identifiers).
+    """
+    if not keys:
+        return body
+    omit = {key for key in keys if key in body}
+    if not omit:
+        return body
+    return {key: value for key, value in body.items() if key not in omit}
+
+
 def _decorative_tool_schema_adaptation_payload(
     adaptation: DecorativeToolSchemaAdaptation,
 ) -> dict[str, Any]:
@@ -838,6 +855,29 @@ async def _proxy_upstream(
 ) -> StreamingResponse | JSONResponse:
     """Forward a chat-completion request to the upstream provider."""
     assert _http is not None
+
+    # Per-provider top-level body key omissions (TASK-29), e.g. Cursor's `user`
+    # for strict APIs like Mistral. Empty/absent config is a no-op. Skip when
+    # runtime is not configured (direct unit-test call sites).
+    if actual_provider:
+        runtime = _state or _runtime_state_from_legacy_globals()
+        provider_cfg = (
+            runtime.config.providers.get(actual_provider)
+            if runtime is not None
+            else None
+        )
+        omit_keys = provider_cfg.omit_body_keys if provider_cfg is not None else []
+        if omit_keys:
+            omitted = [key for key in omit_keys if key in body]
+            body = _omit_configured_body_keys(body, omit_keys)
+            if omitted:
+                logger.info(
+                    "OMIT_BODY_KEYS provider=%s keys=%s request_id=%s",
+                    actual_provider,
+                    omitted,
+                    request_id,
+                )
+
     # Avoid doubling /v1 if base_url already ends with it
     if base_url.endswith("/v1"):
         url = f"{base_url}/chat/completions"
